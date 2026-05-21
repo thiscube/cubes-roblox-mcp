@@ -14,6 +14,14 @@ export type DestructivenessLevel = "none" | "soft" | "hard" | "nuclear";
 
 const RANK: Record<DestructivenessLevel, number> = { none: 0, soft: 1, hard: 2, nuclear: 3 };
 
+const NUCLEAR_SERVICES = new Set([
+  "Workspace", "ServerScriptService", "ServerStorage", "ReplicatedStorage",
+  "ReplicatedFirst", "StarterPlayer", "StarterGui", "StarterPack",
+  "Lighting", "Players", "SoundService", "Chat", "TestService",
+  "RunService", "HttpService", "DataStoreService", "MarketplaceService",
+  "TeleportService", "MessagingService",
+]);
+
 export interface Assessment {
   level: DestructivenessLevel;
   summary: string;
@@ -33,9 +41,9 @@ function classifyOp(op: Op): DestructivenessLevel {
   }
   if (op.op === "delete") {
     const target = String(op.target ?? "");
-    // A bare capitalised identifier (no dots, no @, no ref prefix) is a service
-    // or top-level node — deleting that is nuclear. Refs like "p3" won't match.
-    if (/^[A-Z][A-Za-z]+$/.test(target)) return "nuclear";
+    // Only known Roblox services / top-level nodes are nuclear. Plain relative
+    // names like "MyFolder" are hard, not nuclear.
+    if (NUCLEAR_SERVICES.has(target)) return "nuclear";
     return "hard";
   }
   return "soft";

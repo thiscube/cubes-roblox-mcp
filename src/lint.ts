@@ -3,7 +3,7 @@ import { writeFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 
 /**
  * Inline Luau lint, run server-side on script source the agent writes through
@@ -36,17 +36,54 @@ export interface LintResult {
 
 export type LintOutcome = LintResult | { error: string };
 
+// LRU cache keyed by sha1(source). Selene spawn is 50-150ms cold; identical
+// source (re-saves, repeated macro runs) is a common case worth caching.
+// Map insertion order doubles as LRU order: re-set on hit, delete oldest on cap.
+const LINT_CACHE_CAP = 256;
+const lintCache = new Map<string, LintOutcome>();
+
+function hashSource(source: string): string {
+  return createHash("sha1").update(source).digest("hex");
+}
+
+function cacheGet(key: string): LintOutcome | undefined {
+  const hit = lintCache.get(key);
+  if (hit === undefined) return undefined;
+  // Re-insert to mark as most-recently-used.
+  lintCache.delete(key);
+  lintCache.set(key, hit);
+  return hit;
+}
+
+function cacheSet(key: string, value: LintOutcome): void {
+  if (lintCache.has(key)) lintCache.delete(key);
+  lintCache.set(key, value);
+  if (lintCache.size > LINT_CACHE_CAP) {
+    const oldest = lintCache.keys().next().value;
+    if (oldest !== undefined) lintCache.delete(oldest);
+  }
+}
+
 export async function lintLuau(source: string): Promise<LintOutcome> {
+  const key = hashSource(source);
+  const cached = cacheGet(key);
+  if (cached !== undefined) return cached;
+
   const tmpFile = join(tmpdir(), `cubes-mcp-lint-${randomUUID()}.luau`);
+  let outcome: LintOutcome;
   try {
     await writeFile(tmpFile, source, "utf8");
     const stdout = await runSelene(tmpFile);
-    return parseSelene(stdout, source);
+    outcome = parseSelene(stdout, source);
   } catch (err) {
-    return { error: `lint unavailable: ${err instanceof Error ? err.message : String(err)}` };
+    outcome = { error: `lint unavailable: ${err instanceof Error ? err.message : String(err)}` };
   } finally {
     await unlink(tmpFile).catch(() => {});
   }
+  // Don't cache transient failures (selene not on PATH, timeout) — they may
+  // resolve on retry. Cache only deterministic lint results.
+  if ("ok" in outcome) cacheSet(key, outcome);
+  return outcome;
 }
 
 function runSelene(file: string): Promise<string> {

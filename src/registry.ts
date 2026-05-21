@@ -20,6 +20,7 @@ export type Category =
   | "lighting"
   | "audio"
   | "camera"
+  | "viewport"
   | "debug"
   | "session";
 
@@ -27,6 +28,13 @@ export type Category =
 export interface ToolContext {
   bridge: StudioBridge;
   memory: SessionMemory;
+  /**
+   * Routes a mutate batch through the same safety pipeline as the core `mutate`
+   * tool (destructiveness gate + script source lint). Specialist tools that
+   * replay or compose mutate batches (e.g. macro_run) must call this instead of
+   * `bridge.send("mutate", ...)` so they don't bypass confirm-before-destructive.
+   */
+  handleMutate: (args: Record<string, unknown>) => Promise<unknown>;
 }
 
 export interface ToolEntry {
@@ -61,6 +69,8 @@ interface IndexDoc {
 export class ToolRegistry {
   private readonly entries = new Map<string, ToolEntry>();
   private readonly index: MiniSearch<IndexDoc>;
+  private readonly searchCache = new Map<string, ToolEntry[]>();
+  private static readonly SEARCH_CACHE_MAX = 64;
 
   constructor(entries: ToolEntry[]) {
     for (const entry of entries) {
@@ -110,6 +120,15 @@ export class ToolRegistry {
    * Semantic/embedding search is intentionally deferred (see design doc Layer 2).
    */
   search(query: string, intent?: string, limit = 5): ToolEntry[] {
+    const cacheKey = `${query}|${intent ?? ""}|${limit ?? 5}`;
+    const cached = this.searchCache.get(cacheKey);
+    if (cached !== undefined) {
+      // LRU bump: re-set to move to end of insertion order.
+      this.searchCache.delete(cacheKey);
+      this.searchCache.set(cacheKey, cached);
+      return cached;
+    }
+
     const lowerQuery = query.toLowerCase();
     const intentCats = intent ? INTENT_CATEGORIES[intent] ?? [] : [];
 
@@ -118,16 +137,23 @@ export class ToolRegistry {
         const entry = this.entries.get(id);
         if (!entry) return 1;
         let boost = 1;
-        if (lowerQuery.includes(entry.category)) boost *= 2;
+        if (new RegExp(`\\b${entry.category}\\b`, "i").test(lowerQuery)) boost *= 2;
         if (intentCats.includes(entry.category)) boost *= 1.5;
         return boost;
       },
     });
 
-    return results
+    const out = results
       .slice(0, Math.max(1, limit))
       .map((r) => this.entries.get(r.id))
       .filter((e): e is ToolEntry => Boolean(e));
+
+    this.searchCache.set(cacheKey, out);
+    if (this.searchCache.size > ToolRegistry.SEARCH_CACHE_MAX) {
+      const firstKey = this.searchCache.keys().next().value;
+      if (firstKey !== undefined) this.searchCache.delete(firstKey);
+    }
+    return out;
   }
 }
 
@@ -158,12 +184,29 @@ export function evalTool(meta: ToolMeta, buildLuau: (args: any) => string): Tool
   };
 }
 
+/**
+ * A specialist that dispatches directly to a native plugin tool handler.
+ * Use when the plugin owns the implementation (e.g. playtest lifecycle methods
+ * that need plugin-level security context and would silently no-op via eval).
+ */
+export function dispatchTool(meta: ToolMeta, pluginTool: string): ToolEntry {
+  return {
+    ...meta,
+    write: meta.write ?? false,
+    handler: async (args, ctx) => ctx.bridge.send(pluginTool, (args ?? {}) as Record<string, unknown>),
+  };
+}
+
 /** A specialist that builds a mutate batch and runs it through the plugin's mutate path. */
 export function mutateTool(meta: ToolMeta, buildOps: (args: any) => unknown[]): ToolEntry {
   return {
     ...meta,
     write: true, // every mutateTool modifies the DataModel
-    handler: async (args, ctx) => ctx.bridge.send("mutate", { ops: buildOps(args ?? {}) }),
+    // Route through handleMutate so specialist-built batches go through the same
+    // destructiveness gate + script-source lint as a direct `mutate` call. Today's
+    // specialists emit only soft ops, but any future specialist that emits a
+    // delete or Source overwrite would otherwise bypass confirm-before-destructive.
+    handler: async (args, ctx) => ctx.handleMutate({ ops: buildOps(args ?? {}) }),
   };
 }
 
@@ -173,6 +216,8 @@ export function mutateTool(meta: ToolMeta, buildOps: (args: any) => unknown[]): 
  * structured args inside generated Luau.
  */
 export function luaJson(value: unknown): string {
-  const json = JSON.stringify(value ?? null);
-  return "'" + json.replace(/\\/g, "\\\\").replace(/'/g, "\\'") + "'";
+  // First stringify produces a JSON string; the second stringify produces
+  // a JSON-quoted string literal that's also a valid Lua string literal
+  // (Lua double-quoted strings accept the same escape sequences JSON uses).
+  return JSON.stringify(JSON.stringify(value ?? null));
 }

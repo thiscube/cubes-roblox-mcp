@@ -64,11 +64,15 @@ export class SourceMap {
   }
 
   private static autodetect(): string | undefined {
+    const envPath = process.env.CUBES_MCP_SOURCEMAP;
+    if (envPath) {
+      if (existsSync(envPath)) return envPath;
+      console.error(`[cubes-mcp] CUBES_MCP_SOURCEMAP="${envPath}" set but file does not exist; falling back to cwd autodetect.`);
+    }
     const candidates = [
-      process.env.CUBES_MCP_SOURCEMAP,
       join(process.cwd(), "sourcemap.json"),
       join(process.cwd(), "..", "sourcemap.json"),
-    ].filter((p): p is string => Boolean(p));
+    ];
     return candidates.find((p) => existsSync(p));
   }
 }

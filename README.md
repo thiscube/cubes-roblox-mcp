@@ -172,9 +172,12 @@ viewport grounding — printing PASS / FAIL while the place changes in Studio. F
 src/                     the MCP server (TypeScript / Node)
   index.ts               entry — wires the stdio transport + HTTP bridge
   bridge.ts              HTTP long-poll bridge to the Studio plugin
+  protocol.ts            wire-protocol version (server <-> plugin handshake)
   server.ts              MCP server + the four core tool handlers
   registry.ts            specialist tool registry + BM25 search
   seed.ts                seed specialist tools
+  pro.ts                 second-wave specialist tools — terrain, audio, physics
+  vision.ts              screenshot + viewport-capture tools
   session.ts             active tool set, sticky context, turn-based eviction
   memory.ts              tool-call history log + macro store
   lint.ts                Selene lint of script writes
@@ -183,8 +186,9 @@ src/                     the MCP server (TypeScript / Node)
   sourcemap.ts           Rojo source-map lookup
 
 roblox/                  a SEPARATE Rojo project — the Studio plugin (Luau)
-  src/                   12 modules: Transport, Read, Mutate, Query, Refs,
-                         Serialize, SessionState, Diagnostics, Viewport, …
+  src/                   14 modules: Transport, Read, Mutate, Query, Refs,
+                         Serialize, SessionState, Diagnostics, Viewport,
+                         EventWatch, PlaytestBus, …
   plugin.project.json    build target — the publishable .rbxm
   default.project.json   rojo serve target
   rokit.toml             pins Rojo + Selene

@@ -1,4 +1,26 @@
+# Dependencies
 node_modules/
+
+# Build output
 dist/
+
+# Logs
 *.log
+
+# OS files
 .DS_Store
+Thumbs.db
+
+# Editor / agent local tooling
+.claude/
+
+# Archived / scratch builds
+.attic/
+
+# Local debug screenshots
+/bench-*.png
+/cubes-panel-*.png
+
+# Environment / secrets
+.env
+.env.local

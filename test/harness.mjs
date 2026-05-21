@@ -22,9 +22,11 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { existsSync } from "node:fs";
 import { createInterface } from "node:readline";
+import { PROTOCOL_VERSION } from "../dist/protocol.js";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SERVER = join(ROOT, "dist", "index.js");
+const BRIDGE = "http://127.0.0.1:44820";
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // --------------------------------------------------------------------------
@@ -169,7 +171,7 @@ function trunc(v) {
 // --------------------------------------------------------------------------
 // Wait for the Studio plugin to connect to our freshly-spawned server.
 // --------------------------------------------------------------------------
-async function waitForStudio(client, maxTries = 12) {
+async function waitForStudio(client, maxTries = 16) {
   for (let i = 0; i < maxTries; i += 1) {
     const probe = await client.callTool("read", { path: "Workspace" });
     if (!(probe && probe.error === "studio_not_connected")) return true;
@@ -200,6 +202,57 @@ async function runSuite(client) {
   const resources = (await client.request("resources/list")).resources ?? [];
   check("4 studio:// resources are listed", resources.length >= 4, resources.map((r) => r.uri).join(", "));
 
+  section("protocol handshake (bridge HTTP)");
+  // Server should report its protocol version on /health.
+  const health = await (await fetch(`${BRIDGE}/health`)).json();
+  check(
+    "/health reports server protocol version",
+    health.protocol === PROTOCOL_VERSION,
+    `expected ${PROTOCOL_VERSION}, got ${health.protocol}`,
+  );
+
+  // Poll with a deliberately wrong protocol — server should reject with 426 + structured body.
+  const badPoll = await fetch(`${BRIDGE}/poll`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ protocol: 99999, writeEnabled: false }),
+  });
+  check("wrong-protocol /poll returns HTTP 426", badPoll.status === 426, `status: ${badPoll.status}`);
+  const badBody = await badPoll.json().catch(() => null);
+  check(
+    "426 body carries expected/got + message",
+    badBody?.expected === PROTOCOL_VERSION && badBody?.got === 99999 && typeof badBody?.message === "string",
+    badBody,
+  );
+
+  // A poll with no protocol field at all should also 426 (with got = null).
+  const missingPoll = await fetch(`${BRIDGE}/poll`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ writeEnabled: false }),
+  });
+  const missingBody = await missingPoll.json().catch(() => null);
+  check(
+    "missing-protocol /poll also 426s with got=null",
+    missingPoll.status === 426 && missingBody?.got === null,
+    `status ${missingPoll.status}, body ${JSON.stringify(missingBody)}`,
+  );
+
+  // Restore the bridge state so the Studio-dependent tests below aren't blocked by
+  // the lingering mismatch from the two bad polls above. The poll is a long-poll,
+  // so abort it after the server has processed the body (state is updated first).
+  await fetch(`${BRIDGE}/poll`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ protocol: PROTOCOL_VERSION, writeEnabled: false }),
+    signal: AbortSignal.timeout(500),
+  }).catch((err) => {
+    // The abort is intentional — we only need the server to process the body, not
+    // the long-poll response. Swallow AbortError; rethrow anything else.
+    if (err?.name === "AbortError") return undefined;
+    throw err;
+  });
+
   section("bridge connectivity");
   const connected = await waitForStudio(client);
   if (!connected) {
@@ -212,7 +265,9 @@ async function runSuite(client) {
   check("Studio plugin is connected", true);
 
   section("reads");
-  const ws = await client.callTool("read", { path: "Workspace", children: true });
+  // meta is opt-in (only emitted when meta:true OR slow/snapshot-hit/tokens-saved),
+  // so explicitly request it for this assertion.
+  const ws = await client.callTool("read", { path: "Workspace", children: true, meta: true });
   check("read Workspace children returns items", Array.isArray(ws.items), ws.error ?? `${ws.count} items`);
   check("read response carries cost meta", typeof ws.meta?.elapsed_ms === "number", ws.meta);
   if (ws.snapshot) {
@@ -288,7 +343,13 @@ async function runSuite(client) {
   section("search + specialist tools");
   const search = await client.callTool("search_tools", { query: "configure lighting brightness and fog" });
   check("search_tools unlocks specialists", (search.unlocked ?? []).length > 0, (search.unlocked ?? []).map((u) => u.name));
-  check("successful response carries next_likely", Array.isArray(search.next_likely), search.next_likely);
+  // next_likely is only attached when there's a useful follow-up. For search_tools
+  // it depends on whether anything was unlocked — guard accordingly.
+  check(
+    "successful response carries next_likely",
+    Array.isArray(search.next_likely) || (search.unlocked?.length ?? 0) === 0,
+    search.next_likely,
+  );
 
   section("resources");
   const history = await client.readResource("studio://session/history");

@@ -24,6 +24,8 @@ export interface Macro {
 }
 
 const HISTORY_CAP = 200;
+const HISTORY_TRIM_BATCH = Math.floor(HISTORY_CAP * 0.25);
+const HISTORY_HIGH_WATER = HISTORY_CAP + HISTORY_TRIM_BATCH;
 
 export class SessionMemory {
   private readonly history: HistoryEntry[] = [];
@@ -31,7 +33,9 @@ export class SessionMemory {
 
   record(entry: HistoryEntry): void {
     this.history.push(entry);
-    if (this.history.length > HISTORY_CAP) this.history.shift();
+    if (this.history.length > HISTORY_HIGH_WATER) {
+      this.history.splice(0, HISTORY_TRIM_BATCH);
+    }
   }
 
   recentHistory(n = 25): HistoryEntry[] {

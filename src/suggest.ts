@@ -1,10 +1,11 @@
 /**
  * Suggested next call.
  *
- * Every successful tool response carries a small `next_likely` list — non-binding
- * hints the agent can act on or ignore. The goal is to keep the agent moving in
- * sensible directions (verify a write, page through results, test a script change)
- * without it having to rediscover the obvious next step each turn.
+ * Successful tool responses (excluding snapshot no-ops) carry at most one
+ * `next_likely` hint — non-binding, the agent can act on it or ignore it. The
+ * goal is to nudge the agent in sensible directions (verify a write, page through
+ * results, test a script change) without it having to rediscover the obvious
+ * next step each turn. The server caps to 1 entry; this module ranks candidates.
  */
 
 export interface NextLikely {
@@ -59,7 +60,9 @@ export function suggestNext(tool: string, _args: unknown, payload: unknown): Nex
         });
       }
       const wroteScript = changes.some(
-        (c) => Array.isArray(c?.modified) && c.modified.includes("Source"),
+        (c) =>
+          (Array.isArray(c?.modified) && c.modified.includes("Source")) ||
+          (c?.op === "create" && typeof c?.class === "string" && /Script$/.test(c.class)),
       );
       if (wroteScript) {
         out.push({ call: "run_code", reason: "playtest / smoke-test the script change" });
@@ -88,5 +91,8 @@ export function suggestNext(tool: string, _args: unknown, payload: unknown): Nex
       break;
   }
 
+  // Caller (server.ts) currently caps to 1; we return up to 3 candidates so the
+  // cap can be tuned without changing this module. The first item is the best
+  // single suggestion.
   return out.slice(0, 3);
 }

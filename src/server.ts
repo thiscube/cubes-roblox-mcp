@@ -54,7 +54,7 @@ const CORE_TOOL_DEFS: Record<string, Tool> = {
   read: {
     name: "read",
     description:
-      "Universal read. Target the DataModel by ref token, dotted path, or selector query; project a small set of properties by default; pick a response shape. Results are relevance-ranked (recently-modified > selected in Studio > sticky class > name), so the first page is the useful page. Returns short ref tokens (p3, f12, ...) to reuse in later calls, plus a snapshot tag for near-free re-reads (pass it back as `since`).",
+      "Universal read. Target by ref, path, or selector query. Returns relevance-ranked items + short ref tokens + a snapshot tag for cheap re-reads via `since`.",
     inputSchema: {
       type: "object",
       properties: {
@@ -98,7 +98,7 @@ const CORE_TOOL_DEFS: Record<string, Tool> = {
   mutate: {
     name: "mutate",
     description:
-      "Universal write. Submit an ordered batch of ops (create / set / delete). Use @id to reference the result of an earlier op in the same batch (e.g. parent: '@a'), or a ref/path for existing instances. The whole batch runs atomically inside ONE undo waypoint — if any op fails, created instances are rolled back. Returns a diff of what changed. Any op that writes a script's Source is linted with Selene server-side; the diagnostics come back under `lint`. Requires write mode (the user enables it in the Studio panel). Destructive batches — deletes or script overwrites — need `confirm: true`; without it you get a `needs_confirmation` error carrying the exact `retry_with`.",
+      "Universal write. Atomic batch of create/set/delete ops in one undo waypoint. Use @id to reference prior ops in the same batch. Destructive batches need confirm: true.",
     inputSchema: {
       type: "object",
       properties: {
@@ -119,9 +119,34 @@ const CORE_TOOL_DEFS: Record<string, Tool> = {
                 description:
                   "create/set: property map. Values are coerced to Roblox types from the property's current type (e.g. [255,0,0] -> Color3, 'r, g, b' -> Color3, [4,1,2] -> Vector3, 'Wood' -> EnumItem).",
               },
+              attrs: {
+                type: "object",
+                additionalProperties: true,
+                description:
+                  "Custom attributes to set (name -> JSON value). Supports primitives and typed envelopes like { __t: 'Vector3', value: [x,y,z] }.",
+              },
+              tags: {
+                type: "array",
+                items: { type: "string" },
+                description: "CollectionService tags to add.",
+              },
+              remove_tags: {
+                type: "array",
+                items: { type: "string" },
+                description: "CollectionService tags to remove (set op only).",
+              },
+              remove_attrs: {
+                type: "array",
+                items: { type: "string" },
+                description: "Attribute names to remove (set op only).",
+              },
             },
             required: ["op"],
           },
+        },
+        confirm: {
+          type: "boolean",
+          description: "Required for non-soft mutates; set to true to acknowledge destructiveness.",
         },
       },
       required: ["ops"],
@@ -142,7 +167,7 @@ const CORE_TOOL_DEFS: Record<string, Tool> = {
   },
 };
 
-/** Luau for the studio://selection resource (mirrors the selection_get tool). */
+/** Luau for the studio://selection resource. */
 const SELECTION_LUAU = `
 local sel = game:GetService("Selection"):Get()
 local out = {}
@@ -152,8 +177,62 @@ end
 return { selection = out, count = #out }
 `;
 
+/**
+ * Luau for the studio://overview resource. The "where am I" snapshot — meant to
+ * be the first thing a client auto-loads so the agent has a map of the place
+ * (PlaceId, service shape, current selection, recent error count) without
+ * burning a tools/call to discover it.
+ */
+const OVERVIEW_LUAU = `
+local Selection = game:GetService("Selection")
+local function count(svc)
+  local ok, s = pcall(function() return game:GetService(svc) end)
+  if not ok or not s then return 0 end
+  return #s:GetChildren()
+end
+local sel = {}
+for _, inst in ipairs(Selection:Get()) do
+  sel[#sel + 1] = { ref = __MCP.refFor(inst), path = inst:GetFullName(), class = inst.ClassName }
+end
+local diag = __MCP.diagnostics(0)
+local recentErrors = 0
+if type(diag) == "table" then
+  recentErrors = tonumber(diag.totalCaptured) or 0
+end
+return {
+  placeId = game.PlaceId,
+  placeName = game.Name,
+  services = {
+    Workspace = count("Workspace"),
+    ServerScriptService = count("ServerScriptService"),
+    ServerStorage = count("ServerStorage"),
+    ReplicatedStorage = count("ReplicatedStorage"),
+    ReplicatedFirst = count("ReplicatedFirst"),
+    StarterGui = count("StarterGui"),
+    StarterPack = count("StarterPack"),
+    StarterPlayer = count("StarterPlayer"),
+    Lighting = count("Lighting"),
+    SoundService = count("SoundService"),
+    Players = count("Players"),
+    Teams = count("Teams"),
+    TestService = count("TestService"),
+  },
+  selection = sel,
+  selectionCount = #sel,
+  recentErrors = recentErrors,
+  hint = "Drill in with read({ path = '<ServiceName>', children = true }). Selectors: 'ServerScriptService/**[ClassName=Script]' or '<Service>/**[Tag=X]'.",
+}
+`;
+
 /** Resources the agent can read directly, without spending a tool call. */
 const RESOURCES = [
+  {
+    uri: "studio://overview",
+    name: "Place overview",
+    description:
+      "PlaceId, place name, top-level service child counts, current selection, recent error count. Read this first to orient yourself — replaces a manual exploration phase.",
+    mimeType: "application/json",
+  },
   {
     uri: "studio://session/history",
     name: "Tool-call history",
@@ -233,6 +312,8 @@ export function createMcpServer(bridge: StudioBridge): Server {
     });
     try {
       switch (uri) {
+        case "studio://overview":
+          return json(await bridge.send("eval", { luau: OVERVIEW_LUAU }));
         case "studio://session/history":
           return json({ turn: session.turn, history: memory.historyView(60) });
         case "studio://session/macros":
@@ -294,7 +375,7 @@ export function createMcpServer(bridge: StudioBridge): Server {
             // Safety net: agent remembered a tool name from earlier — just unlock it.
             if (session.unlock(name)) await notifyListChanged();
             else session.touch(name);
-            payload = await entry.handler(args, { bridge, memory });
+            payload = await entry.handler(args, { bridge, memory, handleMutate });
           }
         }
       }
@@ -307,11 +388,20 @@ export function createMcpServer(bridge: StudioBridge): Server {
     if (payload && typeof payload === "object") {
       const obj = payload as Record<string, unknown>;
       // Suggested next call: non-binding hints toward sensible follow-ups.
-      const next = suggestNext(name, args, payload);
-      if (next.length > 0) obj.next_likely = next;
-      // Cost accounting: estimated token/timing meta on every response, so the
-      // agent can learn to bias toward cheaper response shapes.
-      obj.meta = buildMeta(name, args, payload, elapsedMs);
+      // Skip on no-op replies (unchanged snapshot) and cap to a single suggestion.
+      if (obj.unchanged !== true) {
+        const next = suggestNext(name, args, payload);
+        if (next.length > 0) obj.next_likely = next.slice(0, 1);
+      }
+      // Cost accounting: only attach when the caller asks for it, or when there's
+      // a real signal worth surfacing (snapshot hit, savings, or a slow call).
+      const wantsMeta = args.meta === true;
+      const meta = buildMeta(name, args, payload, elapsedMs);
+      const hasSignal =
+        meta.snapshot_hit === true ||
+        (typeof meta.tokens_saved === "number" && meta.tokens_saved > 0) ||
+        meta.elapsed_ms > 250;
+      if (wantsMeta || hasSignal) obj.meta = meta;
     }
 
     // Record the call in session memory (drives studio://session/history + macros).
@@ -325,10 +415,24 @@ export function createMcpServer(bridge: StudioBridge): Server {
       at: new Date().toISOString(),
     });
 
-    // Auto-eviction pass after every call.
-    if (session.evict()) await notifyListChanged();
+    // Auto-eviction pass after every call. Only notify when the visible set
+    // actually shrank — evict can only remove, so a size delta is sufficient.
+    // Avoids firing tools/list_changed (and prompting a tools/list re-fetch)
+    // when the change was a no-op against what the client sees.
+    const sizeBefore = session.active.size;
+    if (session.evict() && session.active.size !== sizeBefore) {
+      await notifyListChanged();
+    }
 
-    return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
+    // Multi-block escape hatch: a handler can return `{ __mcpContent: [...] }`
+    // to send arbitrary MCP content blocks (image, audio, etc.) instead of the
+    // default `[{ type: "text", text: JSON.stringify(payload) }]` wrapper.
+    // Used by `screenshot` which needs to ship a PNG inline.
+    if (payload && typeof payload === "object" && Array.isArray((payload as any).__mcpContent)) {
+      return { content: (payload as any).__mcpContent };
+    }
+
+    return { content: [{ type: "text", text: JSON.stringify(payload) }] };
   });
 
   // ---- core tool handlers ------------------------------------------------
@@ -400,6 +504,12 @@ export function createMcpServer(bridge: StudioBridge): Server {
       };
     }
     const result = (await bridge.send("mutate", args)) as Record<string, unknown>;
+    // Plugin-side failures (e.g. mutate_failed + rolled_back, no_undo_available)
+    // come back as { error, ... }. Don't dress a rolled-back failure up with
+    // lint/appliedLevel — that makes a hard failure look partially applied.
+    if (result && typeof result === "object" && "error" in result) {
+      return result;
+    }
     // Inline lint: any op that writes script source gets selene'd server-side,
     // so the agent can fix issues now instead of discovering them at playtest.
     const lint = await lintScriptOps(args.ops);
@@ -416,12 +526,27 @@ export function createMcpServer(bridge: StudioBridge): Server {
         scriptOps.push({ op, index });
       }
     });
-    return Promise.all(
-      scriptOps.map(async ({ op, index }) => ({
-        target: op.id ?? op.name ?? `op#${index}`,
-        ...(await lintLuau(op.props.Source as string)),
-      })),
+    // Selene spawns a process per call — cap concurrency so a 50-script macro
+    // doesn't fork 50 processes + tmpfiles in parallel.
+    const CONCURRENCY = 4;
+    const results: Array<{ target: string } & Awaited<ReturnType<typeof lintLuau>>> = new Array(scriptOps.length);
+    let cursor = 0;
+    async function worker() {
+      while (true) {
+        const i = cursor++;
+        if (i >= scriptOps.length) return;
+        const { op, index } = scriptOps[i];
+        const target =
+          (typeof op.id === "string" && op.id) ||
+          (typeof op.name === "string" && op.name) ||
+          `op#${index}`;
+        results[i] = { target, ...(await lintLuau(op.props.Source as string)) };
+      }
+    }
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, scriptOps.length) }, worker),
     );
+    return results;
   }
 
   async function handleRunCode(args: Record<string, unknown>) {
@@ -467,7 +592,6 @@ interface CostMeta {
   elapsed_ms: number;
   tokens_in: number;
   tokens_out: number;
-  estimated: true;
   tokens_saved?: number;
   snapshot_hit?: true;
 }
@@ -477,7 +601,6 @@ function buildMeta(tool: string, args: unknown, payload: unknown, elapsedMs: num
     elapsed_ms: elapsedMs,
     tokens_in: estTokens(args),
     tokens_out: estTokens(payload),
-    estimated: true,
   };
   // read-specific savings: pagination (items not returned) and snapshot hits.
   if (tool === "read" && payload && typeof payload === "object") {
