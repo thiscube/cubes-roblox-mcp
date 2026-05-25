@@ -24,3 +24,6 @@ Thumbs.db
 # Environment / secrets
 .env
 .env.local
+
+# Roblox Studio plugin — distributed separately, never committed.
+roblox/
