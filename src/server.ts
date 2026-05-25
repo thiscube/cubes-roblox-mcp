@@ -17,6 +17,8 @@ import { SessionMemory } from "./memory.js";
 import { assessDestructiveness } from "./safety.js";
 import { suggestNext } from "./suggest.js";
 import { SourceMap } from "./sourcemap.js";
+import { screenshotTool } from "./vision.js";
+import { loadProfile } from "./profile.js";
 
 /**
  * The MCP server. The opening surface is exactly four tools:
@@ -156,7 +158,7 @@ const CORE_TOOL_DEFS: Record<string, Tool> = {
   run_code: {
     name: "run_code",
     description:
-      "Escape hatch. Run arbitrary Luau inside Studio (plugin context — elevated permissions). A preloaded `__MCP` helper table is in scope: refFor(inst), resolve(refOrPath), query(selector), read(args), mutate(args), decode(json), serialize(value), diagnostics(n), viewport(limit), waypoint(name, fn). Use `return <value>` to get data back as JSON. Requires write mode (the user enables it in the Studio panel).",
+      "Escape hatch + code-mode workflow runner. Run arbitrary Luau inside Studio (plugin context, elevated permissions). PREFER this over many `mutate` calls when you need 3+ ops in a row — one round-trip beats N, and intermediate results stay in the Studio sandbox instead of round-tripping through the LLM context window. A preloaded `__MCP` helper table is in scope: refFor(inst), resolve(refOrPath), query(selector), read(args), mutate(args), decode(json), serialize(value), diagnostics(n), viewport(limit), waypoint(name, fn). Wrap multi-step work in `__MCP.waypoint('your-label', function() ... end)` for one atomic undo step. Use `return <value>` to get JSON back. Example multi-step build: `return __MCP.waypoint('build cat', function() local m = Instance.new('Model'); m.Parent = workspace; for i=1,5 do local p = Instance.new('Part'); p.Parent = m end; return { ref = __MCP.refFor(m), count = #m:GetChildren() } end)`.",
     inputSchema: {
       type: "object",
       properties: {
@@ -164,6 +166,16 @@ const CORE_TOOL_DEFS: Record<string, Tool> = {
       },
       required: ["luau"],
     },
+  },
+
+  // Screenshot is core because vision is fundamental — having to search_tools
+  // for "see the screen" every session adds friction and the agent often
+  // forgets it exists. Lives next to `read` in the conceptual model: same
+  // observation role, just visual instead of structured.
+  screenshot: {
+    name: "screenshot",
+    description: screenshotTool.description,
+    inputSchema: screenshotTool.inputSchema as Tool["inputSchema"],
   },
 };
 
@@ -234,6 +246,20 @@ const RESOURCES = [
     mimeType: "application/json",
   },
   {
+    uri: "studio://tools/catalog",
+    name: "Tool catalog",
+    description:
+      "The full specialist tool index, grouped by category. Each entry: name, description, write-flag, keywords. Read once at session start so you know everything that exists — eliminates blind search_tools queries.",
+    mimeType: "application/json",
+  },
+  {
+    uri: "studio://project/profile",
+    name: "Project profile",
+    description:
+      "Per-place persistent memory: detected genre, style decisions, naming conventions, decisions log, known issues, prior-session summaries. Loaded from ~/.cubesmcp/profiles/{placeId}.json. Update via the `profile_update` specialist tool.",
+    mimeType: "application/json",
+  },
+  {
     uri: "studio://session/history",
     name: "Tool-call history",
     description: "Log of recent tool calls this session (tool, result summary, timing).",
@@ -243,6 +269,13 @@ const RESOURCES = [
     uri: "studio://session/macros",
     name: "Saved macros",
     description: "Macros saved this session, replayable with the macro_run tool.",
+    mimeType: "application/json",
+  },
+  {
+    uri: "studio://session/snapshots",
+    name: "Saved snapshots",
+    description:
+      "DataModel subtree snapshots captured this session (name, path, instance count, timestamp). Compare them with the diff tool.",
     mimeType: "application/json",
   },
   {
@@ -285,6 +318,8 @@ export function createMcpServer(bridge: StudioBridge): Server {
     }
   };
 
+  const getPlaceContext = () => ensurePlaceContext(bridge, session);
+
   // ---- tools/list: core tools + currently-active specialists --------------
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const tools: Tool[] = CORE_TOOLS.map((name) => CORE_TOOL_DEFS[name]);
@@ -314,10 +349,19 @@ export function createMcpServer(bridge: StudioBridge): Server {
       switch (uri) {
         case "studio://overview":
           return json(await bridge.send("eval", { luau: OVERVIEW_LUAU }));
+        case "studio://tools/catalog":
+          return json(buildToolCatalog(registry));
+        case "studio://project/profile": {
+          const ctx = await ensurePlaceContext(bridge, session);
+          const profile = await loadProfile(ctx.placeId, ctx.placeName);
+          return json(profile);
+        }
         case "studio://session/history":
           return json({ turn: session.turn, history: memory.historyView(60) });
         case "studio://session/macros":
           return json({ macros: memory.listMacros() });
+        case "studio://session/snapshots":
+          return json({ snapshots: memory.listSnapshots() });
         case "studio://selection":
           return json(await bridge.send("eval", { luau: SELECTION_LUAU }));
         case "studio://errors/recent":
@@ -362,6 +406,9 @@ export function createMcpServer(bridge: StudioBridge): Server {
           case "run_code":
             payload = await handleRunCode(args);
             break;
+          case "screenshot":
+            payload = await screenshotTool.handler(args, { bridge, memory, handleMutate, getPlaceContext });
+            break;
           default: {
             const entry = registry.get(name);
             if (!entry) {
@@ -375,7 +422,7 @@ export function createMcpServer(bridge: StudioBridge): Server {
             // Safety net: agent remembered a tool name from earlier — just unlock it.
             if (session.unlock(name)) await notifyListChanged();
             else session.touch(name);
-            payload = await entry.handler(args, { bridge, memory, handleMutate });
+            payload = await entry.handler(args, { bridge, memory, handleMutate, getPlaceContext });
           }
         }
       }
@@ -388,10 +435,12 @@ export function createMcpServer(bridge: StudioBridge): Server {
     if (payload && typeof payload === "object") {
       const obj = payload as Record<string, unknown>;
       // Suggested next call: non-binding hints toward sensible follow-ups.
-      // Skip on no-op replies (unchanged snapshot) and cap to a single suggestion.
+      // Skip on no-op replies (unchanged snapshot). Cap at 3 so the agent gets
+      // a meaningful menu (e.g. "verify the write, screenshot it, snapshot for
+      // rollback") without the response bloating into a planning document.
       if (obj.unchanged !== true) {
         const next = suggestNext(name, args, payload);
-        if (next.length > 0) obj.next_likely = next.slice(0, 1);
+        if (next.length > 0) obj.next_likely = next.slice(0, 3);
       }
       // Cost accounting: only attach when the caller asks for it, or when there's
       // a real signal worth surfacing (snapshot hit, savings, or a slow call).
@@ -414,6 +463,19 @@ export function createMcpServer(bridge: StudioBridge): Server {
       elapsedMs,
       at: new Date().toISOString(),
     });
+
+    // Context-aware auto-unlock: surface specialists the agent obviously needs
+    // next without forcing a search_tools round-trip. Rules are intentionally
+    // narrow (only fire on strong context signals) so the active set doesn't
+    // bloat. Newly-unlocked tools are reported back via `auto_unlocked` so the
+    // agent knows what just appeared without re-reading tools/list.
+    const autoUnlocked = applyAutoUnlock(name, args, payload, session, registry);
+    if (autoUnlocked.length > 0) {
+      if (payload && typeof payload === "object" && !("error" in payload)) {
+        (payload as Record<string, unknown>).auto_unlocked = autoUnlocked;
+      }
+      await notifyListChanged();
+    }
 
     // Auto-eviction pass after every call. Only notify when the visible set
     // actually shrank — evict can only remove, so a size delta is sufficient.
@@ -559,6 +621,145 @@ export function createMcpServer(bridge: StudioBridge): Server {
   }
 
   return server;
+}
+
+/**
+ * Context-aware tool auto-unlock. Inspects the tool name + payload shape and
+ * unlocks specialists that are obviously the next step. Rules are kept narrow
+ * (high precision, low recall) so the active tool set stays focused — the
+ * agent should still use `search_tools` for broader discovery.
+ *
+ * Returns the list of newly-unlocked specialist names so the server can both
+ * fire tools/list_changed AND echo the names in the tool response (so the
+ * agent doesn't have to re-fetch tools/list to find out what's new).
+ */
+function applyAutoUnlock(
+  toolName: string,
+  _args: unknown,
+  payload: unknown,
+  session: Session,
+  registry: ToolRegistry,
+): string[] {
+  if (!payload || typeof payload !== "object") return [];
+  const p = payload as Record<string, any>;
+  if (p.error) return [];
+
+  const candidates = new Set<string>();
+
+  // Read → viewport / debug helpers. If the response includes camera + 2D
+  // bboxes, the agent has just done vision-grounding; the natural follow-ups
+  // are `debug_highlight` (to draw on what they care about) and a `screenshot`
+  // (but screenshot is already core).
+  if (toolName === "read" && p.camera && Array.isArray(p.instances)) {
+    candidates.add("debug_highlight");
+  }
+
+  // Mutate creating BaseParts → duplication / array helpers. Most "build many"
+  // workflows start with one part and benefit from `instance_duplicate` or
+  // `parts_grid` next.
+  if (toolName === "mutate") {
+    const changes: Array<{ op?: string; class?: string }> = Array.isArray(p.changes)
+      ? p.changes
+      : [];
+    const createdBasePart = changes.some(
+      (c) => c.op === "create" && c.class && /Part$/.test(c.class),
+    );
+    if (createdBasePart) {
+      candidates.add("instance_duplicate");
+      candidates.add("parts_grid");
+    }
+  }
+
+  // run_code returned a ref/path → likely created/touched a visual instance.
+  // Make `debug_highlight` available so a follow-up can spotlight it.
+  if (toolName === "run_code") {
+    const r = p.result;
+    if (r && typeof r === "object" && (r.ref || r.path)) {
+      candidates.add("debug_highlight");
+    }
+  }
+
+  // Playtest started → its lifecycle siblings (tune, stop, result) are almost
+  // always wanted in the same turn-chain.
+  if (toolName === "playtest_play" || toolName === "playtest_run_mode") {
+    candidates.add("tune");
+    candidates.add("playtest_stop");
+    candidates.add("playtest_result");
+  }
+
+  // Filter to ones the registry knows AND that aren't already active.
+  const out: string[] = [];
+  for (const name of candidates) {
+    if (registry.has(name) && session.unlock(name)) {
+      out.push(name);
+    }
+  }
+  return out;
+}
+
+/**
+ * Fetch + cache the current place's (PlaceId, Name). Used by the profile
+ * resource and the profile_update tool. Falls back to placeId=0 if the
+ * bridge isn't connected — the profile system still works, it just keys
+ * every offline session into the same "unsaved place" bucket.
+ */
+async function ensurePlaceContext(
+  bridge: StudioBridge,
+  session: Session,
+): Promise<{ placeId: number; placeName: string }> {
+  if (session.placeContext) return session.placeContext;
+  if (!bridge.connected) {
+    session.placeContext = { placeId: 0, placeName: "(plugin not connected)" };
+    return session.placeContext;
+  }
+  try {
+    const raw = (await bridge.send("eval", {
+      luau: "return { placeId = game.PlaceId, placeName = game.Name }",
+    })) as { placeId?: unknown; placeName?: unknown } | undefined;
+    session.placeContext = {
+      placeId: Number(raw?.placeId ?? 0) || 0,
+      placeName: String(raw?.placeName ?? ""),
+    };
+  } catch {
+    session.placeContext = { placeId: 0, placeName: "" };
+  }
+  return session.placeContext;
+}
+
+/**
+ * Build the studio://tools/catalog payload — a category-grouped index of every
+ * specialist tool. Cheap: just enumerates the registry, no I/O. Read once per
+ * session at most, so the agent can see the whole menu without firing repeated
+ * search_tools calls.
+ */
+function buildToolCatalog(registry: ToolRegistry) {
+  const tools: Array<{
+    name: string;
+    description: string;
+    write: boolean;
+    keywords: string[];
+  }> = [];
+  const byCategory: Record<string, Array<(typeof tools)[number]>> = {};
+  for (const entry of registry.all()) {
+    const item = {
+      name: entry.name,
+      description: entry.description,
+      write: entry.write === true,
+      keywords: entry.keywords,
+    };
+    tools.push(item);
+    (byCategory[entry.category] ??= []).push(item);
+  }
+  return {
+    note: "Specialist tools, hidden until you call them or search_tools surfaces them. Core tools (always visible, no unlock needed): search_tools, read, screenshot, mutate, run_code.",
+    counts: {
+      total: tools.length,
+      byCategory: Object.fromEntries(
+        Object.entries(byCategory).map(([k, v]) => [k, v.length]),
+      ),
+    },
+    categories: byCategory,
+  };
 }
 
 function errorPayload(err: unknown) {

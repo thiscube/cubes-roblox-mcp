@@ -35,6 +35,13 @@ export interface ToolContext {
    * `bridge.send("mutate", ...)` so they don't bypass confirm-before-destructive.
    */
   handleMutate: (args: Record<string, unknown>) => Promise<unknown>;
+  /**
+   * Returns the current place's identity (PlaceId + Name), cached per session.
+   * Falls back to placeId=0 if the bridge isn't connected. Tools that read or
+   * write the per-place profile (profile_update, profile lookups) should use
+   * this rather than reaching for the bridge directly.
+   */
+  getPlaceContext: () => Promise<{ placeId: number; placeName: string }>;
 }
 
 export interface ToolEntry {

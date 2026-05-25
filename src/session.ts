@@ -7,7 +7,7 @@
  * sticky context to bias search.
  */
 
-export const CORE_TOOLS = ["search_tools", "read", "mutate", "run_code"] as const;
+export const CORE_TOOLS = ["search_tools", "read", "screenshot", "mutate", "run_code"] as const;
 const CORE_SET: ReadonlySet<string> = new Set(CORE_TOOLS);
 
 export class Session {
@@ -24,6 +24,14 @@ export class Session {
     recentClasses: [],
     recentIntent: "",
   };
+
+  /**
+   * Cached identity of the place currently open in Studio. Populated lazily on
+   * the first resource read or tool call that needs it (profile lookup, etc.).
+   * `placeId = 0` is the "unsaved place" sentinel; we still write profiles for
+   * it so quick experiments aren't memory-less.
+   */
+  placeContext: { placeId: number; placeName: string } | null = null;
 
   constructor(id: string) {
     this.id = id;

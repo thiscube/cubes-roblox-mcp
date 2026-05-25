@@ -1,6 +1,8 @@
 import { type ToolEntry, evalTool, mutateTool, dispatchTool, luaJson } from "./registry.js";
-import { screenshotTool } from "./vision.js";
 import { PRO_TOOLS } from "./pro.js";
+import { diffSnapshots } from "./snapshot-diff.js";
+import type { SnapshotInstance } from "./memory.js";
+import { applyPatch, loadProfile, saveProfile, type ProfilePatch } from "./profile.js";
 
 /**
  * Seed specialist tools. These are deliberately a small starter set — enough to
@@ -812,6 +814,111 @@ return {
   ),
 
   // ---- session memory -----------------------------------------------------
+  // Persistent per-place memory (genre, style, decisions, naming conventions,
+  // known issues, session summaries). Lives at ~/.cubesmcp/profiles/{placeId}.json.
+  // Read the current profile via the `studio://project/profile` resource; write
+  // through this tool. Designed so the agent doesn't read+rewrite the whole file
+  // — each call is an upsert (style/structure shallow-merge, decision/issue/
+  // session-summary append). Eliminates the cold-start problem across sessions.
+  {
+    name: "profile_update",
+    category: "session",
+    subcategories: ["memory", "profile", "decision", "convention"],
+    keywords: [
+      "profile",
+      "remember",
+      "memory",
+      "decision",
+      "convention",
+      "style",
+      "genre",
+      "save",
+      "note",
+      "context",
+      "persist",
+      "learn",
+    ],
+    write: false, // writes a server-side JSON file, not the DataModel
+    description:
+      "Update the persistent per-place profile (~/.cubesmcp/profiles/{placeId}.json). Each field is an upsert: `genre`/`placeName`/`style`/`structure` shallow-merge; `decision`/`knownIssue`/`sessionSummary` append. Use this to record style decisions ('we chose elongated balls for ears, not WedgePart'), conventions ('models live under Workspace.Entities'), and per-session takeaways so the NEXT session opens with the project context already loaded.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        genre: {
+          type: "string",
+          description:
+            "Set/replace the detected genre: 'obby' | 'simulator' | 'rpg' | 'racing' | 'tower_defense' | 'casual_sim' | 'social' | 'experimental' | 'unknown'.",
+        },
+        placeName: { type: "string", description: "Set/replace the place name." },
+        style: {
+          type: "object",
+          description:
+            "Shallow-merge into profile.style. Keys: palette (array of color strings), materials (array), naming (string), notes (string).",
+        },
+        structure: {
+          type: "object",
+          description:
+            "Shallow-merge into profile.structure. Free-form key/value (e.g. modelRoot='Workspace.Entities').",
+        },
+        decision: {
+          type: "object",
+          description: "Append to decisions log. { topic, choice }.",
+          properties: {
+            topic: { type: "string" },
+            choice: { type: "string" },
+          },
+          required: ["topic", "choice"],
+        },
+        knownIssue: { type: "string", description: "Append to knownIssues." },
+        sessionSummary: {
+          type: "object",
+          description:
+            "Append to sessionLog. { session, summary }. Use at the end of a session to leave breadcrumbs for next time.",
+          properties: {
+            session: { type: "string" },
+            summary: { type: "string" },
+          },
+          required: ["session", "summary"],
+        },
+      },
+    },
+    handler: async (args, ctx) => {
+      const ctxData = await ctx.getPlaceContext();
+      const profile = await loadProfile(ctxData.placeId, ctxData.placeName);
+      const patch: ProfilePatch = {
+        genre: typeof args.genre === "string" ? args.genre : undefined,
+        placeName: typeof args.placeName === "string" ? args.placeName : undefined,
+        style:
+          args.style && typeof args.style === "object"
+            ? (args.style as ProfilePatch["style"])
+            : undefined,
+        structure:
+          args.structure && typeof args.structure === "object"
+            ? (args.structure as ProfilePatch["structure"])
+            : undefined,
+        decision:
+          args.decision && typeof args.decision === "object"
+            ? (args.decision as ProfilePatch["decision"])
+            : undefined,
+        knownIssue:
+          typeof args.knownIssue === "string" ? args.knownIssue : undefined,
+        sessionSummary:
+          args.sessionSummary && typeof args.sessionSummary === "object"
+            ? (args.sessionSummary as ProfilePatch["sessionSummary"])
+            : undefined,
+      };
+      applyPatch(profile, patch);
+      await saveProfile(profile);
+      return {
+        ok: true,
+        placeId: profile.placeId,
+        updatedAt: profile.updatedAt,
+        decisionsCount: profile.decisions.length,
+        sessionLogCount: profile.sessionLog.length,
+        hint: "Read studio://project/profile to see the updated profile.",
+      };
+    },
+  },
   {
     name: "macro_save",
     category: "session",
@@ -918,6 +1025,181 @@ end
 return { undone = undone, requested = n }
 `,
   ),
+
+  // ---- snapshot / diff: DataModel version control -------------------------
+  // snapshot captures a subtree and stores it SERVER-SIDE (SessionMemory),
+  // returning only a tiny summary. diff compares two stored captures (or a
+  // stored capture against a fresh "live" one) and returns a structured delta
+  // ONLY — never a full tree. This is the token-thrift contract: the capture
+  // can be large, but it lives on the server; what crosses the wire to the
+  // agent is a summary (snapshot) or a delta (diff).
+  {
+    name: "snapshot",
+    category: "session",
+    subcategories: ["version-control", "capture", "checkpoint"],
+    keywords: [
+      "snapshot",
+      "capture",
+      "checkpoint",
+      "save state",
+      "baseline",
+      "version",
+      "before",
+      "record state",
+    ],
+    write: false,
+    description:
+      "Capture the current state of a subtree (a stable identity, ClassName, and projected properties per instance) and store it server-side under `name`. Returns only a small summary — NOT the captured tree. Pair with `diff` to see exactly what changed later. The capture lives in session memory (bounded; oldest evicted).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "Key to store this snapshot under. Re-using a name overwrites it.",
+        },
+        path: {
+          type: "string",
+          description:
+            "Subtree root to capture — a ref or dotted path, e.g. 'Workspace' or 'Workspace.Level'. Required: capturing the whole DataModel is intentionally not the default (too heavy).",
+        },
+      },
+      required: ["name", "path"],
+    },
+    handler: async (args, ctx) => {
+      const name = String(args.name ?? "").trim();
+      if (!name) return { error: "bad_args", hint: "snapshot needs a non-empty 'name'." };
+      const path = String(args.path ?? "").trim();
+      if (!path) {
+        return {
+          error: "bad_args",
+          hint: "snapshot needs a 'path' (a ref or dotted path). Capturing the whole DataModel is not supported — pick a subtree, e.g. 'Workspace'.",
+        };
+      }
+      const capture = (await ctx.bridge.send("snapshot", { path })) as
+        | {
+            path?: string;
+            instances?: SnapshotInstance[];
+            instanceCount?: number;
+            truncated?: boolean;
+            capLimit?: number;
+          }
+        | undefined;
+      if (capture && typeof capture === "object" && "error" in capture) {
+        return capture;
+      }
+      const instances = Array.isArray(capture?.instances) ? capture!.instances : [];
+      const truncated = capture?.truncated === true;
+      const stored = ctx.memory.saveSnapshot(name, {
+        path: capture?.path ?? path,
+        instances,
+        truncated,
+      });
+      return {
+        name: stored.name,
+        path: stored.path,
+        instanceCount: stored.instanceCount,
+        capturedAt: stored.capturedAt,
+        ...(truncated
+          ? {
+              truncated: true,
+              note: `Subtree exceeded the ${capture?.capLimit ?? "capture"} instance cap — snapshot is partial. Snapshot a smaller subtree for a complete capture.`,
+            }
+          : {}),
+        hint: `Compare later with diff({ from: "${name}", to: "live" }), or against another snapshot.`,
+      };
+    },
+  },
+  {
+    name: "diff",
+    category: "session",
+    subcategories: ["version-control", "compare", "delta"],
+    keywords: [
+      "diff",
+      "compare",
+      "delta",
+      "changed",
+      "what changed",
+      "difference",
+      "drift",
+      "since",
+      "version",
+    ],
+    write: false,
+    description:
+      "Compare two snapshots and return a structured DELTA ONLY: { added, removed, changed }. `from` and `to` are snapshot names; `to` may instead be the literal 'live' to diff against a fresh capture of the current DataModel at the `from` snapshot's path. Never returns full trees — only the instances/properties that differ.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        from: { type: "string", description: "Baseline snapshot name." },
+        to: {
+          type: "string",
+          description:
+            "Later snapshot name, OR the literal 'live' to capture the DataModel now at the `from` snapshot's path and diff against that.",
+        },
+      },
+      required: ["from", "to"],
+    },
+    handler: async (args, ctx) => {
+      const fromName = String(args.from ?? "").trim();
+      const toArg = String(args.to ?? "").trim();
+      if (!fromName || !toArg) {
+        return { error: "bad_args", hint: "diff needs 'from' and 'to'." };
+      }
+      const fromSnap = ctx.memory.getSnapshot(fromName);
+      if (!fromSnap) {
+        return {
+          error: "snapshot_not_found",
+          name: fromName,
+          hint: "Take it first with snapshot(), or check the studio://session/snapshots resource.",
+        };
+      }
+
+      let toInstances: SnapshotInstance[];
+      let toLabel: string;
+      let liveTruncated = false;
+      if (toArg === "live") {
+        // Fresh capture at the baseline's path — no need to store it.
+        const capture = (await ctx.bridge.send("snapshot", { path: fromSnap.path })) as
+          | { instances?: SnapshotInstance[]; truncated?: boolean }
+          | undefined;
+        if (capture && typeof capture === "object" && "error" in capture) {
+          return capture;
+        }
+        toInstances = Array.isArray(capture?.instances) ? capture!.instances : [];
+        liveTruncated = capture?.truncated === true;
+        toLabel = `live@${fromSnap.path}`;
+      } else {
+        const toSnap = ctx.memory.getSnapshot(toArg);
+        if (!toSnap) {
+          return {
+            error: "snapshot_not_found",
+            name: toArg,
+            hint: "Pass an existing snapshot name, or the literal 'live'.",
+          };
+        }
+        toInstances = toSnap.instances;
+        toLabel = toSnap.name;
+      }
+
+      const delta = diffSnapshots(fromSnap.instances, toInstances);
+      return {
+        from: fromSnap.name,
+        to: toLabel,
+        path: fromSnap.path,
+        added: delta.added,
+        removed: delta.removed,
+        changed: delta.changed,
+        summary: {
+          added: delta.added.length,
+          removed: delta.removed.length,
+          changed: delta.changed.length,
+        },
+        ...(fromSnap.truncated || liveTruncated
+          ? { partial: true, note: "One side of the diff was a truncated capture — the delta may be incomplete." }
+          : {}),
+      };
+    },
+  },
 
   // ---- playtest -----------------------------------------------------------
   evalTool(
@@ -1110,6 +1392,39 @@ return {
 }
 `,
   ),
+
+  // tune: run_code, but inside the LIVE playtest server instead of the edit DM.
+  // run_code/eval execute in the plugin's edit-DataModel context; during Play
+  // Solo the real game runs in a separate play DM. tune ships the Luau over the
+  // PlaytestBus to the play-DM bootstrap, which loadstrings + runs it in the
+  // running server context — so the agent can tweak live values mid-playtest
+  // (gravity, a player's WalkSpeed, enemy stats) and see the effect at once.
+  // Built inline (not dispatchTool) so a success wraps in { result } exactly
+  // like run_code — same envelope, same { __void = true } for a nil return.
+  {
+    name: "tune",
+    category: "playtest",
+    subcategories: ["live", "eval", "tweak"],
+    keywords: ["tune", "live", "eval", "playtest", "tweak", "gravity", "walkspeed", "stats", "mid-run", "hotfix"],
+    write: true,
+    description:
+      "Run arbitrary Luau inside the RUNNING playtest's server DataModel — the live game, not the edit place. Use to tweak values mid-playtest (workspace.Gravity, a player's Humanoid.WalkSpeed/JumpPower, enemy stats) and see the effect immediately. `return <value>` sends data back as JSON (a nil return comes back as { __void = true }). Requires a playtest to be running (start one with playtest_play); errors with `no_playtest` otherwise. This is the live-game counterpart to run_code, which runs in the edit DM.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        luau: { type: "string", description: "Luau source to run in the live play-DM server. Use 'return <value>' to return data." },
+      },
+      required: ["luau"],
+    },
+    handler: async (args, ctx) => {
+      const luau = (args ?? {}).luau;
+      if (typeof luau !== "string" || luau.trim() === "") {
+        return { error: "bad_args", hint: "tune requires a non-empty 'luau' string." };
+      }
+      const result = await ctx.bridge.send("tune", { luau });
+      return { result };
+    },
+  },
 
   // ---- playtest helpers --------------------------------------------------
   dispatchTool(
@@ -1697,9 +2012,9 @@ return { ok = true, frames = count, elapsed = os.clock() - startClock }
   ),
 
   // ---- vision / observation ----------------------------------------------
-  // screenshot is pure server-side (no plugin call) — uses PowerShell + the
-  // __mcpContent escape hatch so the agent gets a real image block back.
-  screenshotTool,
+  // (`screenshot` is now a CORE tool — defined in server.ts. It used to live
+  // here as a specialist; promoted because vision is fundamental and being
+  // gated behind search_tools added friction every session.)
 
   dispatchTool(
     {
