@@ -29,14 +29,25 @@ changing. Forever.
 Measured against the real `ToolSet` over a 60-turn session
 (`test/bench/tool-churn.mjs`):
 
-| | turns that changed the list | second half of the session | last change |
-|---|---|---|---|
-| now (evicting) | 20 / 60 (33%) | 33% | turn 58 |
-| grow-only | 10 / 60 (17%) | 10% | turn 43 |
+| | turns that changed the list | second half | last change | mean prefix |
+|---|---|---|---|---|
+| evicting | 20 / 60 (33%) | 33% | turn 58 | ~11,900 chars |
+| grow-only | 10 / 60 (17%) | 10% | turn 43 | ~20,600 chars |
 
 The number that matters is the second column. With eviction, a third of turns pay full
 price and it never settles down. Grow-only front-loads the churn and then goes quiet,
 because once a tool has been seen it never leaves.
+
+**The last column is the catch, and it has to be said out loud.** Grow-only changes the
+list less often but makes the cached prefix permanently bigger, so the cheap cache-read
+turns cost more. Priced together at the usual cache rates (write 1.25x, read 0.1x), the
+two break even at roughly 3k tokens of non-tool context. Every real session clears that
+on turn one, so grow-only wins — but it wins by less as the catalog grows, which is
+exactly what the catalog budget in item 6 exists to hold.
+
+One premise here is not provable from this repo: that the tool list sits at the very
+front of the cache prefix. That is how the Anthropic API orders a request, but the MCP
+client builds it, not us.
 
 ### What the people who researched this actually do
 
@@ -55,9 +66,9 @@ in `@modelcontextprotocol/sdk` (grepped, v1.29.0). An MCP server only gets to an
 
 So grow-only is the closest thing we can actually reach from here.
 
-### The change
+### The change — DONE
 
-**Size: S.**
+**Size: S.** Landed in `15dc2d3`.
 
 - Delete `evict`, `IDLE_TURNS` and `SPECIALIST_CAP` from `src/session.ts`.
 - `unlockAndSettle` becomes "add these names, report what is new." Nothing is ever dropped.
@@ -66,15 +77,17 @@ So grow-only is the closest thing we can actually reach from here.
 - Keep the reverse-rank `touch` ordering out of it entirely, since it only existed to
   survive eviction.
 
-Worst case the list ends at 63 tools, which is what the other MCP ships on turn one anyway.
+Worst case the list ends at 63 tools. For scale, the competitor ships 48 on turn one, so
+the grow-only ceiling is about a third larger than what they carry from the start.
 
 **Done when:** the unit tests still pass, `test/bench/tool-churn.mjs` reports grow-only numbers
 against the real class, and a real session shows `tools/list_changed` firing only when a
-genuinely new tool appears.
+genuinely new tool appears. All three hold.
 
-**Then measure for real.** Run a normal build session through an actual client and read
-the cache-read vs cache-write token counts before and after. The simulation says 33% to
-17%. Confirm it with real numbers before claiming it.
+**Still open: measure it for real.** Run a normal build session through an actual client
+and read the cache-read vs cache-write token counts before and after. The simulation says
+33% to 17% on change count and a 1.7x bigger prefix. Confirm both with real numbers before
+claiming the win anywhere it matters.
 
 ---
 
@@ -88,19 +101,23 @@ Ordered by what unblocks the most. Not by size.
 
 **Now:** PowerShell `CopyFromScreen` against Studio's window rect. It grabs whatever
 pixels happen to be on screen there, so another window on top means you screenshot that
-window instead. It also yanks Studio to the front while you are working. macOS and Linux
-shell out to the OS capture tool.
+window instead. macOS and Linux shell out to the OS capture tool. (It does *not* raise
+Studio to the front — `src/vision.ts` only calls `GetWindowRect`. Occlusion is the real
+complaint; window-stealing was mine and it was wrong.)
 
 **They:** `StudioCaptureService:CaptureScreenshot()`. Studio-only, PluginSecurity, hands
 back the framebuffer directly. Base64 it in Luau, send it over the bridge. Falls back to
 `CaptureService` plus `EditableImage.ReadPixelsBuffer` tiled when the fast path is off.
 
 **Do:** add a `capture` handler to the plugin using `StudioCaptureService`, route
-`screenshot` through the bridge first, keep the PowerShell path as the fallback only.
+`screenshot` through the bridge first, keep the OS path as the fallback only.
 See `studio-plugin/src/modules/handlers/CaptureHandlers.ts` in their repo for the shape.
 
-**Done when:** screenshotting does not raise the Studio window and does not capture an
-overlapping window.
+**Caveat worth knowing before relying on it:** their own code comments say
+`StudioCaptureService` is FFlag-gated and missing from `@rbxts/types`. It is not a
+guaranteed API, so the OS fallback is not optional.
+
+**Done when:** a capture taken with another window covering Studio still shows Studio.
 
 #### 2. The plugin needs to live in this repo (**M**)
 
@@ -134,20 +151,29 @@ local plugins folder, and fail loudly when plugin and server protocol versions d
 **Now:** nothing. The agent guesses property names, types and enum values, gets them
 wrong, and burns a turn on a failed `mutate`.
 
-**They:** `get_roblox_docs` returns official API docs as Markdown, `get_roblox_skills`
-lists Roblox-authored skills, plus `robloxdocs://` resource templates.
+**They:** `get_roblox_docs` fetches the *rendered Markdown* from
+`create.roblox.com/docs/reference/engine` with a 24h cache and a 50k-char cap (not the
+API dump). `get_roblox_skills` lists Roblox-authored skills, plus `robloxdocs://`
+resource templates.
 
-**Do:** pull the Roblox API dump (it is a public JSON file), cache it locally, expose
+**Do:** pull the Roblox API dump (a public JSON file), cache it locally, expose
 `docs_class` and `docs_member`. Does not need the plugin at all.
 
-**Done when:** the agent can ask "what properties does a PointLight have" and get the
-real answer with types and defaults.
+**One thing the dump cannot give you.** Its member records carry
+`Name, MemberType, ValueType, Category, Security, Tags, ThreadSafety, Parameters,
+ReturnType, Serialization` and nothing else. **There is no default-value field.** So
+defaults come from a live `Instance.new(Class)[prop]` read over `eval`, not from the dump.
+
+**Done when:** the agent can ask "what properties does a PointLight have" and get real
+names, types, and read/write security — with defaults available through a separate live
+read, clearly labelled as such.
 
 #### 5. Structured output schemas (**M**)
 
 **Now:** every tool returns a JSON blob inside a text block. The model has to parse prose.
 
-**They:** every tool has an `outputSchema`, enforced by a regression test.
+**They:** `outputSchema` is optional in their tool type, and a regression test pins 47 of
+48 as having one. Nearly-every, not every.
 
 **Do:** add `outputSchema` per tool, starting with the five core ones, and a test that
 fails when a tool ships without one.
@@ -159,11 +185,13 @@ fails when a tool ships without one.
 **Now:** progressive disclosure keeps the per-turn cost low, but nothing stops a single
 description from being enormous.
 
-**They:** a test caps the whole public catalog at 43,000 characters, tool descriptions at
-120, argument descriptions at 64.
+**They:** a test caps the public catalog at 44,000 characters (their own token-efficiency
+doc says 43,000 and is stale relative to their test), tool descriptions at 120, argument
+descriptions at 64, and the read-only catalog at 20,000. The 120 is also enforced at build
+time by truncating the description, not only by failing the test.
 
-**Do:** copy the idea. One test, three limits. This gets more important once the tool set
-is grow-only, because then everything is visible eventually.
+**Do:** copy the idea. One test, several limits. This matters more once the tool set is
+grow-only, because then everything is visible eventually.
 
 **Done when:** `npm test` fails if someone writes a 400-character tool description.
 
@@ -228,8 +256,8 @@ better than the old permanent cache, but still single-target.
 
 #### 12. Test depth (**L, ongoing**)
 
-**Now:** 83 tests across 20 suites, all runnable without Studio. They cover the audit
-findings specifically, but not the breadth of the surface.
+**Now:** 105 tests across 23 suites, all runnable without Studio. They cover the audit
+findings and the PLAN items landed so far, but not the breadth of the surface.
 
 **They:** 487 test cases across 36 files, including dedicated suites for HTTP security,
 body limits, transport, response delivery, script-source safety and asset security.
@@ -242,8 +270,9 @@ goes up on its own.
 **Now:** one build. Read-only is a runtime toggle in the panel, not something you can
 install instead.
 
-**They:** a separate `-inspector` npm package with 24 Studio-safe inspection tools and no
-DataModel or script edits at all. The installers remove the other variant.
+**They:** a separate `-inspector` npm package with 25 Studio-safe inspection tools (every
+tool whose declared `category` is `read`) and no DataModel or script edits at all. The
+installers remove the other variant.
 
 **Do:** `capabilities()` already knows which tools are write-class, so this is mostly a
 build flag that filters the registry. The point is that a read-only install cannot be
@@ -259,6 +288,11 @@ sit until the next poll cycle picks it up.
 **Do:** add a WebSocket route, keep long-poll as the fallback, let the plugin pick.
 Protocol is already a range, so this is an additive bump.
 
+**The plugin side is possible.** Theirs uses
+`HttpService:CreateWebStreamClient(Enum.WebStreamClientType.WebSocket, ...)` with
+generation guards and 0.5s-to-5s reconnect backoff. So a Luau WebSocket client is not a
+blocker, only work.
+
 #### 15. Written documentation (**S**)
 
 **Now:** README, CLAUDE.md, and three audit documents. Accurate, but no SECURITY.md and
@@ -273,32 +307,56 @@ configuration guide covering `CUBES_MCP_TOKEN`, `CUBES_MCP_PORT` and
 
 ---
 
+## What CI here can and cannot prove
+
+The Studio plugin is not in this repository and never has been, so nothing below the
+bridge can be exercised in CI. For every item that needs the plugin (1, 8, 9, 10, 11, 14)
+the deliverable from this side is: the server half, the protocol, and a test that asserts
+the exact command shape sent over `FakeTransport`. The Studio-side behaviour is a manual
+check, and any "done when" phrased as observable Studio behaviour has to say so.
+
+Item 2 is worse than it reads. "Un-gitignore it and commit" assumes the source is here.
+It is not, and `git log --all -- roblox/` is empty, so it never was. The real item is
+"get the plugin source into this repo from wherever it is distributed," and items 1, 8, 9,
+10, 11 and 14 all depend on it transitively.
+
+---
+
 ## Do not break these while doing the above
 
 We already win these rows. They are easy to lose in a refactor.
 
-- **Write-class is derived from the tool's channel, not a label.** Their approach is four
-  hardcoded name sets, and a new tool can be mislabelled. Ours cannot.
-- **Every bridge route requires the bearer token, both directions.** Their `/ready`,
-  `/events`, `/response` and `/disconnect` are deliberately tokenless, so a local process
-  can answer on the plugin's behalf.
+- **Write-class is derived from the tool's channel, not a label.** Theirs is a mandatory
+  hand-written `category: 'read' | 'write'` field on each tool (plus four name sets that
+  only refine the MCP annotation hints). A hand-written label can be wrong; a tool that
+  ships Luau is write-class here because of how it was constructed.
+- **Every bridge route requires the bearer token, both directions.** Their `/studio`
+  WebSocket upgrade *does* check `X-Studio-Token`. But `/ready` is unauthenticated and is
+  what *mints* that token, and `/disconnect` takes an arbitrary peer id with no auth — so
+  a local process can still register a fake peer and answer on the plugin's behalf.
 - **`confirm: true` on destructive batches**, with a four-level classifier and elicitation
   when the client supports it. They have no runtime gate at all.
 - **Per-place profiles, macros and sticky context** at `~/.cubesmcp/profiles/{placeId}.json`.
 - **`snapshot` and `diff`.** They have no place-state diffing.
 - **selene over every written `Source`.**
 - **Rojo sourcemap annotation.**
-- **~6k lines of TypeScript versus ~203k.** One person can hold all of it in their head.
-  Every item above costs some of that. Spend it on purpose.
+- **Protocol is a range, not an equality check.** They compare protocol versions for
+  equality, so any additive change breaks every un-updated plugin. We bump MAX for
+  additive changes and only raise MIN for genuinely breaking ones.
+- **6,817 lines of TypeScript versus 29,544 (46,482 with their tests).** About 4x, not the
+  34x a whole-repo line count suggests — their 203k is mostly a lockfile. Still: one
+  person can hold this whole repo in their head. Every item above costs some of that.
+  Spend it on purpose.
 
 ---
 
 ## Suggested order
 
-1. Part 1 (grow-only tool list). Half a day, helps every turn.
+1. ~~Part 1 (grow-only tool list)~~ — done, `15dc2d3`.
 2. Plugin into the repo (#2), then npm publish (#3). Everything else is easier after.
-3. Docs tool (#4) and description budget (#6). Both cheap, both immediately useful.
+3. ~~Description budget (#6)~~ — done, `b7173df`. ~~Output schemas (#5)~~ — done,
+   `30a8c43`. Docs tool (#4) next: cheap and immediately useful.
 4. Studio-side screenshot (#1).
-5. Output schemas (#5), SECURITY.md and config guide (#15).
+5. SECURITY.md and config guide (#15).
 6. Assets (#7).
 7. Everything else, by whatever you actually need that week.

@@ -675,7 +675,7 @@ export function createMcpServer(bridge: StudioTransport): Server {
     const limit = Math.min(Math.max(1, Math.trunc(requested)), MAX_SEARCH_RESULTS);
     if (intent) session.sticky.recentIntent = intent;
 
-    const matches = registry.search(query, intent, limit);
+    const matches = registry.search(query, intent, limit, session.tools.recentlyUsed());
     // Every match survives, so the response can never disagree with tools/list.
     const settled = session.tools.unlock(
       matches.map((m) => m.name),

@@ -6,6 +6,8 @@
 // renders first in the cached prefix. This compares the shipping grow-only
 // ToolSet against a replica of the eviction behaviour it replaced.
 import { ToolSet } from "../../dist/session.js";
+import { ALL_TOOLS } from "../../dist/tools/index.js";
+import { outputSchemaFor } from "../../dist/registry.js";
 
 const CORE = ["search_tools", "read", "screenshot", "mutate", "run_code"];
 
@@ -78,9 +80,30 @@ for (const j of order) {
   turns.push({ search: tools }, { call: tools[0] }, { call: tools[1] });
 }
 
+/**
+ * Serialized chars for one tool, as tools/list would send it. The bench's
+ * fictional tool names aren't in the registry, so they're charged the mean cost
+ * of a real specialist — the point is the size of the prefix, not which tools.
+ */
+const REAL_SIZES = ALL_TOOLS.map(
+  (t) =>
+    JSON.stringify({
+      name: t.name,
+      description: `[${t.category}] ${t.description}`,
+      inputSchema: t.inputSchema,
+      outputSchema: outputSchemaFor(t),
+    }).length,
+);
+const MEAN_SPECIALIST_CHARS = Math.round(REAL_SIZES.reduce((a, b) => a + b, 0) / REAL_SIZES.length);
+/** The five core tools are always present. Measured from the real defs. */
+const CORE_CHARS = 6_837;
+
+const catalogChars = (visible) => CORE_CHARS + (visible.length - CORE.length) * MEAN_SPECIALIST_CHARS;
+
 function measure(set) {
   let before = set.visible().join(",");
   const changes = [];
+  const sizes = [];
   turns.forEach((t, i) => {
     const turn = i + 1;
     if (t.search) set.unlock(t.search, turn);
@@ -88,11 +111,13 @@ function measure(set) {
       set.touch(t.call, turn);
       set.settle?.(turn);
     }
-    const now = set.visible().join(",");
+    const visible = set.visible();
+    const now = visible.join(",");
     if (now !== before) changes.push(turn);
     before = now;
+    sizes.push(catalogChars(visible));
   });
-  return changes;
+  return { changes, meanChars: Math.round(sizes.reduce((a, b) => a + b, 0) / sizes.length) };
 }
 
 const n = turns.length;
@@ -103,11 +128,27 @@ for (const [label, set] of [
   ["evict (old)", new EvictingToolSet()],
   ["grow (now)", new ToolSet()],
 ]) {
-  const c = measure(set);
+  const { changes: c, meanChars } = measure(set);
   const late = c.filter((t) => t > half).length;
   console.log(
-    `${label.padEnd(12)} total ${String(c.length).padStart(2)}/${n} (${pct(c.length, n).padStart(4)})   ` +
-      `second half ${String(late).padStart(2)}/${n - half} (${pct(late, n - half).padStart(4)})   ` +
-      `last change turn ${c[c.length - 1] ?? "-"}   final size ${set.visible().length}`,
+    `${label.padEnd(12)} changed ${String(c.length).padStart(2)}/${n} (${pct(c.length, n).padStart(4)})   ` +
+      `2nd half ${String(late).padStart(2)}/${n - half} (${pct(late, n - half).padStart(4)})   ` +
+      `last turn ${String(c[c.length - 1] ?? "-").padStart(2)}   ` +
+      `tools ${String(set.visible().length).padStart(2)}   ` +
+      `mean prefix ~${meanChars.toLocaleString()} chars`,
   );
 }
+
+// Change count is only half the story, and the half that flatters grow-only.
+// Grow-only also makes the cached prefix permanently bigger, so every cheap
+// cache-read turn costs more. Both effects have to be priced together.
+console.log(`
+Fewer changes but a bigger prefix. At the usual cache pricing (write 1.25x,
+read 0.1x) and H tokens of non-tool context, cost per turn is roughly
+
+  evict:  0.33 * 1.25 * (H + Tevict) + 0.67 * 0.10 * (H + Tevict)
+  grow:   0.10 * 1.25 * (H + Tgrow)  + 0.90 * 0.10 * (H + Tgrow)
+
+which break even near H = 3k tokens. Every real session clears that on the
+first turn, so grow-only wins — but it wins by less as the catalog grows,
+which is what the catalog budget in test/unit/catalog-budget.test.mjs is for.`);

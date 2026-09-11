@@ -246,6 +246,18 @@ describe("ToolSet: grow-only visibility", () => {
     assert.equal(new Set(previous).size, previous.length, "no duplicates");
   });
 
+  test("recentlyUsed reports specialists newest first, core excluded", () => {
+    const ts = new ToolSet();
+    ts.unlock(["alpha"], 1);
+    ts.unlock(["beta"], 2);
+    ts.unlock(["gamma"], 3);
+    ts.touch("read", 4); // core, must not appear
+    ts.touch("alpha", 5);
+    assert.deepEqual(ts.recentlyUsed(), ["alpha", "gamma", "beta"]);
+    assert.deepEqual(ts.recentlyUsed(2), ["alpha", "gamma"]);
+    assert.deepEqual(ts.recentlyUsed(0), []);
+  });
+
   test("touch records the turn without changing visibility", () => {
     const ts = new ToolSet();
     ts.unlock(["tracked"], 3);
@@ -384,5 +396,34 @@ describe("screenshot inset coercion", () => {
 
   test("caller overrides survive when they are real numbers", () => {
     assert.equal(resolveInsets("viewport", { top: 5 }).top, 5);
+  });
+});
+
+// ------------------------------------------------------- search recency boost
+
+describe("search ranking: recency", () => {
+  test("a recently used tool outranks an equally-matching one that wasn't", async () => {
+    const { ToolRegistry } = await import("../../dist/registry.js");
+    const mk = (name) => ({
+      name,
+      category: "instances",
+      subcategories: ["shape"],
+      keywords: ["widget", "thing"],
+      description: "A widget thing for testing ranking.",
+      inputSchema: { type: "object", properties: {} },
+      channel: "local",
+      handler: async () => ({}),
+    });
+    const registry = new ToolRegistry([mk("widget_a"), mk("widget_b")]);
+
+    const plain = registry.search("widget thing", undefined, 2).map((e) => e.name);
+    assert.equal(plain.length, 2, "both should match");
+
+    const boosted = registry.search("widget thing", undefined, 2, ["widget_b"]).map((e) => e.name);
+    assert.equal(boosted[0], "widget_b", "the recently used one should come first");
+
+    // And the cache must not serve the un-boosted answer to the boosted query.
+    const again = registry.search("widget thing", undefined, 2).map((e) => e.name);
+    assert.deepEqual(again, plain, "the recency key must not poison the plain cache entry");
   });
 });

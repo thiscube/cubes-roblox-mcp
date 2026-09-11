@@ -832,6 +832,14 @@ all three routes.
    `snapshot-diff` so findings 8, 12, 16 and 17 cannot regress.
 6. **Findings 20 + 30** — docs, once the code settles.
 
+> **This list is history.** Every item above is done — see the status banner in
+> `ISSUES.md`. Two notes so the text is not misread as open work: finding 12 was
+> **withdrawn as a false positive**, not fixed; and `session.evict` no longer exists,
+> because the tool set became grow-only (`PLAN.md` Part 1), so the test that replaced it
+> asserts the opposite invariant — nothing is ever dropped.
+>
+> For what is actually next, read `PLAN.md`.
+
 ---
 
 ## Reproduction harness

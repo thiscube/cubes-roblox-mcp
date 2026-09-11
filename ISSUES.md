@@ -218,7 +218,7 @@ Capped at 200 entries by count, not by size. Each one can hold a whole script's 
 
 **`#21` · LOW · No tests that run without Studio, no CI**
 There's no `test` script and no `.github/` folder. All 7 test files need a live Studio with the
-plugin connected. Meanwhile `safety.ts`, `snapshot-diff.ts`, `luaJson` and `session.evict` could
+plugin connected. Meanwhile `safety.ts`, `snapshot-diff.ts`, `luaJson` and the tool set could
 all be unit tested today with zero Roblox involved.
 `package.json`
 

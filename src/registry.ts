@@ -219,11 +219,12 @@ export class ToolRegistry {
   }
 
   /**
-   * Keyword (BM25) search + verbatim category boost + optional intent boost.
+   * Keyword (BM25) search + verbatim category boost + optional intent boost +
+   * a recency boost for tools this session has used (`recent`, newest first).
    * Semantic/embedding search is intentionally deferred (see design doc Layer 2).
    */
-  search(query: string, intent?: string, limit = 5): ToolEntry[] {
-    const cacheKey = `${query}|${intent ?? ""}|${limit ?? 5}`;
+  search(query: string, intent?: string, limit = 5, recent: readonly string[] = []): ToolEntry[] {
+    const cacheKey = `${query}|${intent ?? ""}|${limit ?? 5}|${recent.join(",")}`;
     const cached = this.searchCache.get(cacheKey);
     if (cached !== undefined) {
       this.searchCache.delete(cacheKey);
@@ -233,6 +234,7 @@ export class ToolRegistry {
 
     const lowerQuery = query.toLowerCase();
     const intentCats = intent ? INTENT_CATEGORIES[intent] ?? [] : [];
+    const recentSet = new Set(recent);
 
     const results = this.index.search(query, {
       boostDocument: (id: string) => {
@@ -241,6 +243,8 @@ export class ToolRegistry {
         let boost = 1;
         if (new RegExp(`\\b${entry.category}\\b`, "i").test(lowerQuery)) boost *= 2;
         if (intentCats.includes(entry.category)) boost *= 1.5;
+        // What the session just used is a strong hint at what it means now.
+        if (recentSet.has(entry.name)) boost *= 1.4;
         return boost;
       },
     });

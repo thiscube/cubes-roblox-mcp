@@ -74,6 +74,22 @@ export class ToolSet {
     return this.lastTurn.get(tool) ?? 0;
   }
 
+  /**
+   * The specialists used most recently, newest first.
+   *
+   * Feeds a ranking boost in `search_tools`. This matters more now than it did
+   * under eviction: the visible set only grows, so by mid-session the registry
+   * search is competing against a much larger pool and "the thing you were just
+   * working with" is a strong signal for what you mean.
+   */
+  recentlyUsed(limit = 5): string[] {
+    return [...this.lastTurn.entries()]
+      .filter(([name]) => !this.isCore(name))
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, Math.max(0, limit))
+      .map(([name]) => name);
+  }
+
   /** Mark a tool as used now. Core tools are tracked too, harmlessly. */
   touch(tool: string, turn: number): void {
     this.lastTurn.set(tool, turn);
