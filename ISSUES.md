@@ -3,6 +3,26 @@
 38 issues total: **32 bugs** (numbered `#1`-`#32`, full detail in `AUDIT.md`) and
 **6 structural problems** (numbered `A1`-`A6`, full detail in `ARCHITECTURE-REVIEW.md`).
 
+> ## Status: all fixed
+> **37 fixed, 1 withdrawn as a false positive.** Verified by 83 unit tests that run
+> with no Studio, no port and no plugin (`npm test`), plus CI on Node 20 and 22.
+> See `FIXES.md` for the before/after on every one.
+>
+> **`#12` was withdrawn, not fixed.** The `\uXXXX` escape it flagged is always
+> preceded by a doubled backslash, which Lua reads as a literal backslash — leaving
+> valid JSON for `JSONDecode`. The original code round-tripped correctly. Neither
+> the audit nor the verification pass checked the doubling. `luaJson` was rewritten
+> anyway (byte-exact `\ddd` escapes), but that is hardening, not a bug fix.
+>
+> **`A1` is partly fixed.** The `__MCP` contract now has a single declaration
+> (`src/tools/mcp-api.ts`) and a test that fails on drift, which closes the failure
+> A1 actually described. Full extraction of the 33 templates into real `.luau` files
+> with a parser in CI is still open.
+>
+> **One change needs the plugin updated.** The bridge now requires a bearer token
+> (protocol 2). A plugin that does not send one gets 401. `CUBES_MCP_ALLOW_UNAUTHENTICATED=1`
+> is an explicit, loudly-warned escape hatch until the plugin catches up.
+
 This file is the readable index. Same numbers as the other two docs, so you can jump
 between them.
 
