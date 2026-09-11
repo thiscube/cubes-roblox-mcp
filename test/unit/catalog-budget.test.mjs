@@ -16,8 +16,12 @@ import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 
 import { createMcpServer } from "../../dist/server.js";
+import { installFakeDump } from "./_fixtures.mjs";
 import { ALL_TOOLS } from "../../dist/tools/index.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+
+// Docs tools must answer from a fixture, never from Roblox's CDN.
+installFakeDump();
 
 /**
  * Hard ceiling on the serialized `tools/list` payload with every tool visible.

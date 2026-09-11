@@ -28,7 +28,7 @@ manually unless you hold stdin open (`node dist/index.js < <(sleep 86400)`).
 
 `index.ts` starts a `StudioBridge` (HTTP long-poll on 127.0.0.1:44820) and an MCP server
 over stdio. The bridge implements `StudioTransport` (`src/transport.ts`); everything above
-that line — the 58 specialist tools, the core handlers, the resource handlers — depends only
+that line — the specialist tools, the core handlers, the resource handlers — depends only
 on the interface, which is why the tools are unit-testable against a fake and why a second
 transport (Open Cloud) would not touch a single tool handler.
 
@@ -74,7 +74,9 @@ curl -s -X POST http://127.0.0.1:44820/rpc \
 - `ISSUES.md` — every known defect in plain language. Read before changing behaviour.
 - `AUDIT.md` / `ARCHITECTURE-REVIEW.md` — the detailed findings behind it.
 - `src/transport.ts` — the seam. Depend on this, not on `StudioBridge`.
-- `src/registry.ts` — `capabilities()`, the tool constructors, `luaJson`.
+- `src/registry.ts` — `capabilities()`, `outputSchemaFor()`, the tool constructors, `luaJson`.
+- `src/docs.ts` — the cached Roblox API dump behind the `docs_*` tools.
+- `src/paths.ts` — every on-disk location, resolved lazily (`CUBES_MCP_HOME`).
 - `src/server.ts` — the five always-visible core tools (`search_tools`, `read`, `screenshot`,
   `mutate`, `run_code`) plus the resource handlers.
 - `src/tools/index.ts` — assembles every category into `ALL_TOOLS`.
@@ -88,3 +90,10 @@ curl -s -X POST http://127.0.0.1:44820/rpc \
 - Rebuilding the plugin needs a Studio restart (plugins are cached at launch) and a new MCP
   client session (tool schemas load at session start).
 - Port is configurable from the panel; the server must run with a matching `CUBES_MCP_PORT`.
+- The visible tool set is **grow-only**. Nothing is ever evicted, because every change to
+  `tools/list` invalidates the prompt cache for that turn. Don't add eviction back; see
+  `PLAN.md` Part 1 and `test/bench/tool-churn.mjs`.
+- The tool catalog is on a **budget** (`test/unit/catalog-budget.test.mjs`). A new tool has
+  to fit the mean, so adding one usually means trimming another's description.
+- Unit tests never touch the network. The `docs_*` tools read a fixture
+  (`test/unit/_fixtures.mjs`); CI sets `CUBES_MCP_OFFLINE=1` so a stray fetch fails the build.

@@ -31,3 +31,8 @@ jobs:
 
       - name: Unit tests
         run: npm run test:unit
+        env:
+          # Unit tests answer API-reference questions from a fixture. This makes a
+          # stray network read fail the build instead of passing quietly on CI's
+          # connection and then failing on someone's laptop.
+          CUBES_MCP_OFFLINE: "1"

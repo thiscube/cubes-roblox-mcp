@@ -16,8 +16,9 @@
  */
 
 import { readFile, writeFile, mkdir, rename, unlink } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join, dirname } from "node:path";
+
+import { profileDir } from "./paths.js";
 
 export interface ProfileDecision {
   topic: string;
@@ -54,10 +55,11 @@ export interface ProjectProfile {
   sessionLog: ProfileSessionSummary[];
 }
 
-const PROFILE_DIR = join(homedir(), ".cubesmcp", "profiles");
+
 
 function profilePath(placeId: number): string {
-  return join(PROFILE_DIR, `${placeId}.json`);
+  // Resolved per call so CUBES_MCP_HOME can relocate it. See src/paths.ts.
+  return join(profileDir(), `${placeId}.json`);
 }
 
 function emptyProfile(placeId: number, placeName?: string): ProjectProfile {

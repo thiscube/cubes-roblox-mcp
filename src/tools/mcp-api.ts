@@ -85,7 +85,7 @@ export const MCP_API: readonly McpHelper[] = [
     name: "serialize",
     signature: "serialize(value)",
     summary: "Convert a Luau value into the JSON-safe envelope the server expects.",
-    exercisedByTemplates: false,
+    exercisedByTemplates: true,
   },
   {
     name: "viewport",

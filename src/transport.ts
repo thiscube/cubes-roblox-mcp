@@ -1,7 +1,7 @@
 /**
  * The seam between the MCP server and whatever is driving Roblox Studio.
  *
- * Everything above this line (the 58 specialist tools, the core handlers, the
+ * Everything above this line (the specialist tools, the core handlers, the
  * resource handlers) depends only on this interface. `StudioBridge` is one
  * implementation — an HTTP long-poll bridge to the Studio plugin — and
  * `FakeTransport` in the tests is another.

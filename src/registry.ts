@@ -41,6 +41,7 @@ export type Category =
   | "camera"
   | "viewport"
   | "debug"
+  | "docs"
   | "session";
 
 /** Everything a tool handler needs from the server. */
@@ -149,9 +150,10 @@ export function outputSchemaFor(entry: Pick<ToolEntry, "channel" | "outputSchema
 
 /** intent hint -> category clusters it biases toward. */
 const INTENT_CATEGORIES: Record<string, Category[]> = {
-  building: ["instances", "physics", "terrain", "ui"],
-  debugging: ["scripts", "playtest", "debug"],
+  building: ["instances", "physics", "terrain", "ui", "docs"],
+  debugging: ["scripts", "playtest", "debug", "docs"],
   polishing: ["ui", "lighting", "audio", "animation"],
+  reference: ["docs"],
 };
 
 interface IndexDoc {
@@ -285,15 +287,25 @@ interface ToolMeta {
   outputSchema?: JsonSchema;
 }
 
-/** A specialist that ships generated Luau to the plugin's eval path. */
-export function evalTool(meta: ToolMeta, buildLuau: (args: any) => string): ToolEntry {
+/**
+ * A specialist that ships generated Luau to the plugin's eval path.
+ *
+ * `buildLuau` may be async: `docs_defaults` has to read the API dump before it
+ * knows which properties to ask for. It stays an eval tool rather than becoming
+ * a local one that calls the bridge, because its effect really is in Studio and
+ * the channel is what decides capability.
+ */
+export function evalTool(
+  meta: ToolMeta,
+  buildLuau: (args: any) => string | Promise<string>,
+): ToolEntry {
   return {
     ...meta,
     channel: "eval",
     handler: async (args, ctx) => {
       const result = await ctx.bridge.send(
         "eval",
-        { luau: buildLuau(args ?? {}) },
+        { luau: await buildLuau(args ?? {}) },
         timeoutFor(meta, args),
       );
       return { result };

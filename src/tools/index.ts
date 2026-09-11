@@ -11,6 +11,7 @@ import { ANIMATION_TOOLS } from "./animation.js";
 import { AUDIO_TOOLS } from "./audio.js";
 import { PHYSICS_TOOLS } from "./physics.js";
 import { LIGHTING_TOOLS } from "./lighting.js";
+import { DOCS_TOOLS } from "./docs.js";
 
 /**
  * Every specialist tool, assembled from the per-category files.
@@ -33,4 +34,5 @@ export const ALL_TOOLS: ToolEntry[] = [
   ...AUDIO_TOOLS,
   ...PHYSICS_TOOLS,
   ...LIGHTING_TOOLS,
+  ...DOCS_TOOLS,
 ];
