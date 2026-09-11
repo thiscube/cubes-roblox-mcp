@@ -10,41 +10,47 @@
 export const CORE_TOOLS = ["search_tools", "read", "screenshot", "mutate", "run_code"] as const;
 const CORE_SET: ReadonlySet<string> = new Set(CORE_TOOLS);
 
-/** How many specialists stay visible at once, on top of the core tools. */
-export const SPECIALIST_CAP = 8;
-/** Turns of disuse before a specialist is dropped. */
-const IDLE_TURNS = 10;
-
-export interface SettleResult {
-  /** Specialists visible after unlock + eviction resolved. */
+export interface UnlockResult {
+  /** Everything in tools/list after the unlock, core first. */
   visible: string[];
-  /** Requested unlocks that survived eviction — safe to report to the agent. */
+  /** Names that were not already visible and have now been added. */
   unlocked: string[];
-  /** Requested unlocks that were immediately evicted (should be empty in practice). */
-  rejected: string[];
-  /** True if the visible set changed and tools/list_changed should fire. */
+  /** True if the visible set grew and tools/list_changed should fire. */
   changed: boolean;
 }
 
 /**
- * Owns the visible tool set.
+ * Owns the visible tool set. Grow-only: a tool that has been surfaced never
+ * leaves.
  *
- * Previously three call sites called `unlock` and a fourth called `evict`, all
- * writing the same Set with nobody arbitrating — which is why `search_tools` could
- * report twelve tools while `tools/list` carried eight, and why the tools it dropped
- * were the highest-ranked ones (AUDIT.md #8, ARCHITECTURE-REVIEW.md A4).
+ * It used to evict — idle tools aged out after 10 turns and the set was capped
+ * at 8 specialists. That was wrong for two separate reasons.
  *
- * Now every mutation goes through here, eviction is resolved BEFORE the caller
- * builds its response, and recency is a strictly increasing sequence number so
- * same-turn unlocks never tie and LRU is exact.
+ * The first is correctness. Three call sites mutated the same Set with nobody
+ * arbitrating, so `search_tools` could report twelve tools while `tools/list`
+ * carried eight, and the tools it dropped were the highest-ranked ones
+ * (AUDIT.md #8, ARCHITECTURE-REVIEW.md A4).
+ *
+ * The second is cost, and it is the reason eviction is gone rather than fixed.
+ * `tools` renders first in the prompt-cache prefix, so any change to the tool
+ * list invalidates the cache for that turn. Eviction guarantees the list keeps
+ * changing: measured over a 60-turn session (`test/bench/tool-churn.mjs`), 33%
+ * of turns changed the list and it stayed at 33% in the second half, because
+ * churn is the steady state. Grow-only lands at 17% overall and 10% late, since
+ * once a tool has been seen it never leaves and the list converges.
+ *
+ * Anthropic's own fix is `defer_loading` plus `tool_addition`/`tool_removal`,
+ * which keep the list literally constant. Those are Messages API parameters and
+ * the MCP client builds that request, not this server — they do not exist in
+ * `@modelcontextprotocol/sdk`. Grow-only is the closest reachable approximation.
+ *
+ * Worst case the list ends at every tool in the registry, which is what other
+ * Roblox MCP servers ship on turn one anyway.
  */
 export class ToolSet {
   private readonly active = new Set<string>(CORE_TOOLS);
-  /** tool name -> monotonic sequence number of last use. */
-  private readonly lastUsed = new Map<string, number>();
-  /** tool name -> turn of last use, for idle eviction. */
+  /** tool name -> turn of last use. Kept for ranking and diagnostics only. */
   private readonly lastTurn = new Map<string, number>();
-  private seq = 0;
 
   isCore(tool: string): boolean {
     return CORE_SET.has(tool);
@@ -63,72 +69,33 @@ export class ToolSet {
     return [...this.active].filter((t) => !this.isCore(t));
   }
 
+  /** Turn a tool was last used, or 0. */
+  lastUsedTurn(tool: string): number {
+    return this.lastTurn.get(tool) ?? 0;
+  }
+
   /** Mark a tool as used now. Core tools are tracked too, harmlessly. */
   touch(tool: string, turn: number): void {
-    this.seq += 1;
-    this.lastUsed.set(tool, this.seq);
     this.lastTurn.set(tool, turn);
   }
 
   /**
-   * Unlock names, then immediately resolve eviction, and report what actually
-   * survived. Callers must report `unlocked` from the result rather than what
-   * they asked for.
+   * Make `names` visible. Nothing is ever dropped, so everything asked for is
+   * unlocked and callers can report the result verbatim.
    */
-  unlockAndSettle(names: string[], turn: number): SettleResult {
-    const before = new Set(this.active);
-    for (const name of names) this.active.add(name);
-    // `names` arrives in RANK order, best first. Recency is assigned in reverse
-    // so the best match ends up most-recently-used — otherwise strict LRU evicts
-    // exactly the top hits, which is the bug this class exists to fix
-    // (AUDIT.md #8).
-    for (let i = names.length - 1; i >= 0; i -= 1) this.touch(names[i], turn);
-    this.evict(turn);
-
-    const visible = this.specialists();
-    const survived = new Set(visible);
-    const unlocked = names.filter((n) => survived.has(n) && !before.has(n));
-    const rejected = names.filter((n) => !survived.has(n));
-    const changed =
-      before.size !== this.active.size || [...this.active].some((t) => !before.has(t));
-    return { visible: this.visible(), unlocked, rejected, changed };
-  }
-
-  /** Resolve eviction only (after a tool call that didn't unlock anything). */
-  settle(turn: number): boolean {
-    const before = this.active.size;
-    const beforeSet = new Set(this.active);
-    this.evict(turn);
-    return before !== this.active.size || [...this.active].some((t) => !beforeSet.has(t));
-  }
-
-  /**
-   * Drop specialists that have gone idle or push the set over its cap.
-   * Eviction is strict LRU on a monotonic sequence, so the tools unlocked most
-   * recently are the ones kept.
-   */
-  private evict(turn: number, idleTurns = IDLE_TURNS, cap = SPECIALIST_CAP): void {
-    for (const tool of [...this.active]) {
-      if (this.isCore(tool)) continue;
-      const last = this.lastTurn.get(tool) ?? turn;
-      if (turn - last > idleTurns) this.drop(tool);
+  unlock(names: string[], turn: number): UnlockResult {
+    const unlocked: string[] = [];
+    for (const name of names) {
+      if (!this.active.has(name)) {
+        this.active.add(name);
+        unlocked.push(name);
+      }
+      this.touch(name, turn);
     }
-
-    const specialists = this.specialists();
-    if (specialists.length > cap) {
-      specialists
-        .sort((a, b) => (this.lastUsed.get(a) ?? 0) - (this.lastUsed.get(b) ?? 0))
-        .slice(0, specialists.length - cap)
-        .forEach((t) => this.drop(t));
-    }
-  }
-
-  private drop(tool: string): void {
-    this.active.delete(tool);
-    this.lastUsed.delete(tool);
-    this.lastTurn.delete(tool);
+    return { visible: this.visible(), unlocked, changed: unlocked.length > 0 };
   }
 }
+
 
 /**
  * Identity of the place currently open in Studio.

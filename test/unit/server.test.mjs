@@ -174,12 +174,39 @@ describe("search_tools honesty (#8)", () => {
     }
   });
 
-  test("#8 overflow is disclosed rather than silently dropped", async () => {
+  test("#8 nothing is dropped, so there is no overflow to disclose", async () => {
     const h = harness(new FakeTransport());
-    const p = h.payloadOf(await h.callTool("search_tools", { query: "debug playtest character terrain sound", limit: 12 }));
-    // limit is clamped to the cap, so nothing should be silently lost.
-    assert.ok(p.unlocked.length <= 8);
-    if (p.not_unlocked) assert.ok(Array.isArray(p.not_unlocked));
+    const p = h.payloadOf(
+      await h.callTool("search_tools", {
+        query: "debug playtest character terrain sound",
+        limit: 12,
+      }),
+    );
+    assert.equal(p.not_unlocked, undefined, "grow-only: nothing can be dropped");
+    const { tools } = await h.listTools();
+    const listed = new Set(tools.map((t) => t.name));
+    for (const u of p.unlocked) assert.ok(listed.has(u.name), `${u.name} missing from tools/list`);
+  });
+
+  test("limit is a results cap, not a visibility cap", async () => {
+    const h = harness(new FakeTransport());
+    const p = h.payloadOf(await h.callTool("search_tools", { query: "part", limit: 999 }));
+    assert.ok(p.unlocked.length <= 12, "one query cannot dump the whole registry");
+  });
+
+  test("tools stay in the list across later unrelated calls", async () => {
+    const h = harness(new FakeTransport());
+    const first = h.payloadOf(await h.callTool("search_tools", { query: "terrain", limit: 3 }));
+    assert.ok(first.unlocked.length > 0, "expected at least one terrain tool");
+    const name = first.unlocked[0].name;
+    for (let i = 0; i < 20; i += 1) {
+      await h.callTool("search_tools", { query: `sound playtest camera light ${i}`, limit: 5 });
+    }
+    const { tools } = await h.listTools();
+    assert.ok(
+      tools.some((t) => t.name === name),
+      `${name} was evicted; the tool set must be grow-only`,
+    );
   });
 });
 

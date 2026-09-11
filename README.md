@@ -209,10 +209,8 @@ src/                    the MCP server (TypeScript / Node)
   server.ts             MCP server + core tool handlers + resource handlers
   tools/                one file per category, assembled by tools/index.ts
   registry.ts           specialist tool registry + BM25 search
-  seed.ts               seed specialist tools
-  pro.ts                second-wave specialist tools — terrain, audio, physics
   vision.ts             screenshot + viewport-capture tools
-  session.ts            active tool set, sticky context, turn-based eviction
+  session.ts            visible tool set (grow-only), sticky context, place cache
   memory.ts             tool-call history log + macro + snapshot store
   profile.ts            per-place persistent profile (~/.cubesmcp/profiles/)
   snapshot-diff.ts      delta engine behind the diff specialist

@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 
 import { assessDestructiveness, serviceTargetOf } from "../../dist/safety.js";
 import { luaJson, luaStringLiteral, capabilities, timeoutFor } from "../../dist/registry.js";
-import { ToolSet, SPECIALIST_CAP } from "../../dist/session.js";
+import { ToolSet } from "../../dist/session.js";
 import { validateArgs } from "../../dist/validate.js";
 import { diffSnapshots } from "../../dist/snapshot-diff.js";
 import { truncateArgs } from "../../dist/memory.js";
@@ -175,49 +175,84 @@ describe("capability derivation", () => {
 
 // ---------------------------------------------------------------- ToolSet #8 A4
 
-describe("ToolSet: unlock and eviction", () => {
-  test("#8 never reports a tool it evicted in the same turn", () => {
+describe("ToolSet: grow-only visibility", () => {
+  test("#8 everything reported unlocked is actually visible", () => {
     const ts = new ToolSet();
     const names = Array.from({ length: 12 }, (_, i) => `tool_${i}`);
-    const res = ts.unlockAndSettle(names, 1);
+    const res = ts.unlock(names, 1);
     const visible = new Set(res.visible);
     for (const n of res.unlocked) {
       assert.ok(visible.has(n), `${n} was reported unlocked but is not visible`);
     }
-    assert.equal(res.unlocked.length, SPECIALIST_CAP);
+    assert.equal(res.unlocked.length, names.length, "nothing is dropped any more");
   });
 
-  test("#8 keeps the highest-ranked matches, not the lowest", () => {
+  test("#8 the highest-ranked match survives, and so does the lowest", () => {
     const ts = new ToolSet();
-    // Ranked order: best first. The cap must drop from the tail.
     const ranked = Array.from({ length: 12 }, (_, i) => `rank_${i}`);
-    const res = ts.unlockAndSettle(ranked, 1);
-    assert.ok(res.unlocked.includes("rank_0"), "the top-ranked match must survive");
-    assert.ok(!res.visible.includes("rank_11"), "the worst match should be the one dropped");
+    const res = ts.unlock(ranked, 1);
+    assert.ok(res.visible.includes("rank_0"), "the top-ranked match must survive");
+    assert.ok(res.visible.includes("rank_11"), "grow-only keeps the tail too");
   });
 
-  test("core tools are never evicted", () => {
+  test("core tools stay visible and are never duplicated", () => {
     const ts = new ToolSet();
-    ts.unlockAndSettle(Array.from({ length: 30 }, (_, i) => `t${i}`), 1);
+    ts.unlock(Array.from({ length: 30 }, (_, i) => `t${i}`), 1);
+    const visible = ts.visible();
     for (const core of ["search_tools", "read", "screenshot", "mutate", "run_code"]) {
-      assert.ok(ts.visible().includes(core), `${core} disappeared`);
+      assert.equal(
+        visible.filter((v) => v === core).length,
+        1,
+        `${core} should appear exactly once`,
+      );
     }
   });
 
-  test("idle specialists are dropped after enough turns", () => {
+  test("an idle specialist is NOT dropped, however long it sits", () => {
+    // This is the whole point of the change. The list has to converge, because
+    // every change to it invalidates the prompt cache for that turn.
     const ts = new ToolSet();
-    ts.unlockAndSettle(["lonely"], 1);
-    assert.ok(ts.has("lonely"));
-    ts.settle(100);
-    assert.ok(!ts.has("lonely"), "an idle specialist should age out");
+    ts.unlock(["lonely"], 1);
+    for (let turn = 2; turn < 500; turn += 1) ts.touch("read", turn);
+    assert.ok(ts.has("lonely"), "an idle specialist must survive");
   });
 
-  test("recently used specialists survive a later settle", () => {
+  test("re-unlocking a visible tool does not report a change", () => {
     const ts = new ToolSet();
-    ts.unlockAndSettle(["keeper"], 1);
-    ts.touch("keeper", 9);
-    ts.settle(10);
-    assert.ok(ts.has("keeper"));
+    assert.equal(ts.unlock(["keeper"], 1).changed, true);
+    const again = ts.unlock(["keeper"], 2);
+    assert.equal(again.changed, false, "no tools/list_changed for a no-op unlock");
+    assert.deepEqual(again.unlocked, []);
+  });
+
+  test("unlocking a core tool is a no-op", () => {
+    const ts = new ToolSet();
+    const res = ts.unlock(["read"], 1);
+    assert.equal(res.changed, false);
+    assert.deepEqual(res.unlocked, []);
+  });
+
+  test("the visible set only ever grows over a long session", () => {
+    const ts = new ToolSet();
+    let previous = ts.visible();
+    for (let turn = 1; turn <= 100; turn += 1) {
+      ts.unlock([`t${turn % 20}`], turn);
+      const now = ts.visible();
+      for (const name of previous) {
+        assert.ok(now.includes(name), `${name} disappeared on turn ${turn}`);
+      }
+      previous = now;
+    }
+    assert.equal(new Set(previous).size, previous.length, "no duplicates");
+  });
+
+  test("touch records the turn without changing visibility", () => {
+    const ts = new ToolSet();
+    ts.unlock(["tracked"], 3);
+    ts.touch("tracked", 9);
+    assert.equal(ts.lastUsedTurn("tracked"), 9);
+    assert.equal(ts.lastUsedTurn("never_seen"), 0);
+    assert.ok(ts.has("tracked"));
   });
 });
 

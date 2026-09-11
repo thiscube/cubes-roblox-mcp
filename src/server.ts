@@ -9,7 +9,7 @@ import {
 import { randomUUID } from "node:crypto";
 
 import { BridgeError, type StudioTransport } from "./transport.js";
-import { Session, CORE_TOOLS, SPECIALIST_CAP } from "./session.js";
+import { Session, CORE_TOOLS } from "./session.js";
 import { ToolRegistry, capabilities, type ToolEntry } from "./registry.js";
 import { ALL_TOOLS } from "./tools/index.js";
 import { lintLuau } from "./lint.js";
@@ -36,6 +36,13 @@ import { validateArgs, invalidArgsPayload } from "./validate.js";
 // --------------------------------------------------------------------------
 // Core tool schemas (hand-written JSON Schema; always present in tools/list).
 // --------------------------------------------------------------------------
+
+/**
+ * Most matches one `search_tools` call will surface at once. Not a cap on how
+ * many tools can be visible — nothing is evicted any more — just a guard so one
+ * broad query doesn't pull the whole registry into the tool list in a single turn.
+ */
+const MAX_SEARCH_RESULTS = 12;
 
 const CORE_TOOL_DEFS: Record<string, Tool> = {
   search_tools: {
@@ -506,8 +513,7 @@ export function createMcpServer(bridge: StudioTransport): Server {
               break;
             }
             // Safety net: agent remembered a tool name from earlier — just unlock it.
-            const settled = session.tools.unlockAndSettle([name], session.turn);
-            if (settled.changed) await notifyListChanged();
+            if (session.tools.unlock([name], session.turn).changed) await notifyListChanged();
             payload = await entry.handler(args, toolCtx);
           }
         }
@@ -571,12 +577,6 @@ export function createMcpServer(bridge: StudioTransport): Server {
       await notifyListChanged();
     }
 
-    // Resolve eviction once, at the end, through the single owner of the tool
-    // set (ARCHITECTURE-REVIEW.md A4).
-    if (session.tools.settle(session.turn)) {
-      await notifyListChanged();
-    }
-
     const failed = payload !== null && typeof payload === "object" && "error" in (payload as object);
 
     // Multi-block escape hatch: a handler can return `{ __mcpContent: [...] }`
@@ -622,35 +622,29 @@ export function createMcpServer(bridge: StudioTransport): Server {
     if (!query) return { error: "bad_args", hint: "search_tools requires a 'query' string." };
 
     const intent = typeof args.intent === "string" ? args.intent : undefined;
-    // Clamp to the cap. Asking for more than can stay visible used to "unlock"
-    // tools that eviction dropped in the same turn (AUDIT.md #8).
+    // A results cap, not a visibility cap. Nothing is evicted any more, so every
+    // match survives; this only stops one broad query dumping the whole registry
+    // into the tool list at once.
     const requested = typeof args.limit === "number" ? args.limit : 5;
-    const limit = Math.min(Math.max(1, Math.trunc(requested)), SPECIALIST_CAP);
+    const limit = Math.min(Math.max(1, Math.trunc(requested)), MAX_SEARCH_RESULTS);
     if (intent) session.sticky.recentIntent = intent;
 
     const matches = registry.search(query, intent, limit);
-    // Unlock and resolve eviction together, then report only what SURVIVED, so
-    // the response can never disagree with tools/list.
-    const settled = session.tools.unlockAndSettle(
+    // Every match survives, so the response can never disagree with tools/list.
+    const settled = session.tools.unlock(
       matches.map((m) => m.name),
       session.turn,
     );
     if (settled.changed) await notifyListChanged();
 
-    const survived = new Set(settled.visible);
-    const unlocked = matches
-      .filter((m) => survived.has(m.name))
-      .map((m) => ({ name: m.name, category: m.category, description: m.description }));
-    const dropped = matches.filter((m) => !survived.has(m.name)).map((m) => m.name);
+    const unlocked = matches.map((m) => ({
+      name: m.name,
+      category: m.category,
+      description: m.description,
+    }));
 
     return {
       unlocked,
-      ...(dropped.length > 0
-        ? {
-            not_unlocked: dropped,
-            note: `${dropped.length} match(es) did not fit the ${SPECIALIST_CAP}-specialist cap. Call them by name to bring them in.`,
-          }
-        : {}),
       message:
         unlocked.length > 0
           ? `Unlocked ${unlocked.length} tool(s): ${unlocked.map((u) => u.name).join(", ")}. They are now in your tool list.`
@@ -843,12 +837,10 @@ function applyAutoUnlock(
     candidates.add("playtest_result");
   }
 
-  // Filter to ones the registry knows AND that aren't already visible, then let
-  // the ToolSet decide what actually survives.
+  // Filter to ones the registry knows AND that aren't already visible.
   const wanted = [...candidates].filter((n) => registry.has(n) && !session.tools.has(n));
   if (wanted.length === 0) return [];
-  const settled = session.tools.unlockAndSettle(wanted, session.turn);
-  return settled.unlocked;
+  return session.tools.unlock(wanted, session.turn).unlocked;
 }
 
 /**

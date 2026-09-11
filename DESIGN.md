@@ -160,14 +160,20 @@ on search_tools(query):
 
 The agent gets a confirmation message naming what unlocked. Don't skip this — agents that don't see confirmation re-search.
 
-### Auto-eviction
+### No auto-eviction
 
-Two rules:
+The original design evicted: idle for 10 turns, or over a cap of 8 specialists,
+and the least-recently-used got dropped.
 
-- Tool idle for N turns (default: 10) → evict.
-- Active set above cap (default: 8) → evict the least-recently-used.
+That is gone. `tools` renders first in the prompt-cache prefix, so every change
+to the tool list invalidates the cache for that turn, and eviction guarantees the
+list keeps changing forever. Measured over a 60-turn session
+(`test/bench/tool-churn.mjs`): eviction changed the list on 33% of turns and was
+still at 33% in the second half. Grow-only is 17% overall, 10% late, because once
+a tool is visible it stays.
 
-Fire `tools/list_changed` on eviction so the client re-fetches.
+So the rule is one line: unlock, never drop. Fire `tools/list_changed` only when
+the set actually grew.
 
 ### Safety net
 
