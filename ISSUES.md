@@ -4,9 +4,10 @@
 **6 structural problems** (numbered `A1`-`A6`, full detail in `ARCHITECTURE-REVIEW.md`).
 
 > ## Status: all fixed
-> **37 fixed, 1 withdrawn as a false positive.** Verified by 83 unit tests that run
-> with no Studio, no port and no plugin (`npm test`), plus CI on Node 20 and 22.
-> See `FIXES.md` for the before/after on every one.
+> **36 fixed outright, 1 partial, 1 withdrawn as a false positive.** Verified by 83
+> unit tests that run with no Studio, no port and no plugin (`npm test`), plus CI on
+> Node 20 and 22. Before/after for every one:
+> https://claude.ai/code/artifact/a666b176-8a6d-4482-a083-62a8c9151173
 >
 > **`#12` was withdrawn, not fixed.** The `\uXXXX` escape it flagged is always
 > preceded by a doubled backslash, which Lua reads as a literal backslash — leaving
