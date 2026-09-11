@@ -25,7 +25,9 @@
 > is an explicit, loudly-warned escape hatch until the plugin catches up.
 
 This file is the readable index. Same numbers as the other two docs, so you can jump
-between them.
+between them. It is a record of what was wrong, not a to-do list.
+
+**For what to build next, read `PLAN.md`.**
 
 Grouped by what actually goes wrong, not by severity label. Severity is still marked on
 each line so you know what to care about.
@@ -265,7 +267,9 @@ have a 14-value category list that names the files for you.
 
 ---
 
-## What to actually do first
+## What to actually do first (historical)
+
+This was the order the fixes were done in. Kept so the commits make sense.
 
 1. **`A3`** — the transport interface. About an hour, and it lets you test everything else.
    Do this before any other refactor so you have a safety net.

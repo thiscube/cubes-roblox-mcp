@@ -70,6 +70,7 @@ curl -s -X POST http://127.0.0.1:44820/rpc \
 
 ## Where to look
 
+- `PLAN.md` — what to build next, and why. Start here for new work.
 - `ISSUES.md` — every known defect in plain language. Read before changing behaviour.
 - `AUDIT.md` / `ARCHITECTURE-REVIEW.md` — the detailed findings behind it.
 - `src/transport.ts` — the seam. Depend on this, not on `StudioBridge`.
