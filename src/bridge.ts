@@ -109,8 +109,17 @@ export class StudioBridge implements StudioTransport {
   readonly tokenGenerated: boolean;
   private readonly allowUnauthenticated: boolean;
 
-  constructor(port: number) {
+  /**
+   * Read-only build (PLAN.md #13): `/rpc` refuses every write, whatever the
+   * Studio panel's toggle says. The MCP surface has no write tools in this mode,
+   * and `/rpc` is a second door into the same plugin — leaving it open would
+   * make the guarantee meaningless.
+   */
+  readonly readOnly: boolean;
+
+  constructor(port: number, opts: { readOnly?: boolean } = {}) {
     this.port = port;
+    this.readOnly = opts.readOnly ?? false;
     const { token, generated } = resolveToken();
     this.token = token;
     this.tokenGenerated = generated;
@@ -446,14 +455,16 @@ export class StudioBridge implements StudioTransport {
       res.end(JSON.stringify({ error: "missing_tool" }));
       return;
     }
-    if (!RPC_READ_ONLY_TOOLS.has(tool) && !this.writeEnabled) {
+    if (!RPC_READ_ONLY_TOOLS.has(tool) && (this.readOnly || !this.writeEnabled)) {
       res.statusCode = 403;
       res.setHeader("content-type", "application/json");
       res.end(
         JSON.stringify({
-          error: "write_mode_disabled",
+          error: this.readOnly ? "read_only_build" : "write_mode_disabled",
           tool,
-          hint: "Open the Cubes MCP panel in Roblox Studio and enable 'Allow writes', then retry.",
+          hint: this.readOnly
+            ? "This server was started read-only. Restart without CUBES_MCP_READ_ONLY to write."
+            : "Open the Cubes MCP panel in Roblox Studio and enable 'Allow writes', then retry.",
         }),
       );
       return;

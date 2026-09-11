@@ -8,7 +8,16 @@
  */
 
 export const CORE_TOOLS = ["search_tools", "read", "screenshot", "mutate", "run_code"] as const;
-const CORE_SET: ReadonlySet<string> = new Set(CORE_TOOLS);
+
+/**
+ * The core surface of a read-only build (PLAN.md #13).
+ *
+ * `mutate` and `run_code` are not gated here, they are ABSENT. A read-only
+ * install should not be talkable into writing, and the surest way to guarantee
+ * that is for the write tools not to exist in the process at all — no toggle to
+ * flip, no gate to get wrong, nothing to argue with the model about.
+ */
+export const READ_ONLY_CORE_TOOLS = ["search_tools", "read", "screenshot"] as const;
 
 export interface UnlockResult {
   /** Everything in tools/list after the unlock, core first. */
@@ -48,12 +57,20 @@ export interface UnlockResult {
  * Roblox MCP servers ship on turn one anyway.
  */
 export class ToolSet {
-  private readonly active = new Set<string>(CORE_TOOLS);
+  private readonly core: readonly string[];
+  private readonly coreSet: ReadonlySet<string>;
+  private readonly active: Set<string>;
   /** tool name -> turn of last use. Kept for ranking and diagnostics only. */
   private readonly lastTurn = new Map<string, number>();
 
+  constructor(core: readonly string[] = CORE_TOOLS) {
+    this.core = core;
+    this.coreSet = new Set(core);
+    this.active = new Set(core);
+  }
+
   isCore(tool: string): boolean {
-    return CORE_SET.has(tool);
+    return this.coreSet.has(tool);
   }
 
   has(tool: string): boolean {
@@ -62,7 +79,7 @@ export class ToolSet {
 
   /** Everything currently in tools/list, core first. */
   visible(): string[] {
-    return [...CORE_TOOLS, ...this.specialists()];
+    return [...this.core, ...this.specialists()];
   }
 
   specialists(): string[] {
@@ -163,7 +180,7 @@ export class Session {
   readonly id: string;
   turn = 0;
 
-  readonly tools = new ToolSet();
+  readonly tools: ToolSet;
   readonly place = new PlaceContextCache();
 
   /** Biases search ranking and (later) prefetch. */
@@ -172,8 +189,9 @@ export class Session {
     recentIntent: "",
   };
 
-  constructor(id: string) {
+  constructor(id: string, core: readonly string[] = CORE_TOOLS) {
     this.id = id;
+    this.tools = new ToolSet(core);
   }
 
   isCore(tool: string): boolean {

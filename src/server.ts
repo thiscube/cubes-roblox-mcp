@@ -9,7 +9,7 @@ import {
 import { randomUUID } from "node:crypto";
 
 import { BridgeError, type StudioTransport } from "./transport.js";
-import { Session, CORE_TOOLS } from "./session.js";
+import { Session, CORE_TOOLS, READ_ONLY_CORE_TOOLS } from "./session.js";
 import { ToolRegistry, capabilities, outputSchemaFor, type ToolEntry } from "./registry.js";
 import { CORE_OUTPUT_SCHEMAS, RESULT_ENVELOPE } from "./core-output.js";
 import { ALL_TOOLS } from "./tools/index.js";
@@ -315,9 +315,35 @@ const RESOURCES = [
 // Server wiring.
 // --------------------------------------------------------------------------
 
-export function createMcpServer(bridge: StudioTransport): Server {
-  const session = new Session(randomUUID().slice(0, 8));
-  const registry = new ToolRegistry(ALL_TOOLS);
+export interface ServerOptions {
+  /**
+   * Build a read-only server (PLAN.md #13).
+   *
+   * Every write-class tool is removed from the registry and from the core
+   * surface, rather than being gated. The point is that a read-only install
+   * cannot be talked into writing: there is no toggle to flip and no gate to get
+   * wrong, because `mutate`, `run_code` and every write specialist are simply
+   * not in the process. Defaults to the CUBES_MCP_READ_ONLY environment variable.
+   */
+  readOnly?: boolean;
+}
+
+/** True when this process was asked to run read-only. */
+export function readOnlyFromEnv(): boolean {
+  const v = process.env.CUBES_MCP_READ_ONLY;
+  return v === "1" || v === "true";
+}
+
+export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {}): Server {
+  const readOnly = opts.readOnly ?? readOnlyFromEnv();
+  const coreTools = readOnly ? READ_ONLY_CORE_TOOLS : CORE_TOOLS;
+  const session = new Session(randomUUID().slice(0, 8), coreTools);
+  // Filtering the registry, not filtering the response: a write tool that is not
+  // registered cannot be called by name, cannot be found by search_tools, and
+  // cannot be auto-unlocked.
+  const registry = new ToolRegistry(
+    readOnly ? ALL_TOOLS.filter((t) => !capabilities(t).write) : ALL_TOOLS,
+  );
   const memory = new SessionMemory();
   const sourcemap = new SourceMap();
   if (sourcemap.loaded) {
@@ -325,7 +351,7 @@ export function createMcpServer(bridge: StudioTransport): Server {
   }
 
   const server = new Server(
-    { name: "cubes-roblox-mcp", version: "0.2.0" },
+    { name: readOnly ? "cubes-roblox-mcp-inspector" : "cubes-roblox-mcp", version: "0.2.0" },
     {
       capabilities: {
         tools: { listChanged: true },
@@ -402,7 +428,7 @@ export function createMcpServer(bridge: StudioTransport): Server {
 
   // ---- tools/list: core tools + currently-active specialists --------------
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const tools: Tool[] = CORE_TOOLS.map((name) => ({
+    const tools: Tool[] = coreTools.map((name) => ({
       ...CORE_TOOL_DEFS[name],
       annotations: CORE_ANNOTATIONS[name],
       outputSchema: CORE_OUTPUT_SCHEMAS[name] as Tool["outputSchema"],
@@ -500,7 +526,7 @@ export function createMcpServer(bridge: StudioTransport): Server {
       // Arguments are validated against the tool's own inputSchema before any
       // handler sees them. The MCP SDK does not do this, and every handler used
       // to cast blindly (AUDIT.md #3, #14).
-      const schema = schemaFor(name, registry);
+      const schema = schemaFor(name, registry, session);
       const problems = schema ? validateArgs(args, schema) : [];
       if (problems.length > 0) {
         payload = invalidArgsPayload(name, problems);
@@ -513,7 +539,10 @@ export function createMcpServer(bridge: StudioTransport): Server {
           tool: name,
           hint: "Writes are off. Open the Cubes MCP panel in Roblox Studio and enable 'Allow writes', then retry.",
         };
-      } else {
+      } else if (session.isCore(name)) {
+        // Dispatch by the session's OWN core set, never by the name alone. A
+        // read-only build has no `mutate` and no `run_code`, and matching on the
+        // name would route straight past that and reach Studio anyway.
         switch (name) {
           case "search_tools":
             payload = await handleSearchTools(args);
@@ -530,19 +559,20 @@ export function createMcpServer(bridge: StudioTransport): Server {
           case "screenshot":
             payload = await screenshotTool.handler(args, toolCtx);
             break;
-          default: {
-            const entry = registry.get(name);
-            if (!entry) {
-              payload = {
-                error: "unknown_tool",
-                name,
-                hint: "Call search_tools to discover specialist tools, or use run_code.",
-              };
-              break;
-            }
-            payload = await entry.handler(args, toolCtx);
-          }
+          default:
+            payload = { error: "unknown_tool", name };
         }
+      } else {
+        const entry = registry.get(name);
+        payload = entry
+          ? await entry.handler(args, toolCtx)
+          : {
+              error: "unknown_tool",
+              name,
+              hint: readOnly
+                ? "This is a read-only build: every write tool is absent, not disabled. Use search_tools to see what exists."
+                : "Call search_tools to discover specialist tools, or use run_code.",
+            };
       }
     } catch (err) {
       payload = errorPayload(err);
@@ -995,9 +1025,14 @@ function isWriteTool(name: string, registry: ToolRegistry): boolean {
 }
 
 /** The declared inputSchema for any tool, core or specialist. */
-function schemaFor(name: string, registry: ToolRegistry): unknown {
-  if (name === "screenshot") return screenshotTool.inputSchema;
-  if (CORE_TOOL_DEFS[name]) return CORE_TOOL_DEFS[name].inputSchema;
+function schemaFor(name: string, registry: ToolRegistry, session: Session): unknown {
+  // Only tools this build actually has. Validating an absent tool's arguments
+  // would report a schema problem for something that is about to come back as
+  // unknown_tool, which reads as "wrong arguments" rather than "not here".
+  if (session.isCore(name)) {
+    if (name === "screenshot") return screenshotTool.inputSchema;
+    return CORE_TOOL_DEFS[name]?.inputSchema;
+  }
   return registry.get(name)?.inputSchema;
 }
 
