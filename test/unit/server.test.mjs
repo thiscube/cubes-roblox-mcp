@@ -9,7 +9,7 @@ import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 
 import { createMcpServer } from "../../dist/server.js";
-import { SEED_TOOLS } from "../../dist/seed.js";
+import { ALL_TOOLS as SEED_TOOLS } from "../../dist/tools/index.js";
 import { capabilities } from "../../dist/registry.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 

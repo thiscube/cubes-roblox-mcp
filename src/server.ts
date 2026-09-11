@@ -11,7 +11,7 @@ import { randomUUID } from "node:crypto";
 import { BridgeError, type StudioTransport } from "./transport.js";
 import { Session, CORE_TOOLS, SPECIALIST_CAP } from "./session.js";
 import { ToolRegistry, capabilities, type ToolEntry } from "./registry.js";
-import { SEED_TOOLS } from "./seed.js";
+import { ALL_TOOLS } from "./tools/index.js";
 import { lintLuau } from "./lint.js";
 import { SessionMemory } from "./memory.js";
 import { assessDestructiveness } from "./safety.js";
@@ -22,12 +22,15 @@ import { loadProfile } from "./profile.js";
 import { validateArgs, invalidArgsPayload } from "./validate.js";
 
 /**
- * The MCP server. The opening surface is exactly four tools:
+ * The MCP server. The opening surface is exactly five tools:
  *   search_tools  - discover specialist tools
  *   read          - universal read
+ *   screenshot    - see the screen
  *   mutate        - universal write
  *   run_code      - Luau escape hatch
  * Everything else is hidden in the registry until search_tools surfaces it.
+ *
+ * The list lives in CORE_TOOLS (session.ts) — keep this comment in step with it.
  */
 
 // --------------------------------------------------------------------------
@@ -299,7 +302,7 @@ const RESOURCES = [
 
 export function createMcpServer(bridge: StudioTransport): Server {
   const session = new Session(randomUUID().slice(0, 8));
-  const registry = new ToolRegistry(SEED_TOOLS);
+  const registry = new ToolRegistry(ALL_TOOLS);
   const memory = new SessionMemory();
   const sourcemap = new SourceMap();
   if (sourcemap.loaded) {

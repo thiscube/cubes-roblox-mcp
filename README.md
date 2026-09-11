@@ -93,7 +93,7 @@ Plus **eight resources** the agent can read without spending a tool call:
 | `studio://selection` | What's selected in Studio right now. |
 | `studio://errors/recent` | Recent script errors / playtest output, from the plugin's ring buffer. |
 
-Everything else — `lighting_configure`, `instance_duplicate`, `script_create`,
+Everything else — `instance_duplicate`, `material_paint`, `script_edit`,
 `macro_save`, `snapshot`, `diff`, `profile_update`, `test_run`, `tune`, … —
 lives in a search-loaded registry. Many are also auto-unlocked when context
 implies they're the next step (touching a Part unlocks `instance_duplicate`,
@@ -169,10 +169,18 @@ The **Studio status panel** (the toolbar button) shows connection state, the
 host it's polling, commands handled, recent activity, a **Visual debug** toggle
 (turn on the live-activity HUD), and pause / connect / disconnect controls.
 
-**Writes are always-on** in this build. Destructive batches — deleting
-instances, overwriting script source — still need an explicit `confirm: true`.
-Without it `mutate` returns a `needs_confirmation` error carrying the exact
-retry payload.
+**Writes are gated.** The agent is read-only until you flip *Allow writes* in the
+Studio panel; the plugin reports that toggle on every poll, and a poll that omits
+it counts as off. Destructive batches — deleting instances, overwriting script
+source — additionally need an explicit `confirm: true`. When your MCP client
+supports elicitation the server asks you directly; otherwise `mutate` returns a
+`needs_confirmation` error carrying the exact retry payload.
+
+**The bridge requires a token.** It is generated at startup and printed to stderr;
+set `CUBES_MCP_TOKEN` to pin it across restarts. Every route also refuses requests
+that carry an `Origin` header, that address a non-loopback `Host`, or that aren't
+`application/json` — which is what stops a web page or another local process from
+driving your Studio.
 
 ---
 
@@ -197,7 +205,9 @@ src/                    the MCP server (TypeScript / Node)
   index.ts              entry — wires the stdio transport + HTTP bridge
   bridge.ts             HTTP long-poll bridge to the Studio plugin
   protocol.ts           wire-protocol version (server <-> plugin handshake)
+  transport.ts          the StudioTransport seam every tool depends on
   server.ts             MCP server + core tool handlers + resource handlers
+  tools/                one file per category, assembled by tools/index.ts
   registry.ts           specialist tool registry + BM25 search
   seed.ts               seed specialist tools
   pro.ts                second-wave specialist tools — terrain, audio, physics
