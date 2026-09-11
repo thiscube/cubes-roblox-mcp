@@ -19,24 +19,59 @@ vulnerabilities in a 2-package tree.
 
 ## Summary
 
+Severity spread after the verification pass: **1 critical, 4 high, 11 medium, 16 low = 32**.
+Findings 27-32 were added by that pass; four originals were re-graded and two corrected. The
+per-finding notes below carry a **[verify]** line where anything changed.
+
 | # | Severity | Finding | Status |
 |---|---|---|---|
-| 1 | **Critical** | Any web page can drive `/rpc` into Studio — no Origin/Host/Content-Type check, and the write gate only covers two tool names | Confirmed |
+| 1 | **Critical** | The bridge trusts anyone who can reach the port: `/rpc` has no Origin/Host/Content-Type check and a two-name write gate — and (finding 27) the gate is forgeable anyway | Confirmed |
 | 2 | **High** | "Allow writes" is bypassable from the MCP surface: `evalTool` defaults to `write: false`, and `wait_until` `loadstring`s caller-supplied Luau | Confirmed |
 | 3 | **High** | PowerShell command injection via `screenshot.insets` — nothing validates tool args against `inputSchema` | Confirmed |
-| 4 | **High** | HTTP bridge reads request bodies with no size cap | Confirmed |
+| 4 | Medium | HTTP bridge reads request bodies with no size cap | Confirmed · re-graded High→Medium |
 | 5 | Medium | A dead long-poll socket silently eats one command and stalls the caller for the full timeout | Confirmed |
-| 6 | Medium | One bad protocol handshake poisons every later `send()` permanently | Confirmed |
+| 6 | Medium | One bad protocol handshake blocks every `send()` until the next good poll (~25s), and is re-triggerable | Confirmed · impact corrected |
 | 7 | Medium | Inline Luau lint can never run — `cwd` points at a directory the repo no longer ships | Confirmed |
 | 8 | Medium | `search_tools` reports tools as unlocked that the same turn evicts — best matches dropped first | Confirmed |
 | 9 | Medium | `isError` is never set, so MCP clients read every failure as a success | Confirmed |
 | 10 | Medium | `resources/read` bypasses the write gate entirely | Confirmed |
-| 11 | Medium | Concurrent `profile_update` loses 9 of 10 writes; the code comment claims the opposite | Confirmed |
-| 12 | Medium | `luaJson` emits `\uXXXX`, which Luau cannot parse — generated script fails to compile | Confirmed |
+| 11 | Low | Concurrent `profile_update` loses 9 of 10 writes; the code comment claims the opposite | Confirmed · re-graded Medium→Low |
+| 12 | Low | `luaJson` emits `\uXXXX`, which Luau cannot parse — generated script fails to compile | Confirmed · re-graded Medium→Low |
 | 13 | Medium | `script_edit` overwrites script source with no confirm gate and no lint | Confirmed |
-| 14 | Medium | `instance_duplicate.count` is uncapped | Confirmed |
+| 14 | Low | `instance_duplicate.count` is uncapped | Confirmed · re-graded Medium→Low |
 | 15 | Medium | Screenshot: no size cap, temp files never cleaned, full-monitor default | Confirmed |
 | 16-26 | Low | Fail-open op classification, leaks, doc drift, no CI — see below | Confirmed |
+| 27 | **High** | An unauthenticated `/poll` forges the write toggle ON without the user touching the panel | Confirmed (verification pass) |
+| 28 | **High** | `/poll` + `/result` are unauthenticated both ways: a local process steals commands and forges results | Confirmed (verification pass) |
+| 29 | Medium | The command queue has no cap — an attacker floods it and starves the agent | Confirmed (verification pass) |
+| 30 | Medium | `README.md:172` says writes are always-on, contradicting the code and the rest of the docs | Confirmed (verification pass) |
+| 31 | Low | Some `pro.ts` builders leave a ChangeHistoryService recording open on error | Plausible (code-read; plugin-dependent) |
+| 32 | Low | `/poll` and `/rpc` lack the malformed-body try/catch `/result` has | Confirmed (verification pass) |
+
+---
+
+## Verification pass
+
+A second agent re-derived every finding independently against the built `dist/` and attacked
+the headline. Net result: no finding was WRONG at the level of "the code does not do that,"
+and thirteen spot-checked line citations were exact. Six changes came out of it, all folded
+into the findings below:
+
+- **Finding 6 was overstated.** "Sticky forever / permanently disables the server" is false —
+  a connected plugin's next poll clears it. Measured here at **25047ms**. It is a re-triggerable
+  ~25s DoS, not a permanent kill. Corrected in place.
+- **Finding 20 had one factual error.** `roblox/` was **never** git-tracked (`git log` over all
+  history: 0 files under `roblox/` ever added); commit `2533818` only added the `.gitignore`
+  rule and rewrote the README. It was not "removed." Everything else in 20 holds.
+- **Findings 4, 11, 12, 14 re-graded down** on consequence, not mechanism (each mechanism
+  reproduced exactly). 4 is availability-only on a local dev process; 11's `updateProfile` is
+  dead code and loses only advisory notes; 12 is a loud `compile_error` on rare input and is
+  injection-safe; 14 needs an explicit huge `count` and an agent could loop in `run_code` anyway.
+- **The audit under-covered the trust boundary it named as the whole problem.** It audited only
+  the inbound `/rpc` direction. Findings **27-30** cover what an unauthenticated `/poll` and
+  `/result` actually permit — forging the write toggle, stealing commands, spoofing results, and
+  the README line that says the write model doesn't exist in this build. 27 is verified here
+  (see below); it makes finding 1's "writes OFF" framing beside the point.
 
 ---
 
@@ -62,15 +97,36 @@ const isWrite = tool === "eval" || tool === "mutate";
 
 `/rpc` forwards *any* `tool` string straight to the plugin. Every plugin-native write tool
 is outside that two-name allowlist — including `tune`, whose own description
-(`src/seed.ts:1417`) reads *"Run arbitrary Luau inside the RUNNING playtest's server
-DataModel."*
+(`src/seed.ts:1411`) reads *"Run arbitrary Luau inside the RUNNING playtest's server
+DataModel."* The gate is also case-sensitive, so `EVAL` and ` eval` slip past it too.
 
 Because `readJson` ignores `Content-Type`, a `text/plain` POST qualifies as a CORS
 *simple request*: no preflight, so the browser sends it. The response is opaque to the
-attacker, but the side effect has already run. Separately, the missing `Host` check means
-a DNS-rebinding page becomes same-origin and can read responses too.
+attacker, but the side effect has already run. Even simpler, a plain
+`<form method=POST enctype="text/plain">` needs no JavaScript at all and is exempt from
+CORS entirely. Separately, the missing `Host` check means a DNS-rebinding page becomes
+same-origin and can read responses too.
 
-**Reproduction** (`Allow writes` OFF, `CUBES_MCP_RPC_TOKEN` unset — the documented default):
+**[verify] The "any web page" claim carries one unstated assumption.** The reproductions
+below use a server-side `fetch`, which enforces no CORS or localhost policy — it proves the
+*server* accepts the request, not that a *browser* would send it. The CORS-simple-request
+reasoning above is sound, but modern Chromium and Safari also gate requests from a public
+page to `127.0.0.1` (Private/Local Network Access). On a browser that enforces it, the
+web-page vector is blocked or permission-prompted; the assumption is unquantified because no
+browser was available here. What needs *no* assumption: a page served from localhost, an
+Electron/extension context, an older browser, and — the vector that moots the whole debate —
+**any local process on the machine**, which findings 27-28 build on. `127.0.0.1` binding
+(`bridge.ts:110`) stops LAN/remote attackers (verified) but not browser CSRF or DNS rebinding.
+
+**[verify] The `tune` example is weaker than it reads, and the framing is off.** `tune` also
+requires a playtest already running (`seed.ts:1411`, `no_playtest` otherwise) — not a one-shot
+payload. And "the documented default" for writes-OFF is contradicted by `README.md:172`, which
+says writes are always-on in this build (finding 30). The sharper statement of finding 1 does
+not depend on the toggle at all: with writes ON — the normal posture — `/rpc` is an
+unauthenticated arbitrary-`eval` endpoint. Measured, writes ON, cross-origin:
+`POST /rpc {tool:"eval"} -> 200`, plugin received the Luau.
+
+**Reproduction** (`Allow writes` OFF, `CUBES_MCP_RPC_TOKEN` unset):
 
 ```
 POST /rpc from https://evil.example -> 200 {"ok":true,"result":{"echoed":"tune"}}
@@ -197,7 +253,11 @@ handler.
 
 ---
 
-## 4. High — unbounded request bodies on the bridge
+## 4. Medium — unbounded request bodies on the bridge
+
+**[verify] Re-graded High→Medium.** Reproduced (89MB→538MB on one 64MB POST), but the impact
+is availability-only: a local dev process OOMs and the MCP client restarts it. No data loss,
+no privilege gain, not reachable off-host.
 
 **File:** `src/bridge.ts:380-395`
 
@@ -248,18 +308,27 @@ command back onto `this.queue` instead of discarding it.
 
 ---
 
-## 6. Medium — `protocolMismatch` is sticky forever
+## 6. Medium — one bad handshake blocks `send()` for ~25s, re-triggerably
+
+**[verify] Impact corrected.** The original heading ("sticky forever") and body ("permanently
+disables the server for the session") were wrong. `bridge.ts:191` clears the flag on *every*
+good poll, and a connected plugin re-polls at least every `POLL_HOLD_MS` (25s), so the
+poisoning window is bounded. It is a re-triggerable ~25s DoS (an attacker re-posting once a
+second holds it down) plus a confusing-error source — not a permanent kill. The mechanism is
+otherwise as described.
 
 **File:** `src/bridge.ts:119-128`, `src/bridge.ts:176-191`
 
 `_protocolMismatch` is set on any `/poll` with a wrong or missing `protocol` field, and is
-cleared *only* by a subsequent good poll. Until then `send()` rejects everything up front.
+cleared only by a subsequent good poll. Until then `send()` rejects everything up front.
 Any process that POSTs a malformed body to `/poll` — including the unauthenticated path in
-finding 1 — permanently disables the server for the session:
+finding 1 — blocks the server until the real plugin's next poll:
 
 ```
-mismatch recorded: {"expected":1,"got":999}
-every later send() now fails with: plugin_version_mismatch
+poisoned. health.protocolMismatch: {"expected":1,"got":999}
+read right after      -> plugin_version_mismatch
+mismatch cleared after 25047ms (the legit plugin's next poll)
+read after recovery   -> {"echoed":"read"}
 ```
 
 The user-facing message also tells them to rebuild from `roblox/plugin.project.json`
@@ -387,7 +456,12 @@ those two is true cannot be determined from this repo.
 
 ---
 
-## 11. Medium — concurrent profile writes are lost
+## 11. Low — concurrent profile writes are lost
+
+**[verify] Re-graded Medium→Low.** Reproduced (1/10 survived), but it needs genuinely parallel
+tool calls and loses only local advisory notes in `~/.cubesmcp`. Note also that `updateProfile`
+— the function whose comment makes the false claim — is **dead code**: the handler inlines its
+own load/save, so nothing calls it.
 
 **File:** `src/profile.ts:108-121`, `src/seed.ts:885-916`
 
@@ -415,7 +489,13 @@ write to a temp file and `rename` for atomicity; cap the append-only arrays.
 
 ---
 
-## 12. Medium — `luaJson` emits escapes Luau cannot parse
+## 12. Low — `luaJson` emits escapes Luau cannot parse
+
+**[verify] Re-graded Medium→Low.** The JS half is exact (a lone surrogate like `"\ud800"` also
+triggers it), and `luaJson` is injection-safe — no input under 0x80 produces a raw quote or
+newline. The failure is a loud `compile_error` on rare input, not silent corruption. Caveat:
+the "Luau rejects `\uXXXX`" half is a language-spec claim; no Luau lexer was run on either the
+original pass or the verification.
 
 **File:** `src/registry.ts:225-230`
 
@@ -474,7 +554,12 @@ have it call `assessDestructiveness` and `lintLuau` itself.
 
 ---
 
-## 14. Medium — `instance_duplicate.count` is uncapped
+## 14. Low — `instance_duplicate.count` is uncapped
+
+**[verify] Re-graded Medium→Low.** `count: 1e9` reaches the plugin unclamped — confirmed. But
+the "non-numeric value" half of the original sentence is wrong: `for i = 1, "abc"` raises a
+Luau error, it doesn't hang. And an agent that wants a million clones can already write the
+loop in `run_code`. This is a guardrail gap, not a new capability.
 
 **File:** `src/seed.ts:62`
 
@@ -562,7 +647,9 @@ Grows with total lifetime timeouts. Slow leak on a long-lived server.
 (`seed.ts:1098-1109`). Neither key exists, so the "one-click follow-up" is
 `{"call":"diff","args":{}}`. Should be `p.name`.
 
-**20 — documentation drift.** The `roblox/` half was removed in `2533818` but the docs were
+**20 — documentation drift.** *(Correction: `roblox/` was **never** git-tracked — 0 files under
+it in all history — so `2533818` did not "remove" it; that commit only added the ignore rule and
+rewrote the README. The drift is real regardless.)* The `roblox/` half is absent but the docs were
 not:
 - `CLAUDE.md:11,13,23,26-27,54-55` describes `roblox/`, `roblox/src/Transport.luau`,
   `roblox/src/StatusUi.luau` and a `rojo build plugin.project.json` command. None exist here.
@@ -609,19 +696,141 @@ copies stay resident.
 
 ---
 
+## Findings from the verification pass
+
+These cover the direction the original audit missed: it audited the inbound `/rpc` call but
+never asked what an unauthenticated `/poll` or `/result` permits. The bridge cannot tell the
+real plugin from any other local poster, in either direction.
+
+## 27. High — an unauthenticated `/poll` forges the write toggle ON
+
+**File:** `src/bridge.ts:192`
+
+```ts
+if (typeof body?.writeEnabled === "boolean") this._writeEnabled = body.writeEnabled;
+```
+
+`/poll` is unauthenticated and reachable by the same CORS-simple / form-post shape as `/rpc`.
+Any poster that sends `{ protocol: 1, writeEnabled: true }` flips the server's write toggle —
+the user never touches the panel. This defeats the entire "promotion to write mode requires
+user action" model (`DESIGN.md:442`) that findings 1-2 are framed around.
+
+**Reproduction** (real plugin connected and reporting `writeEnabled: false` throughout):
+
+```
+user toggle OFF, real plugin polling.
+  baseline cross-origin eval -> HTTP 403 write_mode_disabled
+  bridge.writeEnabled -> false
+attacker fires forged /poll {writeEnabled:true} ...
+  bridge.writeEnabled now -> true      (user never touched the panel)
+  cross-origin eval now  -> HTTP 200 {"ok":true,"result":{"echoed":"eval"}}
+  real plugin still reports writeEnabled: false
+  eval payloads plugin received: 1
+```
+
+The window closes at the real plugin's next poll (≤25s) and is re-openable at will — plenty
+for a single scripted `eval`. This is the sharper form of finding 1: the write gate is not
+just coarse, it is forgeable, so "writes OFF" is not a defense at all.
+
+**Fix direction:** the toggle must come from a trusted channel, not an unauthenticated request
+body. At minimum bind it to the same shared-secret the RPC token contemplates; better, carry
+plugin identity on the poll.
+
+## 28. High — `/poll` + `/result` are unauthenticated both ways: command theft and forged results
+
+**File:** `src/bridge.ts:173-232`, `src/bridge.ts:350-377`
+
+The server cannot distinguish the plugin from any other local poster. A forged poller receives
+the agent's queued commands verbatim, and `/result` accepts an answer for any in-flight `id`
+from anyone. So a local process can (a) exfiltrate every script source the agent reads or
+writes, (b) black-hole commands, and (c) feed the agent fabricated ground truth about the
+Studio state. The verification pass demonstrated a forged `/poll` receiving a `mutate` carrying
+a script Source, then a forged `/result` returning `{"applied":true, ...,"note":"TOTALLY FINE"}`
+that the agent accepted as real.
+
+This also raises finding 5 from "a Studio crash costs one command" to "anyone local can make
+the agent lose commands, or lie to it, on demand." For a browser attacker only (b) applies (the
+poll response is opaque cross-origin); for a local process all three do.
+
+**Fix direction:** authenticate the plugin end of the bridge — a per-session token the plugin
+presents on `/poll` and echoes on `/result`, minted by the server and shown in the panel or
+handed over out of band. Without it, no property of the bridge is trustworthy.
+
+## 29. Medium — the command queue has no cap
+
+**File:** `src/bridge.ts:153` (`this.queue.push(cmd)`)
+
+Nothing bounds `this.queue`. 3000 unauthenticated `/rpc` posts leave 2999 commands queued
+ahead of the agent's next call, which then times out at 30s while the plugin works through the
+attacker's backlog first. Distinct from finding 4 (memory): this is starvation plus
+attacker-directed execution ordering.
+
+**Fix direction:** cap the queue, and drop or 503 past the cap.
+
+## 30. Medium — `README.md:172` says the write gate doesn't exist in this build
+
+**File:** `README.md:172`
+
+```
+**Writes are always-on** in this build. Destructive batches ... still need confirm: true.
+```
+
+This directly contradicts `CLAUDE.md:46` ("Write-class tools ... require the user's *Allow
+writes* toggle") and the code (`server.ts:386-393`, `bridge.ts:289`). It is the most
+consequential doc contradiction in the repo and the original finding 20 missed it. It also
+cuts against finding 1's "the documented default" phrasing. If the shipped plugin really
+reports `writeEnabled: true` always, finding 2's bypass is largely moot (the gate is open
+regardless) while finding 1 gets worse (nothing ever returns 403). **This contradiction must
+be resolved first — it decides how findings 1, 2 and 27 are graded.**
+
+## 31. Low — some `pro.ts` builders leave an undo recording open on error
+
+**File:** `src/pro.ts:531-574` (`constraint_add`), `src/pro.ts:630-689` (`sky_configure`)
+
+**Plausible, code-read only — no Luau was executed.** Several `pro.ts` builders open a
+`ChangeHistoryService` recording and then do unguarded property writes with caller-supplied,
+type-unchecked values (finding 3's root cause). `constraint_add` does `Instance.new(a.type)`
+on any class name, then `c.Attachment0 = at0` — which throws for a class without that property,
+mid-recording. `sky_configure` sets `sky[prop] = val` similarly. Because `TryBeginRecording`
+returns nil while a recording is already open, a throw between begin and finish would mean
+subsequent MCP writes silently stop being undoable. `workspace_configure` wraps each write in
+`pcall`; its neighbours don't. Whether the plugin surfaces or swallows this is not visible here.
+
+**Fix direction:** wrap the body in `pcall` and `Cancel` the recording on error, the way
+`workspace_configure` already does.
+
+## 32. Low — `/poll` and `/rpc` lack the malformed-body try/catch `/result` has
+
+**File:** `src/bridge.ts:173-196` (`/poll`), `src/bridge.ts:263-311` (`/rpc`)
+
+`/result` deliberately catches a malformed JSON body and returns a structured 400
+(`bridge.ts:200-227`); `/poll` and `/rpc` let the parse error fall through to the generic 500
+in `start()`, which echoes the raw parser message. Cosmetic, but inconsistent with the care
+already taken one handler over.
+
+**Fix direction:** share one body-read-and-parse helper that returns a structured 400 across
+all three routes.
+
+---
+
 ## Suggested order of work
 
-1. **Finding 1** — the bridge is the trust boundary and it currently has none. Origin/Host/
-   Content-Type checks plus a deny-by-default tool gate.
+0. **Finding 30** — resolve the README-vs-code contradiction first. Whether writes are
+   toggle-gated or always-on decides how 1, 2 and 27 are graded and fixed. One-line answer,
+   blocks everything else.
+1. **Findings 1 + 27 + 28** — authenticate the bridge in *both* directions. The write toggle
+   and every result must come from a trusted channel, not an unauthenticated request body.
+   Add Origin/Host/Content-Type checks and a deny-by-default tool gate on top. This is the
+   whole ballgame: without it no property of the bridge holds.
 2. **Findings 2 + 3 + 16** — one theme: safety flags and schemas are decorative because
    nothing validates or enforces them. Add schema validation, invert `evalTool`'s default,
    make unknown op verbs fail closed.
-3. **Finding 4, 5** — bridge robustness: body cap, socket-close handling.
+3. **Findings 4, 5, 29** — bridge robustness: body cap, queue cap, socket-close handling.
 4. **Findings 7, 8, 9, 11, 12** — correctness bugs where the code's stated contract and its
    behaviour disagree. Each is small and independently fixable.
 5. **Finding 21** — land unit tests for `safety`, `session.evict`, `luaJson`, and
    `snapshot-diff` so findings 8, 12, 16 and 17 cannot regress.
-6. **Finding 20** — docs, once the code settles.
+6. **Findings 20 + 30** — docs, once the code settles.
 
 ---
 
@@ -636,7 +845,10 @@ The probes used for this audit live in the session scratchpad, not in the repo:
 - `p1_writegate.mjs` (finding 2), `p2_evict.mjs` (8), `p3_proto.mjs` (9, 15),
   `p4_psinject.mjs` (3), `p5_bridge.mjs` (1, 4, 6), `p6_waiter.mjs` (5),
   `p7_misc.mjs` (11, 12, 16, 17), `p8_more.mjs` (7, 10, 18), `p9_rpc.mjs` (1, 19),
-  `p10_chain.mjs` (1).
+  `p10_chain.mjs` (1), `p11_verify.mjs` (6 recovery), `p12_m1.mjs` (27).
+
+The verification pass added its own probes under `scratchpad/agent1/` (`a1`-`a9`, `b1`, `b2`,
+`c1`-`c4`) covering findings 27-30 and the re-graded ones.
 
 They are worth promoting into `test/` as regression tests — most of them are already
 assertions in all but name.
