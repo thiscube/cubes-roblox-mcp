@@ -10,7 +10,8 @@ import { randomUUID } from "node:crypto";
 
 import { BridgeError, type StudioTransport } from "./transport.js";
 import { Session, CORE_TOOLS } from "./session.js";
-import { ToolRegistry, capabilities, type ToolEntry } from "./registry.js";
+import { ToolRegistry, capabilities, outputSchemaFor, type ToolEntry } from "./registry.js";
+import { CORE_OUTPUT_SCHEMAS, RESULT_ENVELOPE } from "./core-output.js";
 import { ALL_TOOLS } from "./tools/index.js";
 import { lintLuau } from "./lint.js";
 import { SessionMemory } from "./memory.js";
@@ -290,6 +291,13 @@ const RESOURCES = [
     mimeType: "application/json",
   },
   {
+    uri: "cubes://schema/result",
+    name: "Result envelope",
+    description:
+      "Fields the server can add to ANY tool result: error, hint, message, next_likely, auto_unlocked, unchanged. Declared once here instead of being repeated into all 63 per-tool outputSchemas.",
+    mimeType: "application/json",
+  },
+  {
     uri: "studio://selection",
     name: "Studio selection",
     description: "The instances currently selected in Roblox Studio, as refs.",
@@ -397,6 +405,7 @@ export function createMcpServer(bridge: StudioTransport): Server {
     const tools: Tool[] = CORE_TOOLS.map((name) => ({
       ...CORE_TOOL_DEFS[name],
       annotations: CORE_ANNOTATIONS[name],
+      outputSchema: CORE_OUTPUT_SCHEMAS[name] as Tool["outputSchema"],
     }));
     for (const name of session.tools.specialists()) {
       const entry = registry.get(name);
@@ -406,6 +415,7 @@ export function createMcpServer(bridge: StudioTransport): Server {
           description: `[${entry.category}] ${entry.description}`,
           inputSchema: entry.inputSchema as Tool["inputSchema"],
           annotations: annotationsFor(entry),
+          outputSchema: outputSchemaFor(entry) as Tool["outputSchema"],
         });
       }
     }
@@ -446,6 +456,15 @@ export function createMcpServer(bridge: StudioTransport): Server {
           return json({ macros: memory.listMacros() });
         case "studio://session/snapshots":
           return json({ snapshots: memory.listSnapshots() });
+        case "cubes://schema/result":
+          return json({
+            envelope: RESULT_ENVELOPE,
+            note:
+              "Every tool's declared outputSchema covers only the fields specific to that tool. " +
+              "These envelope fields can appear on top of any of them, which is why no per-tool " +
+              "schema marks a field required: a handler may return the error envelope instead of " +
+              "its success shape.",
+          });
         case "studio://selection":
           return json(await readOnlyEval(SELECTION_LUAU));
         case "studio://errors/recent":
@@ -588,9 +607,15 @@ export function createMcpServer(bridge: StudioTransport): Server {
 
     // Multi-block escape hatch: a handler can return `{ __mcpContent: [...] }`
     // to send arbitrary MCP content blocks (image, audio, etc.) instead of the
-    // default text wrapper. Used by `screenshot` which ships a PNG inline.
+    // default text wrapper. Used by `screenshot` which ships a PNG inline. It may
+    // also set `__structured` so the call still satisfies its declared
+    // outputSchema — an image result is not an excuse to skip the contract.
     if (payload && typeof payload === "object" && Array.isArray((payload as any).__mcpContent)) {
-      return { content: (payload as any).__mcpContent };
+      const structured = (payload as any).__structured;
+      return {
+        content: (payload as any).__mcpContent,
+        ...(structured && typeof structured === "object" ? { structuredContent: structured } : {}),
+      };
     }
 
     // Serialize exactly once — buildMeta above reuses this string rather than
@@ -616,10 +641,24 @@ export function createMcpServer(bridge: StudioTransport): Server {
       };
     }
 
+    // Every tool declares an outputSchema, so every result carries
+    // structuredContent (PLAN.md #5). The text block stays alongside it: MCP
+    // wants both, and clients that predate structured output still work.
+    // Only an object can be structuredContent — a handler returning a scalar or
+    // an array ships as text alone rather than as an invalid structured result.
+    const structured =
+      payload !== null && typeof payload === "object" && !Array.isArray(payload)
+        ? (payload as Record<string, unknown>)
+        : undefined;
+
     // MCP signals tool failure with isError. Without it every failure — bad args,
     // unknown tool, Studio not connected — reads as a clean success to the
     // client (AUDIT.md #9).
-    return failed ? { content: [{ type: "text", text }], isError: true } : { content: [{ type: "text", text }] };
+    return {
+      content: [{ type: "text", text }],
+      ...(structured ? { structuredContent: structured } : {}),
+      ...(failed ? { isError: true } : {}),
+    };
   });
 
   // ---- core tool handlers ------------------------------------------------

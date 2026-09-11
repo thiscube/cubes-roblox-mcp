@@ -1,5 +1,11 @@
 import MiniSearch from "minisearch";
 import type { Channel, StudioTransport } from "./transport.js";
+import {
+  EVAL_RESULT,
+  MUTATE_RESULT,
+  OPAQUE_RESULT,
+  type JsonSchema,
+} from "./output-schema.js";
 import type { SessionMemory } from "./memory.js";
 
 /**
@@ -77,6 +83,12 @@ export interface ToolEntry {
   /** True only when the tool provably cannot modify Studio. Explicit opt-out. */
   readOnly?: boolean;
   /**
+   * Declared result shape. Optional here because most tools take the default for
+   * their channel; read it through `outputSchemaFor`, never directly, so the
+   * default is never accidentally skipped.
+   */
+  outputSchema?: JsonSchema;
+  /**
    * How long this tool may block Studio, in ms, given its arguments. Yielding
    * tools (wait_until, logs_wait_for, step_frames) can legitimately hold the
    * bridge for ~25s against a 30s default, leaving almost no headroom for the
@@ -112,6 +124,27 @@ export function capabilities(entry: Pick<ToolEntry, "channel" | "readOnly">): Ca
   // Deny by default: anything on a Studio channel is write-class unless it has
   // explicitly, and provably, opted out.
   return { write: entry.readOnly !== true, touchesStudio: true };
+}
+
+/**
+ * The result shape a tool declares in `tools/list`.
+ *
+ * Derived from the channel for the same reason capability is: the channel
+ * decides how much of the shape this server actually owns. An `eval` tool's
+ * answer is produced inside Studio, so only the `{ result }` wrapper is known
+ * here; a `local` tool runs in this process, so its shape is knowable and worth
+ * declaring exactly. An explicit `outputSchema` always wins.
+ */
+export function outputSchemaFor(entry: Pick<ToolEntry, "channel" | "outputSchema">): JsonSchema {
+  if (entry.outputSchema) return entry.outputSchema;
+  switch (entry.channel) {
+    case "eval":
+      return EVAL_RESULT;
+    case "mutate":
+      return MUTATE_RESULT;
+    default:
+      return OPAQUE_RESULT;
+  }
 }
 
 /** intent hint -> category clusters it biases toward. */
@@ -244,6 +277,8 @@ interface ToolMeta {
   readOnly?: boolean;
   /** See ToolEntry.yieldBudgetMs. */
   yieldBudgetMs?: (args: any) => number;
+  /** Declared result shape. Defaults to the channel's shape when omitted. */
+  outputSchema?: JsonSchema;
 }
 
 /** A specialist that ships generated Luau to the plugin's eval path. */
