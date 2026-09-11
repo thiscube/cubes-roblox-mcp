@@ -110,16 +110,32 @@ describe("docs_class", () => {
     assert.equal(byName.Material.type, "Material");
   });
 
-  test("writable is derived from security and the ReadOnly tag", async () => {
+  test("writable is three-valued, because the honest answer is", async () => {
     const res = await call("docs_class", { class: "Instance" });
     const byName = Object.fromEntries(res.members.map((m) => [m.name, m]));
     assert.equal(byName.Name.writable, true);
     assert.equal(byName.ClassName.writable, false, "ReadOnly tag must block writes");
 
-    const base = await call("docs_class", { class: "BasePart" });
-    const secret = base.members.find((m) => m.name === "SecretFlag");
-    assert.equal(secret.writable, false, "a security-gated property is not writable");
-    assert.ok(secret.security.includes("RobloxScriptSecurity"));
+    const base = Object.fromEntries(
+      (await call("docs_class", { class: "BasePart", limit: 100 })).members.map((m) => [m.name, m]),
+    );
+    assert.equal(base.Anchored.writable, true);
+
+    // RobloxScriptSecurity: genuinely closed to us.
+    assert.equal(base.SecretFlag.writable, false);
+    assert.ok(base.SecretFlag.security.includes("RobloxScriptSecurity"));
+
+    // NotScriptable: the dump says Security None, but assignment throws. This is
+    // the false positive that sent the agent into a confident failed mutate.
+    assert.equal(base.EngineOnlyFlag.writable, false, "NotScriptable must not read as writable");
+
+    // PluginSecurity: this server IS a Studio plugin, so it CAN write these.
+    // Reporting them as unwritable was a false negative on 94 real properties.
+    assert.equal(base.PluginOnlyFlag.writable, "plugin");
+
+    // Older dumps carried Security as a bare string; that branch still works.
+    assert.equal(base.LegacyShapedFlag.writable, false);
+    assert.equal(base.LegacyShapedFlag.security, "RobloxScriptSecurity");
   });
 
   test("methods carry their parameter list and return type", async () => {
@@ -149,13 +165,14 @@ describe("docs_class", () => {
   });
 
   test("filter and limit both apply, and truncation is disclosed", async () => {
-    const filtered = await call("docs_class", { class: "BasePart", filter: "an" });
-    assert.deepEqual(filtered.members.map((m) => m.name), ["Anchored", "Transparency"]);
+    const filtered = await call("docs_class", { class: "BasePart", filter: "anchor" });
+    assert.deepEqual(filtered.members.map((m) => m.name), ["Anchored"]);
 
+    const all = await call("docs_class", { class: "BasePart", limit: 100 });
     const limited = await call("docs_class", { class: "BasePart", limit: 1 });
     assert.equal(limited.members.length, 1);
     assert.equal(limited.truncated, true);
-    assert.equal(limited.total, 4, "total counts what matched, not what fit");
+    assert.equal(limited.total, all.members.length, "total counts what matched, not what fit");
   });
 
   test("an unknown class suggests near misses instead of just failing", async () => {
@@ -199,7 +216,8 @@ describe("docs_member", () => {
   test("an unknown member suggests near misses", async () => {
     const res = await call("docs_member", { class: "Part", member: "Transp" });
     assert.equal(res.error, "unknown_member");
-    assert.deepEqual(res.did_you_mean, ["Transparency"]);
+    // The fixture carries both `Transparency` and the deprecated lowercase alias.
+    assert.deepEqual(new Set(res.did_you_mean), new Set(["Transparency", "transparency"]));
   });
 });
 
@@ -243,6 +261,7 @@ describe("docs_search", () => {
     assert.deepEqual(res.members, [
       { class: "BasePart", member: "Anchored", kind: "Property", type: "bool" },
     ]);
+    assert.equal(res.members[0].reach, undefined, "ranking inputs are not answers");
   });
 
   test("exact matches rank above longer names that merely contain the query", async () => {
@@ -257,6 +276,24 @@ describe("docs_search", () => {
     assert.ok(classes.classes.indexOf("BasePart") > 0, "a suffix match ranks below the exact one");
   });
 
+  test("a deprecated alias never outranks the real property", async () => {
+    // `Fire.size`, `BodyGyro.cframe` and friends are lowercase leftovers. They
+    // tie on name rank with the real member and used to win on dump order.
+    const res = await call("docs_search", { query: "transparency", kind: "members" });
+    assert.equal(res.members[0].member, "Transparency");
+    assert.equal(res.members[0].class, "BasePart");
+    const alias = res.members.find((m) => m.member === "transparency");
+    assert.ok(alias?.deprecated, "the alias should be present and marked");
+    assert.ok(res.members.indexOf(alias) > 0, "and it should rank below the real one");
+  });
+
+  test("the class with more descendants wins an exact-name tie", async () => {
+    // "this is the class everybody means", cheaply. BasePart has descendants in
+    // the fixture; PointLight has none.
+    const res = await call("docs_search", { query: "material", kind: "members" });
+    assert.equal(res.members[0].class, "BasePart");
+  });
+
   test("an empty query is refused rather than matching everything", async () => {
     const res = await call("docs_search", { query: "   " });
     assert.equal(res.error, "bad_args");
@@ -266,12 +303,17 @@ describe("docs_search", () => {
 describe("docs_defaults", () => {
   before(installFakeDump);
 
-  test("is write-class, because it constructs an instance", () => {
-    // The dump has no defaults, so this one has to ask Studio. Constructing an
-    // Instance is not a read, so it does not get the readOnly opt-out.
+  test("is read-class but transient, not a pure read and not a write", () => {
+    // The dump has no defaults, so this one has to ask Studio. It constructs an
+    // Instance, which is why it is not `readOnly: true` — but it never parents
+    // it, so calling it write-class shipped destructiveHint on a docs lookup and
+    // dropped it from the read-only build, which exists to inspect things.
     const entry = tool("docs_defaults");
     assert.equal(entry.channel, "eval");
-    assert.equal(capabilities(entry).write, true);
+    const cap = capabilities(entry);
+    assert.equal(cap.write, false, "it changes nothing, so no write gate");
+    assert.equal(cap.transient, true);
+    assert.equal(cap.touchesStudio, true, "it does reach Studio, and says so");
   });
 
   test("fills the property list from the dump when the caller omits it", async () => {

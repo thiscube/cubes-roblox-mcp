@@ -12,6 +12,8 @@ import { createMcpServer } from "../../dist/server.js";
 import { ALL_TOOLS as SEED_TOOLS } from "../../dist/tools/index.js";
 import { capabilities } from "../../dist/registry.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+// Isolates on-disk state (CUBES_MCP_HOME) and the API dump. Import for the side effect.
+import "./_fixtures.mjs";
 
 /** A StudioTransport that records commands and replays canned answers. */
 class FakeTransport {

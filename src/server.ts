@@ -411,7 +411,11 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
   function annotationsFor(entry: Pick<ToolEntry, "channel" | "readOnly">): Tool["annotations"] {
     const cap = capabilities(entry);
     return {
-      readOnlyHint: !cap.write,
+      // A transient tool is read-class but not a pure read: it constructs
+      // something it never parents. It is not destructive either way, and
+      // shipping destructiveHint on a documentation lookup made clients warn
+      // users about reading a default value.
+      readOnlyHint: !cap.write && !cap.transient,
       destructiveHint: cap.write,
       idempotentHint: false,
       openWorldHint: cap.touchesStudio,
@@ -578,6 +582,17 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
       payload = errorPayload(err);
     }
 
+    // Every tool declares an object outputSchema, and MCP requires a result with
+    // an outputSchema to carry structuredContent — the SDK's own client throws
+    // McpError when it doesn't. A dispatch tool hands back whatever the plugin
+    // returned, and a plugin handler that returns a bare array or string would
+    // therefore have taken down the call. Wrap anything that is not a plain
+    // object, here rather than at serialization, so the text block and the
+    // structured block cannot disagree about what came back.
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+      payload = { result: payload };
+    }
+
     const elapsedMs = Date.now() - startedAt;
 
     if (payload && typeof payload === "object") {
@@ -673,20 +688,16 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
 
     // Every tool declares an outputSchema, so every result carries
     // structuredContent (PLAN.md #5). The text block stays alongside it: MCP
-    // wants both, and clients that predate structured output still work.
-    // Only an object can be structuredContent — a handler returning a scalar or
-    // an array ships as text alone rather than as an invalid structured result.
-    const structured =
-      payload !== null && typeof payload === "object" && !Array.isArray(payload)
-        ? (payload as Record<string, unknown>)
-        : undefined;
+    // wants both, and clients that predate structured output still work. The
+    // normalization above guarantees this is an object.
+    const structured = payload as Record<string, unknown>;
 
     // MCP signals tool failure with isError. Without it every failure — bad args,
     // unknown tool, Studio not connected — reads as a clean success to the
     // client (AUDIT.md #9).
     return {
       content: [{ type: "text", text }],
-      ...(structured ? { structuredContent: structured } : {}),
+      structuredContent: structured,
       ...(failed ? { isError: true } : {}),
     };
   });

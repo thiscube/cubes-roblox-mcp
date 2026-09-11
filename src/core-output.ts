@@ -30,18 +30,24 @@ export const CORE_OUTPUT_SCHEMAS: Record<string, JsonSchema> = {
   }),
 
   /**
-   * The instance payload is built inside Studio, so the per-instance shape stays
-   * open. The wrapper fields below are the server's own and are exact: `cursor`
-   * for pagination, `snapshot` for the `since` short-circuit, `source_file` for
-   * the Rojo sourcemap annotation.
+   * `handleRead` returns the plugin's object verbatim. The only field this
+   * server touches is `items`, where it annotates scripts with their Rojo
+   * source file — and even that it does in place, on whatever the plugin sent.
+   *
+   * So the honest schema names the fields a caller will see and types NONE of
+   * them. An earlier version typed six fields as arrays and objects; a plugin
+   * whose `read` returned `cursor` as a number would have had its result
+   * rejected at a validating client over a shape this server never controlled.
+   * Naming without typing still helps the model know what to look for.
    */
   read: objectResult({
-    instances: { type: "array" },
-    children: { type: "array" },
-    camera: { type: "object" },
-    cursor: { type: "string" },
-    snapshot: { type: "string" },
-    unchanged: { type: "boolean" },
+    items: {},
+    instances: {},
+    children: {},
+    camera: {},
+    cursor: {},
+    snapshot: {},
+    unchanged: {},
   }),
 
   /**
@@ -62,13 +68,21 @@ export const CORE_OUTPUT_SCHEMAS: Record<string, JsonSchema> = {
   }),
 
   /**
-   * `applied` and `results` come from the plugin. `level`, `summary`,
-   * `retry_with` and `lint` are the server's own gate and lint output.
+   * Typed fields are the ones THIS server writes, and only those: the
+   * destructiveness gate's output (`level`, `summary`, `detail`, `uncertain`,
+   * `retry_with`), the selene `lint` array, and `appliedLevel`, which
+   * `handleMutate` stamps on every successful batch.
+   *
+   * `applied` and `results` come back from the plugin untouched, so they are
+   * named and left untyped. The first version had this exactly inverted: it
+   * typed the two plugin-owned fields and did not declare the server-owned one
+   * at all.
    */
   mutate: objectResult({
-    applied: { type: "number" },
-    results: { type: "array" },
+    applied: {},
+    results: {},
     lint: { type: "array" },
+    appliedLevel: { type: "string", enum: ["none", "soft", "hard", "nuclear"] },
     level: { type: "string", enum: ["none", "soft", "hard", "nuclear"] },
     summary: { type: "string" },
     detail: { type: "array" },

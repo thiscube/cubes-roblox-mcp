@@ -28,9 +28,47 @@ function clampLimit(value: unknown, fallback = DEFAULT_LIMIT): number {
 function security(member: ApiMember): string | undefined {
   const s = member.Security;
   if (!s) return undefined;
+  // Older dumps carried a bare string here. Current ones always use the pair,
+  // but the shape is cheap to keep supporting and the fixture exercises it.
   if (typeof s === "string") return s === "None" ? undefined : s;
   if (s.Read === "None" && s.Write === "None") return undefined;
   return `read:${s.Read} write:${s.Write}`;
+}
+
+/** The security level required to WRITE a member, or "None". */
+function writeSecurity(member: ApiMember): string {
+  const s = member.Security;
+  if (!s) return "None";
+  return typeof s === "string" ? s : s.Write;
+}
+
+/**
+ * Can this server set this property?
+ *
+ * Three-valued on purpose, because the honest answer is three-valued.
+ *
+ *   true     plain, unsecured, scriptable. Set it.
+ *   "plugin" writing needs PluginSecurity — which this server HAS, because the
+ *            other half of it is a Studio plugin. 94 properties across the dump
+ *            sit here, including Instance.RobloxLocked. Reporting them as
+ *            unwritable was a false negative.
+ *   false    everything else: RobloxScriptSecurity and friends, ReadOnly, and
+ *            NotScriptable.
+ *
+ * `NotScriptable` is the one that actually hurt. 36 properties carry it —
+ * `Lighting.Technology` among them, which an agent reaches for in the first ten
+ * turns of any lighting task. The dump gives them `Security: None`, so a
+ * security-only rule called them writable and sent the agent into a confident
+ * failed mutate. That is worse than having no docs tool at all.
+ */
+function writability(member: ApiMember): true | false | "plugin" {
+  if (member.MemberType !== "Property") return false;
+  const tags = member.Tags ?? [];
+  if (tags.includes("ReadOnly") || tags.includes("NotScriptable")) return false;
+  const write = writeSecurity(member);
+  if (write === "None") return true;
+  if (write === "PluginSecurity") return "plugin";
+  return false;
 }
 
 /** Compact one member down to what actually helps a caller decide. */
@@ -48,10 +86,8 @@ function summarize({ member, declaredOn, inherited }: ResolvedMember) {
   if (member.Tags?.length) out.tags = member.Tags;
   // Only say where it came from when that is not obvious.
   if (inherited) out.from = declaredOn;
-  // Writable-and-saved is the single most useful fact for a mutate call.
-  if (member.MemberType === "Property") {
-    out.writable = !sec && !(member.Tags ?? []).includes("ReadOnly");
-  }
+  // Whether this can be set is the single most useful fact for a mutate call.
+  if (member.MemberType === "Property") out.writable = writability(member);
   return out;
 }
 
@@ -86,13 +122,47 @@ function matchRank(name: string, query: string): number {
   return 3;
 }
 
-function byRelevance<T>(items: T[], query: string, nameOf: (item: T) => string): T[] {
+/**
+ * Extra ordering for member hits, applied after the name rank.
+ *
+ * Name rank alone is not enough, and the first version of this said it was. An
+ * exact-match query like "size" or "anchored" makes every hit rank 0, and the
+ * tiebreak then fell through to the dump's own order — so `BasePart.Anchored`
+ * came fourth behind three import-data classes, and `BasePart.Size` came
+ * twelfth. Two signals fix it:
+ *
+ *   Deprecated members go last. `Fire.size`, `BodyGyro.cframe` and
+ *   `BodyVelocity.velocity` are lowercase aliases nobody wants, and they were
+ *   outranking the real answer.
+ *
+ *   Then more descendants first. A property on `BasePart` is a property on
+ *   hundreds of classes; the same name on `Fire` is a property on one.
+ */
+interface MemberHit {
+  class: string;
+  member: string;
+  kind: string;
+  type?: string;
+  deprecated?: boolean;
+  reach?: number;
+}
+
+function byRelevance<T>(
+  items: T[],
+  query: string,
+  nameOf: (item: T) => string,
+  extra?: (a: T, b: T) => number,
+): T[] {
   return items
     .map((item, i) => ({ item, name: nameOf(item), i }))
     .sort((a, b) => {
       const ra = matchRank(a.name, query);
       const rb = matchRank(b.name, query);
       if (ra !== rb) return ra - rb;
+      if (extra) {
+        const e = extra(a.item, b.item);
+        if (e !== 0) return e;
+      }
       if (a.name.length !== b.name.length) return a.name.length - b.name.length;
       return a.i - b.i;
     })
@@ -361,20 +431,32 @@ export const DOCS_TOOLS: ToolEntry[] = [
         // Transparency on several hundred classes and bury the useful answer.
         // The scan is over every class because ranking needs the whole set —
         // stopping at the limit would return the first matches, not the best.
-        const hits: { class: string; member: string; kind: string; type?: string }[] = [];
+        const hits: MemberHit[] = [];
         for (const cls of api.dump.Classes) {
           for (const m of cls.Members) {
             if (!m.Name.toLowerCase().includes(q)) continue;
+            const deprecated = (m.Tags ?? []).includes("Deprecated");
             hits.push({
               class: cls.Name,
               member: m.Name,
               kind: m.MemberType,
               ...(m.ValueType ? { type: m.ValueType.Name } : {}),
+              ...(deprecated ? { deprecated: true } : {}),
+              reach: api.descendantCount(cls.Name),
             });
           }
         }
-        const ranked = byRelevance(hits, q, (h) => h.member);
-        out.members = ranked.slice(0, limit);
+        const ranked = byRelevance(
+          hits,
+          q,
+          (h) => h.member,
+          (a, b) => {
+            if (Boolean(a.deprecated) !== Boolean(b.deprecated)) return a.deprecated ? 1 : -1;
+            return (b.reach ?? 0) - (a.reach ?? 0);
+          },
+        );
+        // `reach` is a ranking input, not an answer. Don't spend response budget on it.
+        out.members = ranked.slice(0, limit).map(({ reach, ...rest }) => rest);
         truncated ||= ranked.length > limit;
       }
 
@@ -388,8 +470,9 @@ export const DOCS_TOOLS: ToolEntry[] = [
       category: "docs",
       subcategories: ["reference", "api", "lookup"],
       keywords: ["docs", "default", "defaults", "initial", "value", "starting", "api", "property"],
+      readOnly: "transient",
       description:
-        "Read a class's default property values off a fresh Instance.new in Studio. The API dump carries types but no defaults, so this is the only honest source. Write-class because it constructs an instance, even though it parents nothing.",
+        "Read a class's default property values off a fresh Instance.new in Studio. The API dump carries types but no defaults, so this is the only honest source. The instance is never parented and is destroyed straight away.",
       inputSchema: {
         type: "object",
         properties: {
@@ -415,8 +498,16 @@ export const DOCS_TOOLS: ToolEntry[] = [
         const api = await getApiDocs();
         properties = api
           .members(String(args?.class ?? ""), { inherited: false })
-          .filter((m) => m.member.MemberType === "Property" && !security(m.member))
-          .filter((m) => !(m.member.Tags ?? []).includes("ReadOnly"))
+          // Readable is what matters here, not writable — a default is worth
+          // reporting even for a property you cannot set. But NotScriptable ones
+          // throw on access, so they stay out.
+          .filter((m) => m.member.MemberType === "Property")
+          .filter((m) => !(m.member.Tags ?? []).includes("NotScriptable"))
+          .filter((m) => {
+            const read = m.member.Security;
+            const level = !read ? "None" : typeof read === "string" ? read : read.Read;
+            return level === "None" || level === "PluginSecurity";
+          })
           .map((m) => m.member.Name);
       }
       return `

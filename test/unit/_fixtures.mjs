@@ -7,7 +7,33 @@
  * dump first. It is small but structurally real: an inheritance chain, a
  * read-only member, a security-gated member, a method with parameters, an enum.
  */
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { ApiDocs, __setApiDocsForTest } from "../../dist/docs.js";
+
+/**
+ * Keep every test's on-disk state out of the developer's home directory.
+ *
+ * A bare `npm test` used to write `~/.cubesmcp/profiles/0.json`, because
+ * `profile_update` appears in more than one suite's sample arguments and only
+ * `profile.test.mjs` isolated itself. Importing this module is enough; it runs
+ * once per test process, before any suite.
+ *
+ * CUBES_MCP_HOME, not HOME: `stateDir()` checks CUBES_MCP_HOME first, so
+ * overriding HOME silently does nothing. That is exactly what went wrong in
+ * profile.test.mjs — its isolation evaporated whenever CUBES_MCP_HOME was set.
+ */
+if (!process.env.CUBES_MCP_TEST_STATE) {
+  const dir = mkdtempSync(join(tmpdir(), "cubes-mcp-test-state-"));
+  process.env.CUBES_MCP_TEST_STATE = dir;
+  process.env.CUBES_MCP_HOME = dir;
+}
+
+/** The isolated state directory for this test process. */
+export const TEST_STATE_DIR = process.env.CUBES_MCP_TEST_STATE;
+
 
 export const FAKE_DUMP = {
   Version: 1,
@@ -48,6 +74,36 @@ export const FAKE_DUMP = {
           MemberType: "Property",
           Security: { Read: "RobloxScriptSecurity", Write: "RobloxScriptSecurity" },
           ValueType: { Category: "Primitive", Name: "bool" },
+        },
+        {
+          // Security says None, but assigning it from Luau throws. 36 real
+          // properties look like this, Lighting.Technology among them.
+          Name: "EngineOnlyFlag",
+          MemberType: "Property",
+          Tags: ["NotScriptable"],
+          ValueType: { Category: "Primitive", Name: "bool" },
+        },
+        {
+          // This server IS a Studio plugin, so it can write these.
+          Name: "PluginOnlyFlag",
+          MemberType: "Property",
+          Security: { Read: "PluginSecurity", Write: "PluginSecurity" },
+          ValueType: { Category: "Primitive", Name: "bool" },
+        },
+        {
+          // Older dumps carried Security as a bare string.
+          Name: "LegacyShapedFlag",
+          MemberType: "Property",
+          Security: "RobloxScriptSecurity",
+          ValueType: { Category: "Primitive", Name: "bool" },
+        },
+        {
+          // A lowercase deprecated alias, the kind that used to outrank the real
+          // property in docs_search.
+          Name: "transparency",
+          MemberType: "Property",
+          Tags: ["Deprecated"],
+          ValueType: { Category: "Primitive", Name: "float" },
         },
       ],
     },

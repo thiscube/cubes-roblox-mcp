@@ -1,6 +1,11 @@
 /**
  * Profile persistence: concurrency, atomicity, and growth caps (AUDIT.md #11).
- * Writes go to a throwaway HOME so the developer's real ~/.cubesmcp is untouched.
+ *
+ * Writes go to a throwaway directory so the developer's real ~/.cubesmcp is
+ * untouched. This used to override HOME, which silently stopped working:
+ * `stateDir()` checks CUBES_MCP_HOME FIRST, so whenever that variable was set
+ * the isolation evaporated and these tests read a shared directory. Override the
+ * variable the code actually consults.
  */
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -8,21 +13,20 @@ import { mkdtemp, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-let realHome;
+let previousStateHome;
 let sandbox;
 let profile;
 
 before(async () => {
   sandbox = await mkdtemp(join(tmpdir(), "cubes-profile-test-"));
-  realHome = process.env.HOME;
-  process.env.HOME = sandbox;
-  process.env.USERPROFILE = sandbox;
-  // Imported AFTER HOME is redirected: the module resolves its directory on load.
+  previousStateHome = process.env.CUBES_MCP_HOME;
+  process.env.CUBES_MCP_HOME = sandbox;
   profile = await import("../../dist/profile.js");
 });
 
 after(async () => {
-  process.env.HOME = realHome;
+  if (previousStateHome === undefined) delete process.env.CUBES_MCP_HOME;
+  else process.env.CUBES_MCP_HOME = previousStateHome;
   await rm(sandbox, { recursive: true, force: true });
 });
 
@@ -70,7 +74,7 @@ describe("profile persistence", () => {
   test("#11 writes are atomic — no temp files left behind", async () => {
     const PID = 888;
     await profile.updateProfile(PID, (p) => p.knownIssues.push("x"));
-    const dir = join(sandbox, ".cubesmcp", "profiles");
+    const dir = join(sandbox, "profiles");
     const files = await readdir(dir);
     assert.ok(!files.some((f) => f.endsWith(".tmp")), `temp files left: ${files.join(", ")}`);
     assert.ok(files.includes(`${PID}.json`));

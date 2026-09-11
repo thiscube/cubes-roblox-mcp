@@ -35,11 +35,20 @@ transport (Open Cloud) would not touch a single tool handler.
 ## The two rules that matter most
 
 **1. Capability is derived, never labelled.** A tool's `channel` (set by its constructor —
-`evalTool`, `mutateTool`, `dispatchTool`, `localTool`) determines whether it's write-class.
-`capabilities()` in `registry.ts` is the single source of truth, used by the write gate, the
-`/rpc` gate and the MCP tool annotations. A tool on a Studio channel is write-class **by
-default**; opt out with `readOnly: true`, and only when the generated Luau provably only
-reads. Never add a hand-maintained write flag back.
+`evalTool`, `mutateTool`, `dispatchTool`, `pipelineTool`, `localTool`) determines whether
+it's write-class. `capabilities()` in `registry.ts` is the single source of truth, used by
+the write gate, the `/rpc` gate (via `rpc-policy.ts`) and the MCP tool annotations.
+
+The channel must describe **where the effect lands**, not where the computation happens.
+`script_edit` does its find/replace in TypeScript and was therefore written as a
+`localTool` — and it then overwrote script source with the *Allow writes* toggle off. Use
+`pipelineTool` when a server-side handler's effect reaches Studio through `handleMutate`.
+
+A tool on a Studio channel is write-class **by default**. Two explicit opt-outs, both
+read-class: `readOnly: true` when the generated Luau provably only reads, and
+`readOnly: "transient"` when it constructs something it never parents (`docs_defaults`).
+Never add a hand-maintained write flag back — the `/rpc` allowlist was the last one and it
+had drifted by sixteen tools.
 
 **2. The bridge authenticates in both directions.** Every route requires a bearer token,
 refuses any request carrying an `Origin`, requires a loopback `Host`, and requires

@@ -81,8 +81,24 @@ export interface ToolEntry {
   inputSchema: Record<string, unknown>;
   /** How this tool reaches Studio. Set by the constructor, never by hand. */
   channel: Channel;
-  /** True only when the tool provably cannot modify Studio. Explicit opt-out. */
-  readOnly?: boolean;
+  /**
+   * Explicit opt-out of write-class. Two honest levels, and no third:
+   *
+   *   true          the generated Luau provably only reads.
+   *   "transient"   it constructs an object that is never parented and destroys
+   *                 it again, so it cannot change the place. Read-class for
+   *                 every gate, but not a pure read, and the annotations say so.
+   *
+   * The second level exists because `docs_defaults` has to do
+   * `Instance.new(Class)` to read a default value. Under a boolean it came out
+   * write-class, which meant a documentation lookup shipped
+   * `destructiveHint: true` to the client and vanished from the read-only build
+   * — the build whose entire purpose is inspection. The binary was the bug, not
+   * the classification.
+   *
+   * Deny-by-default is unchanged: absent means write-class.
+   */
+  readOnly?: true | "transient";
   /**
    * Declared result shape. Optional here because most tools take the default for
    * their channel; read it through `outputSchemaFor`, never directly, so the
@@ -117,14 +133,24 @@ export interface Capability {
   write: boolean;
   /** Touches the DataModel at all (false for server-local tools). */
   touchesStudio: boolean;
+  /**
+   * Constructs something in Studio but never parents it, so it changes nothing.
+   * Read-class, but not a pure read — worth saying separately so annotations can
+   * be accurate instead of merely safe.
+   */
+  transient: boolean;
 }
 
 export function capabilities(entry: Pick<ToolEntry, "channel" | "readOnly">): Capability {
   const touchesStudio = entry.channel !== "local";
-  if (!touchesStudio) return { write: false, touchesStudio: false };
+  if (!touchesStudio) return { write: false, touchesStudio: false, transient: false };
   // Deny by default: anything on a Studio channel is write-class unless it has
-  // explicitly, and provably, opted out.
-  return { write: entry.readOnly !== true, touchesStudio: true };
+  // explicitly, and provably, opted out. Both opt-out levels are read-class.
+  return {
+    write: entry.readOnly === undefined,
+    touchesStudio: true,
+    transient: entry.readOnly === "transient",
+  };
 }
 
 /**
@@ -277,10 +303,11 @@ interface ToolMeta {
   description: string;
   inputSchema: Record<string, unknown>;
   /**
-   * Set ONLY when the tool provably cannot modify Studio. Everything on a Studio
-   * channel is write-class by default — see the capability note at the top.
+   * Set ONLY when the tool cannot modify the place. `true` for a pure read,
+   * `"transient"` when it constructs something it never parents. Everything on a
+   * Studio channel is write-class by default — see the capability note at the top.
    */
-  readOnly?: boolean;
+  readOnly?: true | "transient";
   /** See ToolEntry.yieldBudgetMs. */
   yieldBudgetMs?: (args: any) => number;
   /** Declared result shape. Defaults to the channel's shape when omitted. */

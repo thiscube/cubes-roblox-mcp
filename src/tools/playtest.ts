@@ -194,7 +194,7 @@ return {
     subcategories: ["live", "eval", "tweak"],
     keywords: ["tune", "live", "eval", "playtest", "tweak", "gravity", "walkspeed", "stats", "mid-run", "hotfix"],
     description:
-      "Run Luau in the RUNNING playtest's server DataModel: the live game, not the edit place. Tweak values mid-playtest (Gravity, WalkSpeed, enemy stats) live. `return <value>` comes back as JSON. Needs a playtest, else `no_playtest`.",
+      "Run Luau in the RUNNING playtest's server DataModel: the live game, not the edit place. Tweak values mid-playtest (Gravity, WalkSpeed, enemy stats) live. `return <v>` comes back as JSON, a nil return as `{__void=true}`. Needs a playtest.",
     inputSchema: {
       type: "object",
       properties: {

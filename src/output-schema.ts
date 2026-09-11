@@ -69,13 +69,17 @@ export const OPAQUE_RESULT: JsonSchema = objectResult();
 export const EVAL_RESULT: JsonSchema = objectResult({ result: {} });
 
 /**
- * A mutate batch. `applied` and `results` come from the plugin; the rest are the
- * server's own gate and lint output, which is why they can be declared exactly.
+ * A mutate batch.
+ *
+ * Only the fields this server writes are typed: the destructiveness gate's
+ * output and the selene lint array. `applied` and `results` come from the plugin
+ * and are named but untyped, per Rule 1 above.
  */
 export const MUTATE_RESULT: JsonSchema = objectResult({
-  applied: { type: "number" },
-  results: { type: "array" },
+  applied: {},
+  results: {},
   lint: { type: "array" },
+  appliedLevel: { type: "string", enum: ["none", "soft", "hard", "nuclear"] },
   level: { type: "string", enum: ["none", "soft", "hard", "nuclear"] },
   summary: { type: "string" },
   retry_with: { type: "object" },

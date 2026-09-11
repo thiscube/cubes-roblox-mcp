@@ -132,6 +132,8 @@ export class ApiDocs {
   /** Lowercased class name -> real name, so lookups are case-insensitive. */
   private readonly classAlias = new Map<string, string>();
   private readonly enumAlias = new Map<string, string>();
+  /** Lazily built in descendantCount(). */
+  private descendants: Map<string, number> | null = null;
 
   private constructor(
     readonly dump: ApiDump,
@@ -211,6 +213,40 @@ export class ApiDocs {
 
   classNames(): string[] {
     return [...this.byClass.keys()];
+  }
+
+  /**
+   * How many classes descend from this one, transitively.
+   *
+   * The cheapest signal for "this is the class everybody means". Searching
+   * "size" matches a property on fifty classes; `BasePart` has hundreds of
+   * descendants and `Fire` has none, and that difference is what puts the right
+   * answer first. Computed once, on demand, from the Superclass edges.
+   */
+  descendantCount(name: string): number {
+    if (!this.descendants) {
+      const direct = new Map<string, string[]>();
+      for (const c of this.dump.Classes) {
+        const list = direct.get(c.Superclass);
+        if (list) list.push(c.Name);
+        else direct.set(c.Superclass, [c.Name]);
+      }
+      this.descendants = new Map();
+      for (const c of this.dump.Classes) {
+        let total = 0;
+        const stack = [...(direct.get(c.Name) ?? [])];
+        const seen = new Set<string>([c.Name]);
+        while (stack.length > 0) {
+          const next = stack.pop() as string;
+          if (seen.has(next)) continue;
+          seen.add(next);
+          total += 1;
+          stack.push(...(direct.get(next) ?? []));
+        }
+        this.descendants.set(c.Name, total);
+      }
+    }
+    return this.descendants.get(name) ?? 0;
   }
 
   enumNames(): string[] {

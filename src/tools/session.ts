@@ -165,7 +165,7 @@ export const SESSION_TOOLS: ToolEntry[] = [
         confirm: {
           type: "boolean",
           description:
-            "Required when the macro's ops are destructive. Forwarded to the mutate pipeline.",
+            "Required when the macro deletes anything or overwrites script Source. Forwarded to the mutate pipeline.",
         },
       },
       required: ["name"],

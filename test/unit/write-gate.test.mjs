@@ -199,14 +199,41 @@ describe("write gate: behaviour, not labels", () => {
     );
   });
 
-  test("capabilities() still derives, and nothing opts out dishonestly", () => {
+  test("capabilities() still derives, and deny-by-default still holds", () => {
     for (const entry of ALL_TOOLS) {
       const cap = capabilities(entry);
       if (entry.channel === "local") {
         assert.equal(cap.write, false, `${entry.name}: local tools are not write-class`);
-      } else if (entry.readOnly !== true) {
+        assert.equal(cap.touchesStudio, false);
+      } else if (entry.readOnly === undefined) {
         assert.equal(cap.write, true, `${entry.name}: a Studio channel is write-class by default`);
+      } else {
+        // Both opt-out levels are read-class. `true` is a pure read;
+        // `"transient"` constructs something it never parents.
+        assert.ok(
+          entry.readOnly === true || entry.readOnly === "transient",
+          `${entry.name}: readOnly must be true or "transient", got ${JSON.stringify(entry.readOnly)}`,
+        );
+        assert.equal(cap.write, false);
+        assert.equal(cap.transient, entry.readOnly === "transient");
       }
     }
+  });
+
+  test("the /rpc allowlist is derived, not hand-listed", async () => {
+    // CLAUDE.md: capability is derived and never labelled. The bridge used to
+    // carry its own hardcoded Set, which drifted — sixteen read-only tools were
+    // refused and two entries named commands that are not tools.
+    const { rpcReadOnlyCommands } = await import("../../dist/rpc-policy.js");
+    const allowed = new Set(rpcReadOnlyCommands());
+    for (const entry of ALL_TOOLS) {
+      assert.equal(
+        allowed.has(entry.name),
+        !capabilities(entry).write,
+        `${entry.name}: /rpc allowlist disagrees with capabilities()`,
+      );
+    }
+    assert.ok(allowed.has("read"), "the universal read verb must be allowed");
+    assert.ok(!allowed.has("mutate") && !allowed.has("run_code"));
   });
 });

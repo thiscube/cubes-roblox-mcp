@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 import { createMcpServer } from "../../dist/server.js";
 import { StudioBridge } from "../../dist/bridge.js";
 import { MAX_PROTOCOL_VERSION } from "../../dist/protocol.js";
+import { rpcReadOnlyCommands } from "../../dist/rpc-policy.js";
 import { ALL_TOOLS } from "../../dist/tools/index.js";
 import { capabilities } from "../../dist/registry.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -156,7 +157,7 @@ describe("read-only build: the /rpc door", () => {
   }
 
   test("/rpc refuses writes even with the Studio toggle ON", async () => {
-    const bridge = new StudioBridge(0, { readOnly: true });
+    const bridge = new StudioBridge(0, { readOnly: true, readOnlyCommands: rpcReadOnlyCommands() });
     await bridge.start();
     const p = bridge.boundPort;
     try {
@@ -174,7 +175,7 @@ describe("read-only build: the /rpc door", () => {
   });
 
   test("a read command still goes through on a read-only bridge", async () => {
-    const bridge = new StudioBridge(0, { readOnly: true });
+    const bridge = new StudioBridge(0, { readOnly: true, readOnlyCommands: rpcReadOnlyCommands() });
     await bridge.start();
     const p = bridge.boundPort;
     try {
@@ -193,7 +194,7 @@ describe("read-only build: the /rpc door", () => {
   });
 
   test("a writable build refuses on the toggle instead, with the other error", async () => {
-    const bridge = new StudioBridge(0);
+    const bridge = new StudioBridge(0, { readOnlyCommands: rpcReadOnlyCommands() });
     await bridge.start();
     const p = bridge.boundPort;
     try {

@@ -21,6 +21,7 @@ import { installFakeDump } from "./_fixtures.mjs";
 import { ALL_TOOLS } from "../../dist/tools/index.js";
 import { outputSchemaFor } from "../../dist/registry.js";
 import { validateArgs } from "../../dist/validate.js";
+import AjvModule from "ajv";
 import { RESULT_ENVELOPE } from "../../dist/output-schema.js";
 import {
   CallToolRequestSchema,
@@ -30,6 +31,56 @@ import {
 
 // Docs tools must answer from a fixture, never from Roblox's CDN.
 installFakeDump();
+
+/**
+ * Validate with Ajv, not with this repo's own `validateArgs`.
+ *
+ * The MCP client validates `structuredContent` with Ajv (the SDK's
+ * AjvJsonSchemaValidator), and `src/validate.ts` is a deliberately small subset
+ * that ignores most keywords. Checking our schemas with our own lenient
+ * validator would mean the suite agrees with itself while real clients reject
+ * the result. Ajv comes in with the SDK, so this costs no new dependency.
+ */
+const Ajv = AjvModule.default ?? AjvModule;
+const ajv = new Ajv({ strict: false, allErrors: true });
+
+function ajvProblems(schema, value) {
+  const validate = ajv.compile(schema);
+  return validate(value) ? [] : (validate.errors ?? []).map((e) => `${e.instancePath || "/"} ${e.message}`);
+}
+
+/** Keywords `src/validate.ts` actually implements. */
+const VALIDATE_ARGS_KEYWORDS = new Set([
+  "type",
+  "enum",
+  "required",
+  "properties",
+  "items",
+  "oneOf",
+  "minimum",
+  "maximum",
+  "description",
+  "default",
+  "title",
+  "additionalProperties",
+]);
+
+function keywordsIn(schema, out = new Set()) {
+  if (!schema || typeof schema !== "object") return out;
+  if (Array.isArray(schema)) {
+    for (const s of schema) keywordsIn(s, out);
+    return out;
+  }
+  for (const [k, v] of Object.entries(schema)) {
+    out.add(k);
+    if (k === "properties" || k === "patternProperties") {
+      for (const sub of Object.values(v ?? {})) keywordsIn(sub, out);
+    } else if (typeof v === "object") {
+      keywordsIn(v, out);
+    }
+  }
+  return out;
+}
 
 class FakeTransport {
   connected = true;
@@ -114,8 +165,8 @@ describe("declared result shapes (PLAN #5)", () => {
       }
       const { tools } = await h.list();
       const declared = tools.find((t) => t.name === name)?.outputSchema;
-      const problems = validateArgs(res.structuredContent, declared);
-      if (problems.length > 0) failures.push(`${name}: ${problems.map((p) => p.message).join("; ")}`);
+      const problems = ajvProblems(declared, res.structuredContent);
+      if (problems.length > 0) failures.push(`${name}: ${problems.join("; ")}`);
     }
     assert.deepEqual(failures, [], failures.join("\n"));
   });
@@ -136,7 +187,7 @@ describe("declared result shapes (PLAN #5)", () => {
     assert.ok(res.structuredContent.error, "expected an error payload");
     const { tools } = await h.list();
     const declared = tools.find((t) => t.name === "run_code").outputSchema;
-    assert.deepEqual(validateArgs(res.structuredContent, declared), []);
+    assert.deepEqual(ajvProblems(declared, res.structuredContent), []);
   });
 
   test("the envelope is documented as a resource instead of repeated per tool", async () => {
@@ -183,6 +234,61 @@ describe("declared result shapes (PLAN #5)", () => {
     assert.ok(
       validateArgs({ level: "catastrophic" }, mutate).length > 0,
       "a value outside the declared enum must be rejected",
+    );
+  });
+
+  test("a plugin returning a non-object still produces valid structuredContent", async () => {
+    // MCP requires structuredContent when a tool declares an outputSchema, and
+    // the SDK's own client throws McpError when it is missing. A dispatch tool
+    // hands back whatever the plugin returned, so a plugin handler returning a
+    // bare array or string used to take the call down.
+    for (const bad of [[1, 2, 3], "a string", 42, null, true]) {
+      const transport = {
+        connected: true,
+        writeEnabled: true,
+        async send() {
+          return bad;
+        },
+      };
+      const server = createMcpServer(transport);
+      const h = server._requestHandlers;
+      const signal = new AbortController().signal;
+      const res = await h.get(CallToolRequestSchema.shape.method.value)(
+        { method: "tools/call", params: { name: "playtest_play", arguments: {} } },
+        { signal },
+      );
+      assert.ok(res.structuredContent, `no structuredContent for ${JSON.stringify(bad)}`);
+      assert.equal(typeof res.structuredContent, "object");
+      assert.ok(!Array.isArray(res.structuredContent));
+      assert.deepEqual(res.structuredContent.result, bad);
+      const { tools } = await h.get(ListToolsRequestSchema.shape.method.value)(
+        { method: "tools/list", params: {} },
+        { signal },
+      );
+      const declared = tools.find((t) => t.name === "playtest_play").outputSchema;
+      assert.deepEqual(ajvProblems(declared, res.structuredContent), []);
+    }
+  });
+
+  test("no declared schema uses a keyword this repo's own validator ignores", async () => {
+    // src/validate.ts is a small subset and every gap is permissive. It is used
+    // to validate tool ARGUMENTS, where being wrong means letting a bad call
+    // through. So nothing we declare may depend on a keyword it does not read.
+    const h = harness();
+    for (const t of ALL_TOOLS) await h.call(t.name, SAMPLE_ARGS[t.name] ?? {});
+    const { tools } = await h.list();
+    const unsupported = [];
+    for (const tool of tools) {
+      for (const schema of [tool.inputSchema, tool.outputSchema]) {
+        for (const kw of keywordsIn(schema)) {
+          if (!VALIDATE_ARGS_KEYWORDS.has(kw)) unsupported.push(`${tool.name}: ${kw}`);
+        }
+      }
+    }
+    assert.deepEqual(
+      [...new Set(unsupported)],
+      [],
+      "these keywords are declared but silently ignored by src/validate.ts",
     );
   });
 

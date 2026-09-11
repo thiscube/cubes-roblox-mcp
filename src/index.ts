@@ -2,6 +2,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StudioBridge } from "./bridge.js";
 import { createMcpServer, readOnlyFromEnv } from "./server.js";
+import { rpcReadOnlyCommands } from "./rpc-policy.js";
 import { lintAvailable } from "./lint.js";
 
 /**
@@ -21,7 +22,10 @@ const PORT = Number(process.env.CUBES_MCP_PORT ?? 44820);
 const READ_ONLY = process.argv.includes("--read-only") || readOnlyFromEnv();
 
 async function main(): Promise<void> {
-  const bridge = new StudioBridge(PORT, { readOnly: READ_ONLY });
+  const bridge = new StudioBridge(PORT, {
+    readOnly: READ_ONLY,
+    readOnlyCommands: rpcReadOnlyCommands(),
+  });
   await bridge.start();
 
   const server = createMcpServer(bridge, { readOnly: READ_ONLY });

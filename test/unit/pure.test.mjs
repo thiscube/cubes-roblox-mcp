@@ -16,6 +16,8 @@ import { validateArgs } from "../../dist/validate.js";
 import { diffSnapshots } from "../../dist/snapshot-diff.js";
 import { truncateArgs } from "../../dist/memory.js";
 import { px, resolveInsets } from "../../dist/vision.js";
+// Isolates on-disk state (CUBES_MCP_HOME) and the API dump. Import for the side effect.
+import "./_fixtures.mjs";
 
 const ch = (n) => String.fromCharCode(n);
 

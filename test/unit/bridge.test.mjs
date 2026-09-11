@@ -8,6 +8,9 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { StudioBridge } from "../../dist/bridge.js";
 import { MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, protocolSupported } from "../../dist/protocol.js";
+import { rpcReadOnlyCommands } from "../../dist/rpc-policy.js";
+// Isolates on-disk state (CUBES_MCP_HOME) and the API dump. Import for the side effect.
+import "./_fixtures.mjs";
 
 /**
  * Spin up a bridge on an OS-assigned port; caller must stop it.
@@ -16,7 +19,7 @@ import { MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, protocolSupported } from ".
  * hand-picked ranges collided intermittently with EADDRINUSE.
  */
 async function makeBridge() {
-  const bridge = new StudioBridge(0);
+  const bridge = new StudioBridge(0, { readOnlyCommands: rpcReadOnlyCommands() });
   await bridge.start();
   const p = bridge.boundPort;
   const base = `http://127.0.0.1:${p}`;

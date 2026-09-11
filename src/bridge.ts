@@ -117,9 +117,30 @@ export class StudioBridge implements StudioTransport {
    */
   readonly readOnly: boolean;
 
-  constructor(port: number, opts: { readOnly?: boolean } = {}) {
+  /**
+   * Command names `/rpc` will run without write mode.
+   *
+   * Passed in by the composition root, derived from `capabilities()`, because
+   * the bridge sits BELOW the tool layer and must not import it. It used to be a
+   * hardcoded Set here, which drifted: sixteen tools that `capabilities()` calls
+   * read-only were refused by `/rpc`, including every docs lookup, and two
+   * entries named commands that are not tools at all. CLAUDE.md says capability
+   * is derived and never labelled; this was the last hand-maintained label.
+   */
+  private readonly readOnlyCommands: ReadonlySet<string>;
+
+  constructor(
+    port: number,
+    opts: { readOnly?: boolean; readOnlyCommands?: Iterable<string> } = {},
+  ) {
     this.port = port;
     this.readOnly = opts.readOnly ?? false;
+    // Default to the plugin-native names only. Fails closed: a bridge built
+    // without the derived set refuses more than it needs to, never less.
+    this.readOnlyCommands = new Set([
+      ...PLUGIN_NATIVE_READ_COMMANDS,
+      ...(opts.readOnlyCommands ?? []),
+    ]);
     const { token, generated } = resolveToken();
     this.token = token;
     this.tokenGenerated = generated;
@@ -467,7 +488,7 @@ export class StudioBridge implements StudioTransport {
       res.end(JSON.stringify({ error: "missing_tool" }));
       return;
     }
-    if (!RPC_READ_ONLY_TOOLS.has(tool) && (this.readOnly || !this.writeEnabled)) {
+    if (!this.readOnlyCommands.has(tool) && (this.readOnly || !this.writeEnabled)) {
       res.statusCode = 403;
       res.setHeader("content-type", "application/json");
       res.end(
@@ -574,19 +595,18 @@ export class StudioBridge implements StudioTransport {
 }
 
 /**
- * Tools that only read. Everything else — including plugin-native tools this
- * server has never heard of — is treated as a write by `/rpc`.
+ * Plugin commands with no MCP tool of their own.
+ *
+ * `/rpc` classifies by NAME, and most names are tool names that `capabilities()`
+ * already classifies — the composition root passes that derived set in. These
+ * two are plugin-native commands a human might call over `/rpc` directly, so
+ * they have no tool entry to derive from and are listed explicitly.
+ *
+ * This is the whole hand-maintained surface, and it is read-only by
+ * construction. Everything else — including plugin commands this server has
+ * never heard of — is treated as a write.
  */
-const RPC_READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
-  "read",
-  "diagnostics",
-  "snapshot",
-  "viewport",
-  "players_state",
-  "character_state",
-  "playtest_status",
-  "playtest_result",
-]);
+const PLUGIN_NATIVE_READ_COMMANDS: ReadonlySet<string> = new Set(["diagnostics", "viewport"]);
 
 type JsonBody =
   | { ok: true; value: any }

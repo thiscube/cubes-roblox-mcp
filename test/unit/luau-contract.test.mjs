@@ -14,6 +14,8 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { MCP_API, MCP_API_NAMES } from "../../dist/tools/mcp-api.js";
+// Isolates on-disk state (CUBES_MCP_HOME) and the API dump. Import for the side effect.
+import "./_fixtures.mjs";
 
 const SRC = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "src");
 
