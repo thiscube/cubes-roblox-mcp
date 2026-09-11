@@ -25,10 +25,13 @@
  *   3 - additive: a `capture` command, answered with { png, width, height } from
  *       StudioCaptureService. A v2 plugin has no such handler; `screenshot`
  *       treats any failure as "use the OS path", so MIN stays 2.
+ *   4 - additive: a WebSocket transport at /ws, as an alternative to long-poll.
+ *       A plugin that does not open one keeps polling and nothing changes, so
+ *       MIN stays 2.
  */
 
 /** Newest protocol this server speaks. Advertised in /health. */
-export const MAX_PROTOCOL_VERSION = 3;
+export const MAX_PROTOCOL_VERSION = 4;
 
 /** Oldest protocol this server still accepts. */
 export const MIN_PROTOCOL_VERSION = 2;

@@ -38,6 +38,8 @@ user's "Allow writes" toggle and the server gates every write-class tool on it.
 | playtest lifecycle | 1 | see `src/tools/playtest.ts` |
 | **`capture`** | **3** | **`{ png, width, height }`** |
 
+Protocol 4 adds the WebSocket transport below; it carries the same commands.
+
 ## `capture` (protocol 3)
 
 Sent as `{ region, maxEdge }`. `region` is `"viewport"` or `"studio"`; `maxEdge`
@@ -62,6 +64,59 @@ Two things the server already handles, so do not work around them:
 `StudioCaptureService` is FFlag-gated and missing from some Studio builds, so
 check `CanCaptureScreenshot` first and answer with a structured error when it is
 unavailable — the OS path picks it up from there.
+
+## WebSocket (protocol 4, optional)
+
+Long-poll still works and is still the default. A plugin may instead open a
+socket to `ws://127.0.0.1:<port>/ws`.
+
+Auth is the same four checks minus content-type. The token goes in
+`Authorization: Bearer <token>`, or in `?token=` on the URL if your client cannot
+set headers — that second form is accepted **only** on the upgrade, never on the
+HTTP routes.
+
+**Send no Origin header.** A WebSocket is not subject to CORS, so any web page
+can open one to 127.0.0.1 and the browser will not stop it. What the browser
+always does is attach an Origin, and the plugin never does, so the bridge refuses
+any upgrade that carries one. If your client adds an Origin automatically, you
+cannot use this transport.
+
+Messages are JSON text frames.
+
+Plugin to server:
+
+```
+{ "type": "hello",  "protocol": 4, "writeEnabled": true }
+{ "type": "state",  "writeEnabled": false }
+{ "type": "result", "id": "...", "ok": true,  "result": { ... } }
+{ "type": "result", "id": "...", "ok": false, "error": { "code": "...", "message": "..." } }
+{ "type": "ping" }
+```
+
+Server to plugin:
+
+```
+{ "type": "welcome", "protocol": 4 }
+{ "type": "command", "id": "...", "tool": "read", "args": { ... } }
+{ "type": "error",   "error": "protocol_mismatch", "supported": [2, 4], "got": 1 }
+{ "type": "pong" }
+```
+
+Four things to get right:
+
+- **`hello` first.** Commands queued before it are drained the moment it arrives.
+- **`writeEnabled` is still load-bearing**, and a `state` message without the
+  field means OFF. Closing the socket also turns writes off immediately: write
+  permission must not outlive the plugin that granted it.
+- **One socket.** A second connection replaces the first, which is closed with
+  `replaced_by_new_connection`.
+- **Unknown message types are ignored, not fatal.** That is what keeps the
+  protocol additive in this direction too.
+
+Do not expect this to be faster in any way you can feel. Measured on loopback
+(`test/bench/poll-latency.mjs`): long-poll p50 1.4ms, socket p50 0.06ms. Both are
+noise next to Studio doing the work. The reason to implement it is that the
+plugin can push when nothing was asked of it, which long-poll cannot do.
 
 ## The `__MCP` sandbox
 

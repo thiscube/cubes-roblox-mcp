@@ -1,4 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
+import type { Duplex } from "node:stream";
+import { WebSocketServer, type WebSocket } from "ws";
 import { randomUUID, randomBytes, timingSafeEqual } from "node:crypto";
 import { MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, protocolSupported } from "./protocol.js";
 import { BridgeError, type StudioTransport } from "./transport.js";
@@ -6,10 +8,19 @@ import { BridgeError, type StudioTransport } from "./transport.js";
 /**
  * The bridge between the MCP server (this process) and the Roblox Studio plugin.
  *
- * Studio plugins cannot open sockets, but they CAN make outbound HTTP requests to
- * localhost. So the plugin is a long-polling client: it asks "any command for me?",
- * we hold the request open until a command is queued (or it times out), the plugin
- * runs the command in Studio, then POSTs the result back.
+ * Studio plugins cannot listen on sockets, but they CAN make outbound HTTP requests
+ * to localhost. So the plugin is a long-polling client: it asks "any command for
+ * me?", we hold the request open until a command is queued (or it times out), the
+ * plugin runs the command in Studio, then POSTs the result back.
+ *
+ * A newer plugin can open a WebSocket to /ws instead (protocol 4). Long-poll stays
+ * the default and the fallback, and the reason is worth writing down because it is
+ * not the one people expect: latency is NOT the problem. A parked poll is handed a
+ * command the moment one is queued, so a sequential command costs about 1.5ms at
+ * p50 on loopback (test/bench/poll-latency.mjs), which is noise next to Studio
+ * doing the work. What the socket buys is the direction long-poll cannot do at
+ * all: the plugin can push when nothing has been asked of it, and the server can
+ * dispatch without a poll in flight.
  *
  *   Claude <--stdio--> MCP server <--HTTP long-poll--> Studio plugin --> DataModel
  *
@@ -102,6 +113,9 @@ export class StudioBridge implements StudioTransport {
    */
   private readonly cancelled = new Map<string, true>();
   private lastSeen = 0;
+  /** The plugin's WebSocket, when it chose that transport. */
+  private socket: WebSocket | null = null;
+  private wss?: WebSocketServer;
   private _writeEnabled = false;
   private lastHandshake: { protocol: number | null; ok: boolean; at: number } | null = null;
   private httpServer?: Server;
@@ -154,9 +168,20 @@ export class StudioBridge implements StudioTransport {
     }
   }
 
-  /** True if the Studio plugin has polled us recently. */
+  /** True if the Studio plugin holds a socket, or has polled us recently. */
   get connected(): boolean {
+    if (this.socketOpen) return true;
     return Date.now() - this.lastSeen < HEARTBEAT_WINDOW_MS;
+  }
+
+  private get socketOpen(): boolean {
+    return this.socket !== null && this.socket.readyState === 1; // OPEN
+  }
+
+  /** Which transport the plugin is using. Informational, reported by /health. */
+  get transportKind(): "websocket" | "long-poll" | "none" {
+    if (this.socketOpen) return "websocket";
+    return Date.now() - this.lastSeen < HEARTBEAT_WINDOW_MS ? "long-poll" : "none";
   }
 
   /**
@@ -206,6 +231,12 @@ export class StudioBridge implements StudioTransport {
           if (!res.writableEnded) res.end(JSON.stringify({ error: "internal_error" }));
         });
       });
+      // The WebSocket endpoint shares the HTTP listener. `noServer` means every
+      // upgrade goes through our own guard first — ws never sees a request we
+      // have not authenticated.
+      this.wss = new WebSocketServer({ noServer: true });
+      this.httpServer.on("upgrade", (req, socket, head) => this.handleUpgrade(req, socket, head));
+
       // Reject only the startup attempt; later errors must be logged, not
       // swallowed by a settled promise (AUDIT.md #23).
       this.httpServer.once("error", reject);
@@ -227,6 +258,10 @@ export class StudioBridge implements StudioTransport {
         p.reject(new BridgeError("bridge_stopped", "The Studio bridge was shut down."));
       }
       this.pending.clear();
+      this.socket?.close(1001, "bridge_stopped");
+      this.socket = null;
+      this.wss?.close();
+      this.wss = undefined;
       if (!this.httpServer) return resolve();
       this.httpServer.close(() => resolve());
       this.httpServer.closeAllConnections?.();
@@ -287,6 +322,18 @@ export class StudioBridge implements StudioTransport {
    * skipped rather than silently swallowing the command (AUDIT.md #5).
    */
   private dispatch(cmd: BridgeCommand): void {
+    // A live socket takes it immediately: no queue, no waiting for a poll.
+    if (this.socketOpen) {
+      try {
+        this.socket?.send(
+          JSON.stringify({ type: "command", id: cmd.id, tool: cmd.tool, args: cmd.args }),
+        );
+        return;
+      } catch {
+        // The socket died between the readyState check and the write. Fall
+        // through to the queue rather than dropping the command.
+      }
+    }
     while (this.waiters.length > 0) {
       const waiter = this.waiters.shift();
       if (waiter && waiter(cmd)) return;
@@ -304,6 +351,132 @@ export class StudioBridge implements StudioTransport {
   }
 
   // ------------------------------------------------------------------------
+  // WebSocket transport (protocol 4)
+  // ------------------------------------------------------------------------
+
+  /**
+   * Authenticate an upgrade before ws ever sees it.
+   *
+   * The Origin check matters more here than anywhere else in this file. A
+   * WebSocket is NOT subject to CORS: a page on any site can open one to
+   * 127.0.0.1 and the browser will not stop it. What the browser always does is
+   * attach an Origin header, and the plugin never sends one — so refusing any
+   * upgrade that carries an Origin is the whole defence, and it is not optional.
+   */
+  private handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
+    const path = (req.url ?? "/").split("?")[0];
+    if (path !== "/ws") return StudioBridge.denySocket(socket, 404, "not_found");
+
+    // Same four checks as every HTTP route, minus content-type, which an upgrade
+    // does not carry.
+    const failure = this.guard(req, { requireJson: false, allowQueryToken: true });
+    if (failure) return StudioBridge.denySocket(socket, failure.status, failure.code);
+
+    this.wss?.handleUpgrade(req, socket, head, (ws) => this.adoptSocket(ws));
+  }
+
+  private adoptSocket(ws: WebSocket): void {
+    // One plugin, one place. A second connection replaces the first rather than
+    // racing it for results — the same rule the rest of the bridge assumes.
+    if (this.socket && this.socket !== ws) {
+      try {
+        this.socket.close(1000, "replaced_by_new_connection");
+      } catch {
+        /* already gone */
+      }
+    }
+    this.socket = ws;
+    this.lastSeen = Date.now();
+
+    ws.on("message", (raw) => this.handleSocketMessage(ws, raw.toString()));
+    ws.on("close", () => {
+      if (this.socket === ws) {
+        this.socket = null;
+        // Writes must never outlive the plugin that authorised them. Same rule
+        // as a /poll that omits the field (AUDIT.md #24).
+        this._writeEnabled = false;
+      }
+    });
+    ws.on("error", () => {
+      if (this.socket === ws) this.socket = null;
+    });
+  }
+
+  private handleSocketMessage(ws: WebSocket, raw: string): void {
+    if (raw.length > MAX_BODY_BYTES) {
+      ws.close(1009, "payload_too_large");
+      return;
+    }
+    let msg: any;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      ws.close(1003, "bad_json");
+      return;
+    }
+    this.lastSeen = Date.now();
+
+    switch (msg?.type) {
+      case "hello": {
+        const got: number | null = typeof msg.protocol === "number" ? msg.protocol : null;
+        const ok = got !== null && protocolSupported(got);
+        this.lastHandshake = { protocol: got, ok, at: Date.now() };
+        if (!ok) {
+          // Same answer as the 426 on /poll: rebuild the plugin.
+          ws.send(
+            JSON.stringify({
+              type: "error",
+              error: "protocol_mismatch",
+              supported: [MIN_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION],
+              got,
+            }),
+          );
+          ws.close(1008, "protocol_mismatch");
+          if (this.socket === ws) this.socket = null;
+          return;
+        }
+        this._writeEnabled = msg.writeEnabled === true;
+        ws.send(JSON.stringify({ type: "welcome", protocol: MAX_PROTOCOL_VERSION }));
+        // A socket that connects while commands are already queued should drain
+        // them rather than wait for something new to happen.
+        this.drainQueueToSocket();
+        return;
+      }
+      case "state":
+        // A missing field means off, never unchanged.
+        this._writeEnabled = msg.writeEnabled === true;
+        return;
+      case "result":
+        this.handleResult(msg);
+        return;
+      case "ping":
+        ws.send(JSON.stringify({ type: "pong" }));
+        return;
+      default:
+        // Unknown message types are ignored, not fatal: that is what makes the
+        // protocol range additive in this direction too.
+        return;
+    }
+  }
+
+  private drainQueueToSocket(): void {
+    while (this.socketOpen && this.queue.length > 0) {
+      const cmd = this.queue.shift();
+      if (!cmd) break;
+      this.socket?.send(
+        JSON.stringify({ type: "command", id: cmd.id, tool: cmd.tool, args: cmd.args }),
+      );
+    }
+  }
+
+  private static denySocket(socket: Duplex, status: number, code: string): void {
+    const reason =
+      status === 401 ? "Unauthorized" : status === 403 ? "Forbidden" : status === 404 ? "Not Found" : "Bad Request";
+    socket.write(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nX-Cubes-Error: ${code}\r\n\r\n`);
+    socket.destroy();
+  }
+
+  // ------------------------------------------------------------------------
   // Request guard
   // ------------------------------------------------------------------------
 
@@ -311,7 +484,10 @@ export class StudioBridge implements StudioTransport {
    * The four checks every route runs before doing any work. Returns null when the
    * request is allowed, or the failure to send back.
    */
-  private guard(req: IncomingMessage, opts: { requireJson: boolean }): GuardFailure | null {
+  private guard(
+    req: IncomingMessage,
+    opts: { requireJson: boolean; allowQueryToken?: boolean },
+  ): GuardFailure | null {
     // A browser attaches Origin to every cross-origin request. The plugin never
     // sends one, so its presence alone is disqualifying.
     if (req.headers.origin !== undefined) {
@@ -336,7 +512,7 @@ export class StudioBridge implements StudioTransport {
     }
 
     if (!this.allowUnauthenticated) {
-      const presented = this.presentedToken(req);
+      const presented = this.presentedToken(req, opts.allowQueryToken === true);
       if (!presented || !tokenMatches(presented, this.token)) {
         return { status: 401, code: "unauthorized", message: "Missing or invalid bridge token." };
       }
@@ -344,7 +520,7 @@ export class StudioBridge implements StudioTransport {
     return null;
   }
 
-  private presentedToken(req: IncomingMessage): string {
+  private presentedToken(req: IncomingMessage, allowQuery = false): string {
     const auth = req.headers.authorization;
     if (typeof auth === "string" && auth.toLowerCase().startsWith("bearer ")) {
       return auth.slice(7).trim();
@@ -352,6 +528,18 @@ export class StudioBridge implements StudioTransport {
     const header = req.headers["x-cubes-token"];
     if (typeof header === "string") return header;
     if (Array.isArray(header) && header[0]) return header[0];
+    // Upgrades only. Roblox's WebSocket client cannot be relied on to set custom
+    // headers, so `/ws?token=` is accepted there and nowhere else. It is a real
+    // downgrade — query strings land in logs and referrers — but the listener is
+    // loopback-only and the token is per-run, so the exposure is a local log
+    // file. Never widen this to the HTTP routes, which have no such excuse.
+    if (allowQuery) {
+      const q = (req.url ?? "").split("?")[1];
+      if (q) {
+        const value = new URLSearchParams(q).get("token");
+        if (value) return value;
+      }
+    }
     return "";
   }
 
@@ -378,6 +566,7 @@ export class StudioBridge implements StudioTransport {
         JSON.stringify({
           ok: true,
           connected: this.connected,
+          transport: this.transportKind,
           queued: this.queue.length,
           protocol: MAX_PROTOCOL_VERSION,
           protocolRange: [MIN_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION],
