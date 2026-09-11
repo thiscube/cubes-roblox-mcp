@@ -1,9 +1,9 @@
 {
   "name": "cubes-roblox-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "A next-gen MCP server for Roblox Studio — cheap calls, smart server, full Studio surface.",
+  "description": "A next-gen MCP server for Roblox Studio \u2014 cheap calls, smart server, full Studio surface.",
   "bin": {
     "cubes-roblox-mcp": "dist/index.js"
   },
@@ -11,6 +11,8 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
+    "test": "npm run build && node --test \"test/unit/*.test.mjs\"",
+    "test:unit": "node --test \"test/unit/*.test.mjs\"",
     "test:e2e": "node test/harness.mjs",
     "test:repl": "node test/harness.mjs --interactive"
   },

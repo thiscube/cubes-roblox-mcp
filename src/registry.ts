@@ -1,11 +1,24 @@
 import MiniSearch from "minisearch";
-import type { StudioBridge } from "./bridge.js";
+import type { Channel, StudioTransport } from "./transport.js";
 import type { SessionMemory } from "./memory.js";
 
 /**
- * The specialist tool registry. Everything except the four core tools lives here,
+ * The specialist tool registry. Everything except the core tools lives here,
  * hidden until search_tools surfaces it. Keeps the per-turn tool schema cost ~flat
  * no matter how many specialists exist.
+ *
+ * CAPABILITY IS DERIVED, NOT LABELLED
+ * -----------------------------------
+ * Whether a tool can modify Studio is a fact about HOW it reaches Studio, not a
+ * boolean someone remembers to type. `evalTool` ships generated Luau down the same
+ * channel `run_code` uses, so it can do anything `run_code` can — regardless of what
+ * its author wrote in the metadata. The old `write: meta.write ?? false` default was
+ * wrong on six tools (AUDIT.md #2).
+ *
+ * So: every constructor stamps a `channel`, and `capabilities()` derives the rest.
+ * The default is deny — a tool is write-class unless it explicitly opts out with
+ * `readOnly: true`, and that opt-out is only honest for tools whose generated Luau
+ * genuinely only reads.
  */
 
 export type Category =
@@ -26,7 +39,11 @@ export type Category =
 
 /** Everything a tool handler needs from the server. */
 export interface ToolContext {
-  bridge: StudioBridge;
+  /**
+   * The Studio transport. Typed as the interface, not the concrete HTTP bridge,
+   * so every tool is unit-testable against a fake (ARCHITECTURE-REVIEW.md A3).
+   */
+  bridge: StudioTransport;
   memory: SessionMemory;
   /**
    * Routes a mutate batch through the same safety pipeline as the core `mutate`
@@ -36,12 +53,16 @@ export interface ToolContext {
    */
   handleMutate: (args: Record<string, unknown>) => Promise<unknown>;
   /**
-   * Returns the current place's identity (PlaceId + Name), cached per session.
-   * Falls back to placeId=0 if the bridge isn't connected. Tools that read or
-   * write the per-place profile (profile_update, profile lookups) should use
-   * this rather than reaching for the bridge directly.
+   * Returns the current place's identity (PlaceId + Name). Re-resolved when the
+   * user opens a different place, so profile writes follow the open place.
    */
   getPlaceContext: () => Promise<{ placeId: number; placeName: string }>;
+  /**
+   * Ask the human a question mid-call, when the client supports MCP elicitation.
+   * Resolves to null when the client can't elicit — callers must handle that and
+   * fall back to refusing rather than assuming consent.
+   */
+  confirmWithUser?: (question: string, detail?: string[]) => Promise<boolean | null>;
 }
 
 export interface ToolEntry {
@@ -51,17 +72,53 @@ export interface ToolEntry {
   keywords: string[];
   description: string;
   inputSchema: Record<string, unknown>;
-  /** True if the tool can modify the DataModel — gated behind write mode. */
-  write?: boolean;
+  /** How this tool reaches Studio. Set by the constructor, never by hand. */
+  channel: Channel;
+  /** True only when the tool provably cannot modify Studio. Explicit opt-out. */
+  readOnly?: boolean;
+  /**
+   * How long this tool may block Studio, in ms, given its arguments. Yielding
+   * tools (wait_until, logs_wait_for, step_frames) can legitimately hold the
+   * bridge for ~25s against a 30s default, leaving almost no headroom for the
+   * round trip (AUDIT.md #22). Declaring the budget lets the caller's timeout
+   * scale instead of racing it.
+   */
+  yieldBudgetMs?: (args: any) => number;
   /** Runs the tool. Returns a JSON-serializable payload; throws on failure. */
   handler: (args: any, ctx: ToolContext) => Promise<unknown>;
 }
 
+/** Wall-clock allowance on top of a tool's declared yield budget. */
+const TRANSPORT_HEADROOM_MS = 10_000;
+
+/** Effective bridge timeout for a tool call. */
+export function timeoutFor(entry: Pick<ToolEntry, "yieldBudgetMs">, args: unknown): number {
+  const budget = entry.yieldBudgetMs?.(args ?? {});
+  if (typeof budget !== "number" || !Number.isFinite(budget)) return 30_000;
+  return Math.min(120_000, Math.max(30_000, Math.ceil(budget) + TRANSPORT_HEADROOM_MS));
+}
+
+/** Derived capability for a tool. The single source of truth for every gate. */
+export interface Capability {
+  /** Gated behind the user's "Allow writes" toggle. */
+  write: boolean;
+  /** Touches the DataModel at all (false for server-local tools). */
+  touchesStudio: boolean;
+}
+
+export function capabilities(entry: Pick<ToolEntry, "channel" | "readOnly">): Capability {
+  const touchesStudio = entry.channel !== "local";
+  if (!touchesStudio) return { write: false, touchesStudio: false };
+  // Deny by default: anything on a Studio channel is write-class unless it has
+  // explicitly, and provably, opted out.
+  return { write: entry.readOnly !== true, touchesStudio: true };
+}
+
 /** intent hint -> category clusters it biases toward. */
 const INTENT_CATEGORIES: Record<string, Category[]> = {
-  building: ["instances", "physics", "terrain"],
+  building: ["instances", "physics", "terrain", "ui"],
   debugging: ["scripts", "playtest", "debug"],
-  polishing: ["ui", "lighting", "audio"],
+  polishing: ["ui", "lighting", "audio", "animation"],
 };
 
 interface IndexDoc {
@@ -122,6 +179,12 @@ export class ToolRegistry {
     return [...this.entries.values()];
   }
 
+  /** Derived capability for a registered tool, or undefined if unknown. */
+  capability(name: string): Capability | undefined {
+    const entry = this.entries.get(name);
+    return entry ? capabilities(entry) : undefined;
+  }
+
   /**
    * Keyword (BM25) search + verbatim category boost + optional intent boost.
    * Semantic/embedding search is intentionally deferred (see design doc Layer 2).
@@ -130,7 +193,6 @@ export class ToolRegistry {
     const cacheKey = `${query}|${intent ?? ""}|${limit ?? 5}`;
     const cached = this.searchCache.get(cacheKey);
     if (cached !== undefined) {
-      // LRU bump: re-set to move to end of insertion order.
       this.searchCache.delete(cacheKey);
       this.searchCache.set(cacheKey, cached);
       return cached;
@@ -175,17 +237,26 @@ interface ToolMeta {
   keywords: string[];
   description: string;
   inputSchema: Record<string, unknown>;
-  /** True if the tool can modify the DataModel. evalTool defaults to false. */
-  write?: boolean;
+  /**
+   * Set ONLY when the tool provably cannot modify Studio. Everything on a Studio
+   * channel is write-class by default — see the capability note at the top.
+   */
+  readOnly?: boolean;
+  /** See ToolEntry.yieldBudgetMs. */
+  yieldBudgetMs?: (args: any) => number;
 }
 
 /** A specialist that ships generated Luau to the plugin's eval path. */
 export function evalTool(meta: ToolMeta, buildLuau: (args: any) => string): ToolEntry {
   return {
     ...meta,
-    write: meta.write ?? false,
+    channel: "eval",
     handler: async (args, ctx) => {
-      const result = await ctx.bridge.send("eval", { luau: buildLuau(args ?? {}) });
+      const result = await ctx.bridge.send(
+        "eval",
+        { luau: buildLuau(args ?? {}) },
+        timeoutFor(meta, args),
+      );
       return { result };
     },
   };
@@ -199,32 +270,62 @@ export function evalTool(meta: ToolMeta, buildLuau: (args: any) => string): Tool
 export function dispatchTool(meta: ToolMeta, pluginTool: string): ToolEntry {
   return {
     ...meta,
-    write: meta.write ?? false,
-    handler: async (args, ctx) => ctx.bridge.send(pluginTool, (args ?? {}) as Record<string, unknown>),
+    channel: "dispatch",
+    handler: async (args, ctx) =>
+      ctx.bridge.send(pluginTool, (args ?? {}) as Record<string, unknown>, timeoutFor(meta, args)),
   };
 }
 
 /** A specialist that builds a mutate batch and runs it through the plugin's mutate path. */
-export function mutateTool(meta: ToolMeta, buildOps: (args: any) => unknown[]): ToolEntry {
+export function mutateTool(meta: Omit<ToolMeta, "readOnly">, buildOps: (args: any) => unknown[]): ToolEntry {
   return {
     ...meta,
-    write: true, // every mutateTool modifies the DataModel
+    channel: "mutate",
     // Route through handleMutate so specialist-built batches go through the same
-    // destructiveness gate + script-source lint as a direct `mutate` call. Today's
-    // specialists emit only soft ops, but any future specialist that emits a
-    // delete or Source overwrite would otherwise bypass confirm-before-destructive.
+    // destructiveness gate + script-source lint as a direct `mutate` call.
     handler: async (args, ctx) => ctx.handleMutate({ ops: buildOps(args ?? {}) }),
   };
 }
 
 /**
- * Embed an arbitrary JS value as a Lua string literal that the plugin can
- * HttpService:JSONDecode back into a table. Used by evalTool builders that need
- * structured args inside generated Luau.
+ * A specialist implemented entirely server-side (session memory, profile files,
+ * snapshot diffing). It may still call the bridge through its handler, but its
+ * own effect is local, so the Studio write toggle does not gate it.
+ */
+export function localTool(
+  meta: Omit<ToolMeta, "readOnly">,
+  handler: (args: any, ctx: ToolContext) => Promise<unknown>,
+): ToolEntry {
+  return { ...meta, channel: "local", handler };
+}
+
+/**
+ * Embed an arbitrary JS value as a Lua string literal the plugin can
+ * HttpService:JSONDecode back into a table.
+ *
+ * Do NOT use JSON.stringify twice for this. JSON escapes control characters as
+ * `\uXXXX`, which Luau rejects — it wants `\u{XXXX}` — so a single stray control
+ * byte anywhere in a tool argument produced Luau that would not compile, surfacing
+ * as an opaque `compile_error` (AUDIT.md #12).
+ *
+ * Instead we emit a byte-exact Lua literal: printable ASCII verbatim, everything
+ * else as a zero-padded `\ddd` decimal escape. Lua strings are byte strings, so
+ * UTF-8 survives exactly, and three-digit padding stops the lexer from swallowing
+ * a following digit.
  */
 export function luaJson(value: unknown): string {
-  // First stringify produces a JSON string; the second stringify produces
-  // a JSON-quoted string literal that's also a valid Lua string literal
-  // (Lua double-quoted strings accept the same escape sequences JSON uses).
-  return JSON.stringify(JSON.stringify(value ?? null));
+  return luaStringLiteral(JSON.stringify(value ?? null));
+}
+
+/** Encode any JS string as a Luau double-quoted literal, byte for byte. */
+export function luaStringLiteral(s: string): string {
+  const bytes = Buffer.from(s, "utf8");
+  let out = '"';
+  for (const b of bytes) {
+    if (b === 0x22) out += '\\"';
+    else if (b === 0x5c) out += "\\\\";
+    else if (b >= 0x20 && b <= 0x7e) out += String.fromCharCode(b);
+    else out += "\\" + b.toString(10).padStart(3, "0");
+  }
+  return out + '"';
 }

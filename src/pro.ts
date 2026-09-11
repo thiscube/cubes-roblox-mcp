@@ -51,7 +51,6 @@ export const PRO_TOOLS: ToolEntry[] = [
       category: "terrain",
       subcategories: ["voxel", "sculpt", "build"],
       keywords: ["terrain", "fill", "voxel", "sculpt", "hill", "lake", "dig", "carve", "material"],
-      write: true,
       description:
         "Fill a region of Terrain with a material. Shapes: block (size [x,y,z]), ball (radius), cylinder (radius + height). Material is any Enum.Material name — Grass, Sand, Rock, Snow, Ground, Asphalt, Concrete, Wood, Plastic, Water, etc. Use 'Air' to dig (carve caves). One ChangeHistory waypoint per call.",
       inputSchema: {
@@ -101,7 +100,6 @@ return { ok = true, shape = a.shape, material = a.material, center = { center.X,
       category: "terrain",
       subcategories: ["voxel", "wipe"],
       keywords: ["terrain", "clear", "wipe", "delete", "reset", "void"],
-      write: true,
       description: "Clear all terrain voxels. Single undo waypoint.",
       inputSchema: { type: "object", properties: {} },
     },
@@ -120,7 +118,6 @@ return { cleared = true }
       category: "animation",
       subcategories: ["humanoid", "playback"],
       keywords: ["animate", "animation", "play", "humanoid", "track", "walk", "run", "idle", "dance"],
-      write: true,
       description:
         "Load an Animation asset onto a Humanoid's Animator and play it. Returns the AnimationTrack-equivalent ref so the caller can stop/adjust it. Target can be a Humanoid, a character Model containing one, or a player ref.",
       inputSchema: {
@@ -174,7 +171,6 @@ return { ref = __MCP.refFor(anim), playing = true, length = track.Length, looped
       category: "animation",
       subcategories: ["humanoid", "playback"],
       keywords: ["animation", "stop", "cancel", "halt", "freeze"],
-      write: true,
       description:
         "Stop all playing animation tracks on a Humanoid's Animator. fadeTime smooths out the stop.",
       inputSchema: {
@@ -217,7 +213,6 @@ return { stopped = count }
       category: "audio",
       subcategories: ["sound", "music", "sfx"],
       keywords: ["sound", "audio", "play", "music", "sfx", "noise", "song"],
-      write: true,
       description:
         "Create and play a Sound. Parent to a BasePart for 3D positional audio (auto rolloff), or omit target for ambient (parented to SoundService). One-shot sounds auto-destroy on Ended; set looped=true to keep them around.",
       inputSchema: {
@@ -266,7 +261,6 @@ return { ref = __MCP.refFor(sound), parent = parent:GetFullName(), playing = tru
       category: "animation",
       subcategories: ["tween", "interpolate", "animate"],
       keywords: ["tween", "interpolate", "lerp", "animate", "ease", "transition", "smooth"],
-      write: true,
       description:
         "TweenService:Create + :Play. Fire-and-forget — tween runs to completion in-engine. Number-array values get coerced to Vector3/Color3/UDim2 by the target prop's existing type.",
       inputSchema: {
@@ -333,7 +327,6 @@ return { ref = __MCP.refFor(tween), duration = info.Time, properties = (function
       category: "instances",
       subcategories: ["effects", "particles", "vfx"],
       keywords: ["particle", "particles", "emitter", "vfx", "effect", "sparkle", "smoke", "fire", "magic"],
-      write: true,
       description:
         "Add a ParticleEmitter to a BasePart or Attachment. Tune rate/lifetime/speed/size/color/texture; for most effects a couple of params are enough. Returns the emitter ref so you can later set Enabled=false or destroy.",
       inputSchema: {
@@ -390,7 +383,6 @@ return { ref = __MCP.refFor(e), parent = inst:GetFullName(), enabled = e.Enabled
       category: "instances",
       subcategories: ["effects", "beam", "vfx"],
       keywords: ["beam", "laser", "ray", "line", "connection", "magic", "lightning"],
-      write: true,
       description:
         "Connect two BaseParts with a Beam. Creates Attachments on each part (with optional local offsets) and a Beam between them. Set width, color, transparency, segments, and an optional scrolling texture.",
       inputSchema: {
@@ -455,7 +447,6 @@ return { ref = __MCP.refFor(beam), attachments = { __MCP.refFor(at0), __MCP.refF
       category: "physics",
       subcategories: ["collision", "groups", "rules"],
       keywords: ["collision", "collide", "group", "physicsservice", "pet", "projectile", "ignore"],
-      write: true,
       description:
         "Define collision groups and assign parts to them. Use to make pets not push the player, projectiles not collide with the shooter, etc. `groups` registers new groups + their collide-with rules; `assignments` puts parts/models into a group.",
       inputSchema: {
@@ -532,7 +523,6 @@ return { registered = registered, rules = ruleCount, partsAssigned = assigned }
       category: "physics",
       subcategories: ["constraint", "joints", "rigging"],
       keywords: ["constraint", "hinge", "spring", "rope", "align", "weld", "joint", "physics"],
-      write: true,
       description:
         "Add a Constraint between two BaseParts. Type is any constraint class: HingeConstraint, SpringConstraint, RopeConstraint, AlignPosition, AlignOrientation, RodConstraint, etc. Creates the Attachments and sets Attachment0/1 automatically. Extra props pass through to the constraint.",
       inputSchema: {
@@ -565,12 +555,19 @@ if p1 and p1:IsA("BasePart") then
 end
 local okCreate, c = pcall(function() return Instance.new(a.type) end)
 if not okCreate or not c then ${cancelUndo} return { error = "bad_type", type = a.type } end
-c.Attachment0 = at0
-if at1 then c.Attachment1 = at1 end
-if a.props then
-  for k, v in pairs(a.props) do pcall(function() c[k] = v end) end
+local okWire, wireErr = pcall(function()
+  c.Attachment0 = at0
+  if at1 then c.Attachment1 = at1 end
+  if a.props then
+    for k, v in pairs(a.props) do pcall(function() c[k] = v end) end
+  end
+  c.Parent = p0
+end)
+if not okWire then
+  pcall(function() c:Destroy() end)
+  ${cancelUndo}
+  return { error = "constraint_wire_failed", type = a.type, message = tostring(wireErr) }
 end
-c.Parent = p0
 ${endUndo}
 return { ref = __MCP.refFor(c), type = a.type, attachments = at1 and { __MCP.refFor(at0), __MCP.refFor(at1) } or { __MCP.refFor(at0) } }
 `,
@@ -583,7 +580,6 @@ return { ref = __MCP.refFor(c), type = a.type, attachments = at1 and { __MCP.ref
       category: "instances",
       subcategories: ["world", "game", "settings"],
       keywords: ["workspace", "gravity", "fall", "settings", "walkspeed", "jumppower", "zoom", "streaming"],
-      write: true,
       description:
         "Configure world-level game settings: Workspace.Gravity, FallenPartsDestroyHeight, StreamingEnabled, plus StarterPlayer defaults (WalkSpeed, JumpPower, JumpHeight, MaxZoomDistance). Set only the fields you want to change.",
       inputSchema: {
@@ -631,7 +627,6 @@ return { applied = applied }
       category: "lighting",
       subcategories: ["sky", "atmosphere", "environment"],
       keywords: ["sky", "skybox", "clouds", "atmosphere", "sun", "moon", "stars", "weather"],
-      write: true,
       description:
         "Configure the sky and clouds: skybox face textures, sun/moon size, star count, cloud cover + density + color. Creates Lighting.Sky and workspace.Terrain.Clouds if missing. Pass only the fields you want to change.",
       inputSchema: {
@@ -678,13 +673,19 @@ set("StarCount", tonumber(a.starCount))
 set("SunAngularSize", tonumber(a.sunAngularSize))
 set("MoonAngularSize", tonumber(a.moonAngularSize))
 if a.clouds then
-  local terrain = workspace.Terrain
-  local clouds = terrain:FindFirstChildOfClass("Clouds")
-  if not clouds then clouds = Instance.new("Clouds"); clouds.Parent = terrain end
-  if a.clouds.cover then clouds.Cover = a.clouds.cover; applied[#applied + 1] = "Clouds.Cover" end
-  if a.clouds.density then clouds.Density = a.clouds.density; applied[#applied + 1] = "Clouds.Density" end
-  local cc = __parseColor(a.clouds.color)
-  if cc then clouds.Color = cc; applied[#applied + 1] = "Clouds.Color" end
+  local okClouds, cloudsErr = pcall(function()
+    local terrain = workspace.Terrain
+    local clouds = terrain:FindFirstChildOfClass("Clouds")
+    if not clouds then clouds = Instance.new("Clouds"); clouds.Parent = terrain end
+    if a.clouds.cover then clouds.Cover = tonumber(a.clouds.cover); applied[#applied + 1] = "Clouds.Cover" end
+    if a.clouds.density then clouds.Density = tonumber(a.clouds.density); applied[#applied + 1] = "Clouds.Density" end
+    local cc = __parseColor(a.clouds.color)
+    if cc then clouds.Color = cc; applied[#applied + 1] = "Clouds.Color" end
+  end)
+  if not okClouds then
+    ${cancelUndo}
+    return { error = "clouds_failed", message = tostring(cloudsErr) }
+  end
 end
 ${endUndo}
 return { applied = applied }

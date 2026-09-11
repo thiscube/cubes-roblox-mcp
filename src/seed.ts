@@ -1,4 +1,4 @@
-import { type ToolEntry, evalTool, mutateTool, dispatchTool, luaJson } from "./registry.js";
+import { type ToolEntry, evalTool, mutateTool, dispatchTool, localTool, luaJson } from "./registry.js";
 import { PRO_TOOLS } from "./pro.js";
 import { diffSnapshots } from "./snapshot-diff.js";
 import type { SnapshotInstance } from "./memory.js";
@@ -28,14 +28,13 @@ export const SEED_TOOLS: ToolEntry[] = [
       category: "instances",
       subcategories: ["clone", "copy"],
       keywords: ["duplicate", "copy", "clone", "repeat", "array", "spread"],
-      write: true,
       description:
         "Clone an instance N times into its own parent, optionally offsetting each copy's Position. Returns refs of the new copies. Runs in one undo waypoint.",
       inputSchema: {
         type: "object",
         properties: {
           target: { type: "string", description: "Ref or path of the instance to clone." },
-          count: { type: "number", description: "How many copies (default 1)." },
+          count: { type: "number", minimum: 1, maximum: 250, description: "How many copies (default 1, max 250)." },
           offset: {
             type: "array",
             items: { type: "number" },
@@ -59,7 +58,7 @@ local CHS = game:GetService("ChangeHistoryService")
 local rec = CHS:TryBeginRecording("Cubes MCP: instance_duplicate")
 local out = {}
 local ok, err = pcall(function()
-  for i = 1, (a.count or 1) do
+  for i = 1, math.clamp(math.floor(tonumber(a.count) or 1), 1, 250) do
     local c = src:Clone()
     c.Parent = src.Parent
     if a.offset and c:IsA("BasePart") then
@@ -170,7 +169,6 @@ return { selected = #picked }
       category: "instances",
       subcategories: ["appearance", "material"],
       keywords: ["material", "color", "paint", "texture", "recolor", "wood", "metal", "neon"],
-      write: true,
       description: "Set Material and/or Color on one or more BaseParts (by refs, paths, or a query).",
       inputSchema: {
         type: "object",
@@ -237,6 +235,7 @@ return { painted = touched }
       category: "scripts",
       subcategories: ["search", "grep", "refactor"],
       keywords: ["find", "references", "grep", "search", "usages", "callers"],
+      readOnly: true,
       description:
         "Grep LuaSourceContainers across the standard script services for a literal substring. Returns matching scripts with line numbers. Use before renaming a function or to answer 'where is X used?'.",
       inputSchema: {
@@ -324,15 +323,27 @@ return {
 `,
   ),
 
-  evalTool(
+  /**
+   * script_edit routes through the mutate pipeline rather than writing Source
+   * directly on the eval channel.
+   *
+   * Writing a script's Source is classified `hard` by safety.ts, so the same
+   * change made through `mutate` demands confirm: true. Done through eval it
+   * demanded nothing, and skipped the inline lint too — the one tool built for
+   * editing scripts was the one script path never linted (AUDIT.md #13).
+   *
+   * The find/replace now happens here in TypeScript against the source we read
+   * back, so the resulting `set` op carries the finished text and inherits both
+   * rails for free.
+   */
+  localTool(
     {
       name: "script_edit",
       category: "scripts",
       subcategories: ["code", "patch", "refactor"],
       keywords: ["edit", "patch", "modify", "change", "replace", "find", "refactor", "rewrite", "source"],
-      write: true,
       description:
-        "Patch a script's Source with find/replace edits — far cheaper than reading and rewriting the whole source. Each edit is applied in order. By default a find string must match exactly once; pass `allowMultiple: true` to allow multiple matches. Fails the whole batch if any find string is missing (no silent no-ops). Runs in one undo waypoint.",
+        "Patch a script's Source with find/replace edits — far cheaper than reading and rewriting the whole source. Each edit is applied in order. By default a find string must match exactly once; pass `allowMultiple: true` to allow multiple matches. Fails the whole batch if any find string is missing (no silent no-ops). Goes through the same confirm gate and inline lint as `mutate`.",
       inputSchema: {
         type: "object",
         properties: {
@@ -353,84 +364,84 @@ return {
               required: ["find", "replace"],
             },
           },
+          confirm: {
+            type: "boolean",
+            description: "Overwriting script source is destructive; forwarded to the mutate confirm gate.",
+          },
         },
         required: ["target", "edits"],
       },
     },
-    (args) => `
-local a = __MCP.decode(${luaJson(args)})
+    async (args, ctx) => {
+      const target = String(args.target ?? "").trim();
+      const edits = Array.isArray(args.edits) ? args.edits : [];
+      if (!target) return { error: "bad_args", hint: "script_edit needs a 'target'." };
+      if (edits.length === 0) return { error: "bad_args", hint: "edits must be a non-empty array." };
+
+      // Read the live source (read-only — safe with writes off).
+      const read = (await ctx.bridge.send("eval", {
+        luau: `
+local a = __MCP.decode(${"${luaJson({ target })}"})
 local inst = __MCP.resolve(a.target)
 if not inst then return { error = "not_found", target = a.target } end
 if not inst:IsA("LuaSourceContainer") then
-  return { error = "not_a_script", target = a.target, class = inst.ClassName, hint = "script_edit only works on Script / LocalScript / ModuleScript." }
+  return { error = "not_a_script", class = inst.ClassName }
 end
-if not a.edits or #a.edits == 0 then
-  return { error = "bad_args", hint = "edits must be a non-empty array." }
-end
-
-local source = inst.Source
-local report = {}
-for i, edit in ipairs(a.edits) do
-  if type(edit.find) ~= "string" or edit.find == "" then
-    return { error = "bad_edit", index = i, hint = "Each edit needs a non-empty 'find' string." }
-  end
-  -- Plain (non-pattern) substring search + count
-  local count, pos = 0, 1
-  while true do
-    local s, e = string.find(source, edit.find, pos, true)
-    if not s then break end
-    count += 1
-    pos = e + 1
-  end
-  if count == 0 then
-    return {
-      error = "find_not_found",
-      index = i,
-      find = edit.find,
-      hint = "The find string was not present in the current source. Read the script first to confirm the exact text (whitespace + case matter).",
-    }
-  end
-  if count > 1 and not edit.allowMultiple then
-    return {
-      error = "find_ambiguous",
-      index = i,
-      find = edit.find,
-      matches = count,
-      hint = "find matched " .. tostring(count) .. " times. Pass allowMultiple: true to replace all, or expand the find string to make it unique.",
-    }
-  end
-  -- string.gsub takes plain=nil so we do a manual literal replace
-  local newSource = {}
-  local cursor = 1
-  for _ = 1, count do
-    local s, e = string.find(source, edit.find, cursor, true)
-    if not s then break end
-    newSource[#newSource + 1] = string.sub(source, cursor, s - 1)
-    newSource[#newSource + 1] = edit.replace
-    cursor = e + 1
-  end
-  newSource[#newSource + 1] = string.sub(source, cursor)
-  source = table.concat(newSource)
-  report[#report + 1] = { find = edit.find, replacements = count }
-end
-
-local CHS = game:GetService("ChangeHistoryService")
-local rec = CHS:TryBeginRecording("Cubes MCP: script_edit")
-inst.Source = source
-if rec then CHS:FinishRecording(rec, Enum.FinishRecordingOperation.Commit) end
-
-local totalReplacements = 0
-for _, r in ipairs(report) do totalReplacements += r.replacements end
-
-return {
-  edited = true,
-  ref = __MCP.refFor(inst),
-  path = inst:GetFullName(),
-  edits = report,
-  totalReplacements = totalReplacements,
-  sourceLength = #source,
-}
+return { path = inst:GetFullName(), ref = __MCP.refFor(inst), source = inst.Source }
 `,
+      })) as { error?: string; path?: string; ref?: string; source?: string; class?: string } | undefined;
+
+      if (!read || read.error) return read ?? { error: "read_failed", target };
+
+      let source = String(read.source ?? "");
+      const report: Array<{ find: string; replacements: number }> = [];
+
+      for (let i = 0; i < edits.length; i += 1) {
+        const edit = edits[i] as { find?: unknown; replace?: unknown; allowMultiple?: unknown };
+        if (typeof edit?.find !== "string" || edit.find === "") {
+          return { error: "bad_edit", index: i, hint: "Each edit needs a non-empty 'find' string." };
+        }
+        const replace = typeof edit.replace === "string" ? edit.replace : "";
+        const parts = source.split(edit.find);
+        const count = parts.length - 1;
+        if (count === 0) {
+          return {
+            error: "find_not_found",
+            index: i,
+            find: edit.find,
+            hint: "The find string was not present in the current source. Read the script first to confirm the exact text (whitespace + case matter).",
+          };
+        }
+        if (count > 1 && edit.allowMultiple !== true) {
+          return {
+            error: "find_ambiguous",
+            index: i,
+            find: edit.find,
+            matches: count,
+            hint: `find matched ${count} times. Pass allowMultiple: true to replace all, or expand the find string to make it unique.`,
+          };
+        }
+        source = parts.join(replace);
+        report.push({ find: edit.find, replacements: count });
+      }
+
+      // One `set` op carrying the finished source: picks up the destructiveness
+      // gate and the selene lint, exactly like a hand-written mutate would.
+      const result = await ctx.handleMutate({
+        ops: [{ op: "set", target, props: { Source: source } }],
+        confirm: args.confirm === true,
+      });
+
+      return {
+        edited: !(result && typeof result === "object" && "error" in result),
+        path: read.path,
+        ref: read.ref,
+        edits: report,
+        totalReplacements: report.reduce((n, r) => n + r.replacements, 0),
+        sourceLength: source.length,
+        result,
+      };
+    },
   ),
 
   // script_create removed — duplicated `mutate` { op: "create", class: "Script" | "LocalScript" | "ModuleScript", props: { Source } }.
@@ -769,7 +780,7 @@ return { cleared = false, note = "no debug folder present" }
       category: "scripts",
       subcategories: ["source", "inspect"],
       keywords: ["read", "source", "view", "get", "show", "print", "open", "content", "code"],
-      write: false,
+      readOnly: true,
       description:
         "Read a script's full source with line numbers in one call. Accepts an optional line range for large scripts. Natural follow-up to debug_error — faster and more direct than read+select.",
       inputSchema: {
@@ -822,6 +833,7 @@ return {
   // session-summary append). Eliminates the cold-start problem across sessions.
   {
     name: "profile_update",
+    channel: "local",
     category: "session",
     subcategories: ["memory", "profile", "decision", "convention"],
     keywords: [
@@ -838,7 +850,6 @@ return {
       "persist",
       "learn",
     ],
-    write: false, // writes a server-side JSON file, not the DataModel
     description:
       "Update the persistent per-place profile (~/.cubesmcp/profiles/{placeId}.json). Each field is an upsert: `genre`/`placeName`/`style`/`structure` shallow-merge; `decision`/`knownIssue`/`sessionSummary` append. Use this to record style decisions ('we chose elongated balls for ears, not WedgePart'), conventions ('models live under Workspace.Entities'), and per-session takeaways so the NEXT session opens with the project context already loaded.",
     inputSchema: {
@@ -921,10 +932,10 @@ return {
   },
   {
     name: "macro_save",
+    channel: "local",
     category: "session",
     subcategories: ["macro", "record"],
     keywords: ["macro", "record", "save", "sequence", "replay", "reuse", "automate", "memory"],
-    write: false,
     description:
       "Save a reusable macro. Either captures the mutate ops from the last N history entries (from_last) or takes an explicit ops array. Replay with macro_run. Note: only direct `mutate` ops are captured, not specialist-tool calls.",
     inputSchema: {
@@ -961,10 +972,10 @@ return {
   },
   {
     name: "macro_run",
+    channel: "mutate",
     category: "session",
     subcategories: ["macro", "replay"],
     keywords: ["macro", "run", "replay", "execute", "repeat", "reuse", "memory"],
-    write: true,
     description:
       "Replay a saved macro — re-submits its ops as one atomic mutate batch (single undo waypoint). Lint results come back under the nested mutate result, same as a normal mutate.",
     inputSchema: {
@@ -1003,7 +1014,6 @@ return {
       category: "session",
       subcategories: ["undo", "history", "revert"],
       keywords: ["undo", "revert", "rollback", "back", "reverse", "oops", "mistake", "wrong"],
-      write: true,
       description:
         "Undo the last N ChangeHistoryService waypoints. Every MCP mutate call creates its own named waypoint, so this reliably reverses MCP-driven changes. n defaults to 1.",
       inputSchema: {
@@ -1035,6 +1045,7 @@ return { undone = undone, requested = n }
   // agent is a summary (snapshot) or a delta (diff).
   {
     name: "snapshot",
+    channel: "local",
     category: "session",
     subcategories: ["version-control", "capture", "checkpoint"],
     keywords: [
@@ -1047,7 +1058,6 @@ return { undone = undone, requested = n }
       "before",
       "record state",
     ],
-    write: false,
     description:
       "Capture the current state of a subtree (a stable identity, ClassName, and projected properties per instance) and store it server-side under `name`. Returns only a small summary — NOT the captured tree. Pair with `diff` to see exactly what changed later. The capture lives in session memory (bounded; oldest evicted).",
     inputSchema: {
@@ -1111,6 +1121,7 @@ return { undone = undone, requested = n }
   },
   {
     name: "diff",
+    channel: "local",
     category: "session",
     subcategories: ["version-control", "compare", "delta"],
     keywords: [
@@ -1124,7 +1135,6 @@ return { undone = undone, requested = n }
       "since",
       "version",
     ],
-    write: false,
     description:
       "Compare two snapshots and return a structured DELTA ONLY: { added, removed, changed }. `from` and `to` are snapshot names; `to` may instead be the literal 'live' to diff against a fresh capture of the current DataModel at the `from` snapshot's path. Never returns full trees — only the instances/properties that differ.",
     inputSchema: {
@@ -1208,7 +1218,6 @@ return { undone = undone, requested = n }
       category: "playtest",
       subcategories: ["testez", "tests", "verify"],
       keywords: ["test", "testez", "unit test", "spec", "suite", "run tests", "verify", "regression"],
-      write: false,
       description:
         "Run a TestEZ suite and return structured pass/fail counts + failures. Finds TestEZ automatically (ReplicatedStorage / ServerScriptService / ServerStorage) or takes an explicit testezPath. Closes the loop on 'did my change break anything'.",
       inputSchema: {
@@ -1269,7 +1278,6 @@ return {
       category: "playtest",
       subcategories: ["lifecycle", "simulate"],
       keywords: ["playtest", "play", "solo", "start", "simulate", "player"],
-      write: true,
       description:
         "Start Play Solo (StudioTestService:ExecutePlayModeAsync). Plugin stays connected — drive player via character_* tools during the session. Temporarily flips ServerScriptService.LoadStringEnabled to true so eval-based tools work in the play DM; restores the original value when play ends (`loadStringFlipped: true` in the response if it was changed).",
       inputSchema: {
@@ -1288,7 +1296,6 @@ return {
       category: "playtest",
       subcategories: ["lifecycle", "simulate"],
       keywords: ["playtest", "run", "mode", "server", "simulate"],
-      write: true,
       description:
         "Start Run mode (StudioTestService:ExecuteRunModeAsync). Server scripts execute, no Player.",
       inputSchema: {
@@ -1307,7 +1314,6 @@ return {
       category: "playtest",
       subcategories: ["lifecycle", "simulate"],
       keywords: ["playtest", "run", "test", "stop", "halt", "end"],
-      write: true,
       description:
         "End the current StudioTestService session (calls EndTest). Falls back to RunService:Stop for legacy starts. Idempotent.",
       inputSchema: {
@@ -1326,7 +1332,7 @@ return {
       category: "playtest",
       subcategories: ["lifecycle", "introspect"],
       keywords: ["playtest", "result", "status", "state", "endtest"],
-      write: false,
+      readOnly: true,
       description:
         "Read the current playtest state and the last EndTest result (cleared on each new playtest).",
       inputSchema: { type: "object", properties: {} },
@@ -1340,7 +1346,6 @@ return {
       category: "playtest",
       subcategories: ["lifecycle", "configure"],
       keywords: ["playtest", "players", "numberofplayers", "multi", "clients"],
-      write: true,
       description:
         "Set TestService.NumberOfPlayers before starting a play session. Multi-client testing.",
       inputSchema: {
@@ -1360,7 +1365,7 @@ return {
       category: "playtest",
       subcategories: ["lifecycle", "introspect"],
       keywords: ["playtest", "run", "test", "status", "state", "mode", "running"],
-      write: false,
+      readOnly: true,
       description: "Report current RunService state: running flags, server/client, edit/run/playtest mode.",
       inputSchema: { type: "object", properties: {} },
     },
@@ -1403,10 +1408,10 @@ return {
   // like run_code — same envelope, same { __void = true } for a nil return.
   {
     name: "tune",
+    channel: "eval",
     category: "playtest",
     subcategories: ["live", "eval", "tweak"],
     keywords: ["tune", "live", "eval", "playtest", "tweak", "gravity", "walkspeed", "stats", "mid-run", "hotfix"],
-    write: true,
     description:
       "Run arbitrary Luau inside the RUNNING playtest's server DataModel — the live game, not the edit place. Use to tweak values mid-playtest (workspace.Gravity, a player's Humanoid.WalkSpeed/JumpPower, enemy stats) and see the effect immediately. `return <value>` sends data back as JSON (a nil return comes back as { __void = true }). Requires a playtest to be running (start one with playtest_play); errors with `no_playtest` otherwise. This is the live-game counterpart to run_code, which runs in the edit DM.",
     inputSchema: {
@@ -1433,7 +1438,7 @@ return {
       category: "playtest",
       subcategories: ["players", "state", "introspect"],
       keywords: ["players", "list", "who", "online", "roster"],
-      write: false,
+      readOnly: true,
       description: "List every Player with character/position/health/walk stats. Empty array in edit mode.",
       inputSchema: { type: "object", properties: {} },
     },
@@ -1446,7 +1451,7 @@ return {
       category: "playtest",
       subcategories: ["players", "character", "introspect"],
       keywords: ["character", "humanoid", "health", "position", "state"],
-      write: false,
+      readOnly: true,
       description: "Snapshot a character's position/velocity/humanoid stats. Defaults to first player's character.",
       inputSchema: {
         type: "object",
@@ -1465,7 +1470,7 @@ return {
       category: "playtest",
       subcategories: ["stats", "performance", "introspect"],
       keywords: ["stats", "fps", "memory", "perf", "network"],
-      write: false,
+      readOnly: true,
       description: "Tap the Stats service: heartbeat, physics, network kbps, memory MB, instance count.",
       inputSchema: { type: "object", properties: {} },
     },
@@ -1493,7 +1498,6 @@ return {
       category: "playtest",
       subcategories: ["players", "character", "control"],
       keywords: ["teleport", "move", "position", "warp", "tp"],
-      write: true,
       description: "Teleport character to a literal position or to (target's position + Y offset). Player default: first.",
       inputSchema: {
         type: "object",
@@ -1513,7 +1517,6 @@ return {
       category: "playtest",
       subcategories: ["players", "character", "control"],
       keywords: ["walk", "move", "humanoid", "direction"],
-      write: true,
       description: "Humanoid:Move in a direction for N seconds (cap 10). YIELDS. Player default: first.",
       inputSchema: {
         type: "object",
@@ -1534,7 +1537,6 @@ return {
       category: "playtest",
       subcategories: ["players", "character", "control"],
       keywords: ["jump", "hop", "humanoid"],
-      write: true,
       description: "Force Humanoid into Jumping state. Player default: first player.",
       inputSchema: {
         type: "object",
@@ -1552,7 +1554,6 @@ return {
       category: "playtest",
       subcategories: ["players", "character", "control"],
       keywords: ["humanoid", "set", "walkspeed", "jumppower", "health", "tweak"],
-      write: true,
       description: "Set selected Humanoid fields (walkSpeed/jumpPower/etc). Player default: first.",
       inputSchema: {
         type: "object",
@@ -1577,7 +1578,6 @@ return {
       category: "playtest",
       subcategories: ["players", "character", "control"],
       keywords: ["respawn", "reload", "loadcharacter", "reset"],
-      write: true,
       description: "Calls Player:LoadCharacter and waits for the new character. YIELDS up to ~5s.",
       inputSchema: {
         type: "object",
@@ -1595,7 +1595,7 @@ return {
       category: "playtest",
       subcategories: ["logs", "diagnostics", "introspect"],
       keywords: ["logs", "tail", "errors", "warnings", "output"],
-      write: false,
+      readOnly: true,
       description: "Recent N diagnostics entries with a position cursor — pass back `since: <last cursor>` to fetch only new entries.",
       inputSchema: {
         type: "object",
@@ -1638,10 +1638,11 @@ return {
   evalTool(
     {
       name: "logs_wait_for",
+      yieldBudgetMs: (args) => Math.min(Number(args?.timeout) || 5, 25) * 1000,
       category: "playtest",
       subcategories: ["logs", "diagnostics", "wait"],
       keywords: ["wait", "log", "pattern", "match", "expect", "watch"],
-      write: false,
+      readOnly: true,
       description: "Poll Diagnostics every 100ms for a Lua-pattern match. YIELDS up to timeout (cap 25s).",
       inputSchema: {
         type: "object",
@@ -1696,7 +1697,7 @@ end
       category: "debug",
       subcategories: ["errors", "diagnostics", "context"],
       keywords: ["error", "crash", "stack", "debug", "fix", "exception", "traceback", "broken"],
-      write: false,
+      readOnly: true,
       description:
         "Most recent runtime error with ±N source lines around the failure point + call stack + recent prior errors. One call instead of tail-logs → parse → read-source.",
       inputSchema: {
@@ -1834,7 +1835,6 @@ return result
       category: "playtest",
       subcategories: ["debug", "visualize"],
       keywords: ["marker", "flag", "label", "pin", "debug", "visualize"],
-      write: true,
       description: "Create a small floating part + BillboardGui label at a position. Anchored, non-colliding.",
       inputSchema: {
         type: "object",
@@ -1896,7 +1896,6 @@ return { ref = __MCP.refFor(part), name = name }
       category: "playtest",
       subcategories: ["events", "remote", "observe"],
       keywords: ["watch", "observe", "remoteevent", "bindable", "event", "fire", "remote"],
-      write: false,
       description: "Watch an RBXScriptSignal on an instance. Returns watchId; drain with event_drain.",
       inputSchema: {
         type: "object",
@@ -1917,7 +1916,7 @@ return { ref = __MCP.refFor(part), name = name }
       category: "playtest",
       subcategories: ["events", "remote", "observe"],
       keywords: ["drain", "events", "buffer", "flush", "collect"],
-      write: false,
+      readOnly: true,
       description: "Drain buffered fires from an event_watch. Returns { events, count, dropped }.",
       inputSchema: {
         type: "object",
@@ -1936,7 +1935,6 @@ return { ref = __MCP.refFor(part), name = name }
       category: "playtest",
       subcategories: ["events", "remote", "observe"],
       keywords: ["unwatch", "stop", "disconnect", "event"],
-      write: false,
       description: "Stop a previously-started event_watch and free its connection.",
       inputSchema: {
         type: "object",
@@ -1952,10 +1950,10 @@ return { ref = __MCP.refFor(part), name = name }
   evalTool(
     {
       name: "wait_until",
+      yieldBudgetMs: (args) => Math.min(Number(args?.timeout) || 5, 25) * 1000,
       category: "playtest",
       subcategories: ["wait", "predicate", "polling"],
       keywords: ["wait", "until", "predicate", "watch", "poll", "block"],
-      write: false,
       description: "Block until a Luau predicate is truthy or timeout. Predicate has 'game' in scope.",
       inputSchema: {
         type: "object",
@@ -1989,10 +1987,10 @@ return { matched = false, timedOut = true, elapsed = os.clock() - start }
   evalTool(
     {
       name: "step_frames",
+      yieldBudgetMs: (args) => Math.min(Math.max(Number(args?.count) || 1, 1), 600) * 50,
       category: "playtest",
       subcategories: ["wait", "frames", "advance"],
       keywords: ["frames", "step", "advance", "wait", "heartbeat"],
-      write: false,
       description: "Yield for N RunService.Heartbeat steps. Useful for deterministic time advancement.",
       inputSchema: {
         type: "object",
@@ -2022,7 +2020,7 @@ return { ok = true, frames = count, elapsed = os.clock() - startClock }
       category: "viewport",
       subcategories: ["vision", "scene"],
       keywords: ["viewport", "scene", "camera", "visible", "see", "look", "observe"],
-      write: false,
+      readOnly: true,
       description:
         "Structured scene grounding: camera CFrame + FOV + on-screen BaseParts with projected 2D bboxes and distances. Sorted closest-first. Works in edit and play modes.",
       inputSchema: {
@@ -2041,7 +2039,6 @@ return { ok = true, frames = count, elapsed = os.clock() - startClock }
       category: "camera",
       subcategories: ["vision", "orient", "control"],
       keywords: ["camera", "orient", "look", "fov", "focus", "view", "perspective"],
-      write: true,
       description:
         "Orient the workspace camera: set CFrame (12-number array), or position + lookAt, or just one. Optional fov and focus (position array or ref).",
       inputSchema: {
@@ -2074,7 +2071,7 @@ return { ok = true, frames = count, elapsed = os.clock() - startClock }
       category: "viewport",
       subcategories: ["vision", "probe", "physics"],
       keywords: ["raycast", "probe", "hit", "trace", "ray", "intersect", "what is there"],
-      write: false,
+      readOnly: true,
       description:
         "Cast a ray and return the first hit: instance, position, normal, material, distance. Use fromCamera=true to cast from the camera (forward direction if no direction given). length defaults to direction.Magnitude or 500.",
       inputSchema: {

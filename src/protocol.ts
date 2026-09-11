@@ -1,15 +1,45 @@
 /**
- * Wire-protocol version for the MCP server <-> Studio plugin handshake.
+ * Wire-protocol versioning for the MCP server <-> Studio plugin handshake.
  *
- * The plugin includes this in every /poll body; the server rejects mismatches
- * with HTTP 426 so a stale plugin surfaces as "rebuild the plugin" rather than
- * silent tool-call timeouts.
+ * The two halves ship separately — the plugin is distributed outside this repo —
+ * so they CANNOT be assumed to upgrade in lockstep. An exact-equality check made
+ * every release a flag day: bump the constant and every user on the previous
+ * plugin is locked out until they rebuild (ARCHITECTURE-REVIEW.md A5).
  *
- * Bump when the plugin and server can no longer understand each other safely:
- * any breaking change to the wire format of /poll, /result, BridgeCommand, or
- * to the shape of read / mutate / eval / diagnostics / viewport args + results.
- * Pure additive fields (a new optional key in a response) do NOT need a bump.
+ * Instead the server accepts a RANGE. A plugin is compatible if it reports a
+ * protocol between MIN_PROTOCOL_VERSION and MAX_PROTOCOL_VERSION inclusive.
  *
- * Keep this constant in lockstep with roblox/src/Config.luau PROTOCOL_VERSION.
+ * When to change what:
+ *   - Additive change (a new optional field, a new plugin tool): bump
+ *     MAX_PROTOCOL_VERSION, leave MIN alone. Old plugins keep working.
+ *   - Breaking change (the shape of /poll, /result, read, mutate or eval changes
+ *     incompatibly): raise MIN_PROTOCOL_VERSION to the first good version. Only
+ *     then are older plugins refused, and the 426 tells them to rebuild.
+ *
+ * Keep MAX_PROTOCOL_VERSION in lockstep with the plugin's Config PROTOCOL_VERSION.
+ *
+ * History:
+ *   1 - initial wire format.
+ *   2 - bearer token required on /poll, /result and /rpc. Breaking: a v1 plugin
+ *       sends no token, so MIN is 2 unless CUBES_MCP_ALLOW_UNAUTHENTICATED=1.
  */
-export const PROTOCOL_VERSION = 1;
+
+/** Newest protocol this server speaks. Advertised in /health. */
+export const MAX_PROTOCOL_VERSION = 2;
+
+/** Oldest protocol this server still accepts. */
+export const MIN_PROTOCOL_VERSION = 2;
+
+/**
+ * Back-compat alias. Older code imported a single PROTOCOL_VERSION; it maps to
+ * the newest supported version so existing call sites keep meaning "current".
+ */
+export const PROTOCOL_VERSION = MAX_PROTOCOL_VERSION;
+
+export function protocolSupported(version: number): boolean {
+  return (
+    Number.isInteger(version) &&
+    version >= MIN_PROTOCOL_VERSION &&
+    version <= MAX_PROTOCOL_VERSION
+  );
+}

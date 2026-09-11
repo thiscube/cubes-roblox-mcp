@@ -10,13 +10,25 @@ import { randomUUID, createHash } from "node:crypto";
  * `mutate`. The plugin can't run a linter, but the MCP server can — and it
  * already has the source text in the op, so no Studio round-trip is needed.
  *
- * Uses `selene` (with the roblox std from roblox/selene.toml) via the rokit
- * shim. Degrades gracefully: if selene isn't available, mutate still succeeds
- * and the response just carries a `{ error }` instead of diagnostics.
+ * Uses `selene` if it is on PATH. Configure the working directory (where your
+ * selene.toml lives) with CUBES_MCP_LINT_CWD. Degrades gracefully: if selene
+ * isn't available, mutate still succeeds and the response carries a `{ error }`
+ * instead of diagnostics — and `lintAvailable()` lets the server say so once at
+ * startup rather than silently per call.
  */
 
 // Both dist/lint.js and src/lint.ts sit one level under the project root.
-const ROBLOX_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "roblox");
+const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+/**
+ * Directory selene runs in — it resolves selene.toml (and the Roblox std) from here.
+ *
+ * This used to point at `<root>/roblox`, a directory .gitignore excludes and git has
+ * never tracked. Node fails the spawn on a missing cwd BEFORE it looks for the binary,
+ * so inline lint could never run for anyone who cloned this repo, and failed silently
+ * as "lint unavailable" (AUDIT.md #7). Defaults to the project root; point
+ * CUBES_MCP_LINT_CWD at wherever your selene.toml lives.
+ */
+const LINT_CWD = process.env.CUBES_MCP_LINT_CWD || PROJECT_ROOT;
 const SELENE_BIN = process.platform === "win32" ? "selene.exe" : "selene";
 const SELENE_TIMEOUT_MS = 10_000;
 
@@ -88,7 +100,7 @@ export async function lintLuau(source: string): Promise<LintOutcome> {
 
 function runSelene(file: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn(SELENE_BIN, [file, "--display-style", "json"], { cwd: ROBLOX_DIR });
+    const child = spawn(SELENE_BIN, [file, "--display-style", "json"], { cwd: LINT_CWD });
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {
@@ -161,4 +173,14 @@ function lineFromOffset(source: string, offset: number): number {
     if (source[i] === "\n") line += 1;
   }
   return line;
+}
+
+/**
+ * Probe whether selene can actually run, so the server can say so ONCE at
+ * startup instead of degrading silently on every mutate (AUDIT.md #7).
+ */
+export async function lintAvailable(): Promise<{ ok: boolean; reason?: string }> {
+  const probe = await lintLuau("local _cubes_mcp_probe = 1\n");
+  if ("ok" in probe) return { ok: true };
+  return { ok: false, reason: probe.error };
 }

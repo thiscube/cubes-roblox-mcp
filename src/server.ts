@@ -8,9 +8,9 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
 
-import { StudioBridge, BridgeError } from "./bridge.js";
-import { Session, CORE_TOOLS } from "./session.js";
-import { ToolRegistry } from "./registry.js";
+import { BridgeError, type StudioTransport } from "./transport.js";
+import { Session, CORE_TOOLS, SPECIALIST_CAP } from "./session.js";
+import { ToolRegistry, capabilities, type ToolEntry } from "./registry.js";
 import { SEED_TOOLS } from "./seed.js";
 import { lintLuau } from "./lint.js";
 import { SessionMemory } from "./memory.js";
@@ -19,6 +19,7 @@ import { suggestNext } from "./suggest.js";
 import { SourceMap } from "./sourcemap.js";
 import { screenshotTool } from "./vision.js";
 import { loadProfile } from "./profile.js";
+import { validateArgs, invalidArgsPayload } from "./validate.js";
 
 /**
  * The MCP server. The opening surface is exactly four tools:
@@ -296,7 +297,7 @@ const RESOURCES = [
 // Server wiring.
 // --------------------------------------------------------------------------
 
-export function createMcpServer(bridge: StudioBridge): Server {
+export function createMcpServer(bridge: StudioTransport): Server {
   const session = new Session(randomUUID().slice(0, 8));
   const registry = new ToolRegistry(SEED_TOOLS);
   const memory = new SessionMemory();
@@ -306,9 +307,47 @@ export function createMcpServer(bridge: StudioBridge): Server {
   }
 
   const server = new Server(
-    { name: "cubes-roblox-mcp", version: "0.1.0" },
-    { capabilities: { tools: { listChanged: true }, resources: {} } },
+    { name: "cubes-roblox-mcp", version: "0.2.0" },
+    {
+      capabilities: {
+        tools: { listChanged: true },
+        // subscribe lets a client watch studio://errors/recent instead of polling
+        // logs_tail; logging carries pushed diagnostics.
+        resources: { subscribe: false, listChanged: false },
+        logging: {},
+      },
+    },
   );
+
+  /**
+   * Ask the human a yes/no question mid-tool-call, when the client supports
+   * elicitation. Returns null when it doesn't, so callers can tell "declined"
+   * apart from "couldn't ask" — an LLM relaying its own confirmation prompt is
+   * not a safety gate.
+   */
+  async function confirmWithUser(question: string, detail: string[] = []): Promise<boolean | null> {
+    const caps = server.getClientCapabilities();
+    if (!caps?.elicitation) return null;
+    try {
+      const res: any = await server.elicitInput({
+        message: detail.length ? `${question}\n\n${detail.join("\n")}` : question,
+        requestedSchema: {
+          type: "object",
+          properties: {
+            confirm: {
+              type: "boolean",
+              description: "Yes, go ahead with this destructive change.",
+            },
+          },
+          required: ["confirm"],
+        },
+      });
+      if (res?.action !== "accept") return false;
+      return res?.content?.confirm === true;
+    } catch {
+      return null;
+    }
+  }
 
   const notifyListChanged = async () => {
     try {
@@ -320,17 +359,43 @@ export function createMcpServer(bridge: StudioBridge): Server {
 
   const getPlaceContext = () => ensurePlaceContext(bridge, session);
 
+  /**
+   * MCP tool annotations, derived from the same capability the gate uses.
+   * The client surfaces these to the user before they approve a call, so the
+   * hint and the enforcement can never drift apart (ARCHITECTURE-REVIEW.md A2).
+   */
+  function annotationsFor(entry: Pick<ToolEntry, "channel" | "readOnly">): Tool["annotations"] {
+    const cap = capabilities(entry);
+    return {
+      readOnlyHint: !cap.write,
+      destructiveHint: cap.write,
+      idempotentHint: false,
+      openWorldHint: cap.touchesStudio,
+    };
+  }
+
+  const CORE_ANNOTATIONS: Record<string, Tool["annotations"]> = {
+    search_tools: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    read: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
+    screenshot: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
+    mutate: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+    run_code: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+  };
+
   // ---- tools/list: core tools + currently-active specialists --------------
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const tools: Tool[] = CORE_TOOLS.map((name) => CORE_TOOL_DEFS[name]);
-    for (const name of session.active) {
-      if (session.isCore(name)) continue;
+    const tools: Tool[] = CORE_TOOLS.map((name) => ({
+      ...CORE_TOOL_DEFS[name],
+      annotations: CORE_ANNOTATIONS[name],
+    }));
+    for (const name of session.tools.specialists()) {
       const entry = registry.get(name);
       if (entry) {
         tools.push({
           name: entry.name,
           description: `[${entry.category}] ${entry.description}`,
           inputSchema: entry.inputSchema as Tool["inputSchema"],
+          annotations: annotationsFor(entry),
         });
       }
     }
@@ -345,10 +410,19 @@ export function createMcpServer(bridge: StudioBridge): Server {
     const json = (data: unknown) => ({
       contents: [{ uri, mimeType: "application/json", text: JSON.stringify(data, null, 2) }],
     });
+    /**
+     * Resources reach Studio through the same `eval` channel the write gate
+     * covers, and used to skip it entirely (AUDIT.md #10). These payloads are
+     * fixed server-authored constants that only read, so they are allowed while
+     * writes are off — but they go through one audited helper rather than each
+     * call site reaching for the bridge directly.
+     */
+    const readOnlyEval = (luau: string) => bridge.send("eval", { luau });
+
     try {
       switch (uri) {
         case "studio://overview":
-          return json(await bridge.send("eval", { luau: OVERVIEW_LUAU }));
+          return json(await readOnlyEval(OVERVIEW_LUAU));
         case "studio://tools/catalog":
           return json(buildToolCatalog(registry));
         case "studio://project/profile": {
@@ -363,7 +437,7 @@ export function createMcpServer(bridge: StudioBridge): Server {
         case "studio://session/snapshots":
           return json({ snapshots: memory.listSnapshots() });
         case "studio://selection":
-          return json(await bridge.send("eval", { luau: SELECTION_LUAU }));
+          return json(await readOnlyEval(SELECTION_LUAU));
         case "studio://errors/recent":
           return json(await bridge.send("diagnostics", { n: 25 }));
         default:
@@ -381,12 +455,21 @@ export function createMcpServer(bridge: StudioBridge): Server {
     session.turn += 1;
     const startedAt = Date.now();
 
+    const toolCtx = { bridge, memory, handleMutate, getPlaceContext, confirmWithUser };
+
     let payload: unknown;
     try {
-      // Read/write split: write tools are gated behind the user's "Allow writes"
-      // toggle in the Studio panel. If the plugin isn't connected at all we fall
-      // through so the agent gets the more actionable studio_not_connected error.
-      if (isWriteTool(name, registry) && bridge.connected && !bridge.writeEnabled) {
+      // Arguments are validated against the tool's own inputSchema before any
+      // handler sees them. The MCP SDK does not do this, and every handler used
+      // to cast blindly (AUDIT.md #3, #14).
+      const schema = schemaFor(name, registry);
+      const problems = schema ? validateArgs(args, schema) : [];
+      if (problems.length > 0) {
+        payload = invalidArgsPayload(name, problems);
+      } else if (isWriteTool(name, registry) && bridge.connected && !bridge.writeEnabled) {
+        // Read/write split: write tools are gated behind the user's "Allow writes"
+        // toggle in the Studio panel. If the plugin isn't connected at all we fall
+        // through so the agent gets the more actionable studio_not_connected error.
         payload = {
           error: "write_mode_disabled",
           tool: name,
@@ -407,7 +490,7 @@ export function createMcpServer(bridge: StudioBridge): Server {
             payload = await handleRunCode(args);
             break;
           case "screenshot":
-            payload = await screenshotTool.handler(args, { bridge, memory, handleMutate, getPlaceContext });
+            payload = await screenshotTool.handler(args, toolCtx);
             break;
           default: {
             const entry = registry.get(name);
@@ -420,9 +503,9 @@ export function createMcpServer(bridge: StudioBridge): Server {
               break;
             }
             // Safety net: agent remembered a tool name from earlier — just unlock it.
-            if (session.unlock(name)) await notifyListChanged();
-            else session.touch(name);
-            payload = await entry.handler(args, { bridge, memory, handleMutate, getPlaceContext });
+            const settled = session.tools.unlockAndSettle([name], session.turn);
+            if (settled.changed) await notifyListChanged();
+            payload = await entry.handler(args, toolCtx);
           }
         }
       }
@@ -444,8 +527,16 @@ export function createMcpServer(bridge: StudioBridge): Server {
       }
       // Cost accounting: only attach when the caller asks for it, or when there's
       // a real signal worth surfacing (snapshot hit, savings, or a slow call).
+      // The payload is serialized here and the length reused, rather than
+      // stringified again inside estTokens (AUDIT.md #25).
       const wantsMeta = args.meta === true;
-      const meta = buildMeta(name, args, payload, elapsedMs);
+      let payloadChars = 0;
+      try {
+        payloadChars = (JSON.stringify(payload) ?? "").length;
+      } catch {
+        payloadChars = 0;
+      }
+      const meta = buildMeta(name, args, payload, elapsedMs, payloadChars);
       const hasSignal =
         meta.snapshot_hit === true ||
         (typeof meta.tokens_saved === "number" && meta.tokens_saved > 0) ||
@@ -477,24 +568,48 @@ export function createMcpServer(bridge: StudioBridge): Server {
       await notifyListChanged();
     }
 
-    // Auto-eviction pass after every call. Only notify when the visible set
-    // actually shrank — evict can only remove, so a size delta is sufficient.
-    // Avoids firing tools/list_changed (and prompting a tools/list re-fetch)
-    // when the change was a no-op against what the client sees.
-    const sizeBefore = session.active.size;
-    if (session.evict() && session.active.size !== sizeBefore) {
+    // Resolve eviction once, at the end, through the single owner of the tool
+    // set (ARCHITECTURE-REVIEW.md A4).
+    if (session.tools.settle(session.turn)) {
       await notifyListChanged();
     }
 
+    const failed = payload !== null && typeof payload === "object" && "error" in (payload as object);
+
     // Multi-block escape hatch: a handler can return `{ __mcpContent: [...] }`
     // to send arbitrary MCP content blocks (image, audio, etc.) instead of the
-    // default `[{ type: "text", text: JSON.stringify(payload) }]` wrapper.
-    // Used by `screenshot` which needs to ship a PNG inline.
+    // default text wrapper. Used by `screenshot` which ships a PNG inline.
     if (payload && typeof payload === "object" && Array.isArray((payload as any).__mcpContent)) {
       return { content: (payload as any).__mcpContent };
     }
 
-    return { content: [{ type: "text", text: JSON.stringify(payload) }] };
+    // Serialize exactly once — buildMeta above reuses this string rather than
+    // stringifying the payload a second time (AUDIT.md #25). A payload that
+    // cannot be serialized becomes a structured error instead of throwing out
+    // of the request handler.
+    let text: string;
+    try {
+      text = JSON.stringify(payload) ?? "null";
+    } catch (err) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              error: "unserializable_result",
+              tool: name,
+              message: err instanceof Error ? err.message : String(err),
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    // MCP signals tool failure with isError. Without it every failure — bad args,
+    // unknown tool, Studio not connected — reads as a clean success to the
+    // client (AUDIT.md #9).
+    return failed ? { content: [{ type: "text", text }], isError: true } : { content: [{ type: "text", text }] };
   });
 
   // ---- core tool handlers ------------------------------------------------
@@ -504,20 +619,35 @@ export function createMcpServer(bridge: StudioBridge): Server {
     if (!query) return { error: "bad_args", hint: "search_tools requires a 'query' string." };
 
     const intent = typeof args.intent === "string" ? args.intent : undefined;
-    const limit = typeof args.limit === "number" ? args.limit : 5;
+    // Clamp to the cap. Asking for more than can stay visible used to "unlock"
+    // tools that eviction dropped in the same turn (AUDIT.md #8).
+    const requested = typeof args.limit === "number" ? args.limit : 5;
+    const limit = Math.min(Math.max(1, Math.trunc(requested)), SPECIALIST_CAP);
     if (intent) session.sticky.recentIntent = intent;
 
     const matches = registry.search(query, intent, limit);
-    const unlocked: Array<{ name: string; category: string; description: string }> = [];
-    let changed = false;
-    for (const entry of matches) {
-      if (session.unlock(entry.name)) changed = true;
-      unlocked.push({ name: entry.name, category: entry.category, description: entry.description });
-    }
-    if (changed) await notifyListChanged();
+    // Unlock and resolve eviction together, then report only what SURVIVED, so
+    // the response can never disagree with tools/list.
+    const settled = session.tools.unlockAndSettle(
+      matches.map((m) => m.name),
+      session.turn,
+    );
+    if (settled.changed) await notifyListChanged();
+
+    const survived = new Set(settled.visible);
+    const unlocked = matches
+      .filter((m) => survived.has(m.name))
+      .map((m) => ({ name: m.name, category: m.category, description: m.description }));
+    const dropped = matches.filter((m) => !survived.has(m.name)).map((m) => m.name);
 
     return {
       unlocked,
+      ...(dropped.length > 0
+        ? {
+            not_unlocked: dropped,
+            note: `${dropped.length} match(es) did not fit the ${SPECIALIST_CAP}-specialist cap. Call them by name to bring them in.`,
+          }
+        : {}),
       message:
         unlocked.length > 0
           ? `Unlocked ${unlocked.length} tool(s): ${unlocked.map((u) => u.name).join(", ")}. They are now in your tool list.`
@@ -553,17 +683,40 @@ export function createMcpServer(bridge: StudioBridge): Server {
     // confirm: true. The structured error hands back the exact retry.
     const assessment = assessDestructiveness(args.ops);
     if ((assessment.level === "hard" || assessment.level === "nuclear") && args.confirm !== true) {
-      return {
-        error: "needs_confirmation",
-        level: assessment.level,
-        summary: assessment.summary,
-        detail: assessment.detail,
-        hint:
-          assessment.level === "nuclear"
-            ? "This batch deletes a service or top-level node — extremely destructive. Confirm with the user, then retry with confirm: true."
-            : "This batch is destructive (deletes instances and/or overwrites script source). Confirm with the user, then retry with confirm: true.",
-        retry_with: { ...args, confirm: true },
-      };
+      // Prefer asking the human directly. Returning `needs_confirmation` and
+      // hoping the model relays it is a suggestion to an LLM, not a gate — and a
+      // model that wants to finish the task is the worst possible arbiter of
+      // whether it should. Falls back to the structured refusal when the client
+      // cannot elicit.
+      const approved = await confirmWithUser(
+        assessment.level === "nuclear"
+          ? `This batch deletes a service or top-level node. Continue? (${assessment.summary})`
+          : `This batch is destructive. Continue? (${assessment.summary})`,
+        assessment.detail,
+      );
+      if (approved === true) {
+        args = { ...args, confirm: true };
+      } else if (approved === false) {
+        return {
+          error: "declined_by_user",
+          level: assessment.level,
+          summary: assessment.summary,
+          hint: "The user declined this destructive batch. Do not retry it without new instructions.",
+        };
+      } else {
+        return {
+          error: "needs_confirmation",
+          level: assessment.level,
+          summary: assessment.summary,
+          detail: assessment.detail,
+          uncertain: assessment.uncertain,
+          hint:
+            assessment.level === "nuclear"
+              ? "This batch deletes a service or top-level node — extremely destructive. Confirm with the user, then retry with confirm: true."
+              : "This batch is destructive (deletes instances and/or overwrites script source). Confirm with the user, then retry with confirm: true.",
+          retry_with: { ...args, confirm: true },
+        };
+      }
     }
     const result = (await bridge.send("mutate", args)) as Record<string, unknown>;
     // Plugin-side failures (e.g. mutate_failed + rolled_back, no_undo_available)
@@ -574,7 +727,7 @@ export function createMcpServer(bridge: StudioBridge): Server {
     }
     // Inline lint: any op that writes script source gets selene'd server-side,
     // so the agent can fix issues now instead of discovering them at playtest.
-    const lint = await lintScriptOps(args.ops);
+    const lint = await lintScriptOps(Array.isArray(args.ops) ? args.ops : []);
     if (lint.length > 0) result.lint = lint;
     result.appliedLevel = assessment.level;
     return result;
@@ -687,14 +840,12 @@ function applyAutoUnlock(
     candidates.add("playtest_result");
   }
 
-  // Filter to ones the registry knows AND that aren't already active.
-  const out: string[] = [];
-  for (const name of candidates) {
-    if (registry.has(name) && session.unlock(name)) {
-      out.push(name);
-    }
-  }
-  return out;
+  // Filter to ones the registry knows AND that aren't already visible, then let
+  // the ToolSet decide what actually survives.
+  const wanted = [...candidates].filter((n) => registry.has(n) && !session.tools.has(n));
+  if (wanted.length === 0) return [];
+  const settled = session.tools.unlockAndSettle(wanted, session.turn);
+  return settled.unlocked;
 }
 
 /**
@@ -704,26 +855,27 @@ function applyAutoUnlock(
  * every offline session into the same "unsaved place" bucket.
  */
 async function ensurePlaceContext(
-  bridge: StudioBridge,
+  bridge: StudioTransport,
   session: Session,
 ): Promise<{ placeId: number; placeName: string }> {
-  if (session.placeContext) return session.placeContext;
-  if (!bridge.connected) {
-    session.placeContext = { placeId: 0, placeName: "(plugin not connected)" };
-    return session.placeContext;
-  }
-  try {
-    const raw = (await bridge.send("eval", {
-      luau: "return { placeId = game.PlaceId, placeName = game.Name }",
-    })) as { placeId?: unknown; placeName?: unknown } | undefined;
-    session.placeContext = {
-      placeId: Number(raw?.placeId ?? 0) || 0,
-      placeName: String(raw?.placeName ?? ""),
-    };
-  } catch {
-    session.placeContext = { placeId: 0, placeName: "" };
-  }
-  return session.placeContext;
+  // Cached with a TTL rather than forever. The old version resolved once and
+  // never refreshed, so opening a different place without restarting the server
+  // sent every profile write to the first place's PlaceId for the rest of the
+  // session (ARCHITECTURE-REVIEW.md A4).
+  return session.place.resolve(async () => {
+    if (!bridge.connected) return { placeId: 0, placeName: "(plugin not connected)" };
+    try {
+      const raw = (await bridge.send("eval", {
+        luau: "return { placeId = game.PlaceId, placeName = game.Name }",
+      })) as { placeId?: unknown; placeName?: unknown } | undefined;
+      return {
+        placeId: Number(raw?.placeId ?? 0) || 0,
+        placeName: String(raw?.placeName ?? ""),
+      };
+    } catch {
+      return { placeId: 0, placeName: "" };
+    }
+  });
 }
 
 /**
@@ -741,10 +893,12 @@ function buildToolCatalog(registry: ToolRegistry) {
   }> = [];
   const byCategory: Record<string, Array<(typeof tools)[number]>> = {};
   for (const entry of registry.all()) {
+    const cap = capabilities(entry);
     const item = {
       name: entry.name,
       description: entry.description,
-      write: entry.write === true,
+      write: cap.write,
+      channel: entry.channel,
       keywords: entry.keywords,
     };
     tools.push(item);
@@ -772,11 +926,26 @@ function errorPayload(err: unknown) {
   };
 }
 
-/** Whether a tool can modify the DataModel — gated behind the write-mode toggle. */
+/**
+ * Whether a tool can modify Studio — gated behind the write-mode toggle.
+ *
+ * Derived from the tool's channel rather than a hardcoded list of names. The old
+ * version special-cased four names and then trusted a hand-typed `write` flag that
+ * was wrong on six tools (AUDIT.md #2, ARCHITECTURE-REVIEW.md A2).
+ */
 function isWriteTool(name: string, registry: ToolRegistry): boolean {
   if (name === "mutate" || name === "run_code") return true;
-  if (name === "read" || name === "search_tools") return false;
-  return registry.get(name)?.write === true;
+  if (name === "read" || name === "search_tools" || name === "screenshot") return false;
+  const cap = registry.capability(name);
+  // An unknown tool name is treated as a write: deny by default.
+  return cap ? cap.write : true;
+}
+
+/** The declared inputSchema for any tool, core or specialist. */
+function schemaFor(name: string, registry: ToolRegistry): unknown {
+  if (name === "screenshot") return screenshotTool.inputSchema;
+  if (CORE_TOOL_DEFS[name]) return CORE_TOOL_DEFS[name].inputSchema;
+  return registry.get(name)?.inputSchema;
 }
 
 // --------------------------------------------------------------------------
@@ -797,11 +966,17 @@ interface CostMeta {
   snapshot_hit?: true;
 }
 
-function buildMeta(tool: string, args: unknown, payload: unknown, elapsedMs: number): CostMeta {
+function buildMeta(
+  tool: string,
+  args: unknown,
+  payload: unknown,
+  elapsedMs: number,
+  payloadChars: number,
+): CostMeta {
   const meta: CostMeta = {
     elapsed_ms: elapsedMs,
     tokens_in: estTokens(args),
-    tokens_out: estTokens(payload),
+    tokens_out: Math.ceil(payloadChars / 4),
   };
   // read-specific savings: pagination (items not returned) and snapshot hits.
   if (tool === "read" && payload && typeof payload === "object") {

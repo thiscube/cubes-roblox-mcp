@@ -46,6 +46,45 @@ const HISTORY_TRIM_BATCH = Math.floor(HISTORY_CAP * 0.25);
 const HISTORY_HIGH_WATER = HISTORY_CAP + HISTORY_TRIM_BATCH;
 
 /**
+ * Max serialized bytes of `args` kept per history entry.
+ *
+ * The cap used to be on entry COUNT only, so 200 entries each holding a whole
+ * script's Source sat resident for the life of the process (AUDIT.md #26). Large
+ * values are replaced with a marker that records the original size, which keeps
+ * the log readable and macro capture working for ordinary op batches.
+ */
+const MAX_ARG_BYTES = 8 * 1024;
+
+/** Replace oversized argument values with a size marker, preserving shape. */
+export function truncateArgs(args: unknown): unknown {
+  if (args === null || typeof args !== "object") return args;
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(args) ?? "";
+  } catch {
+    return { __unserializable: true };
+  }
+  if (Buffer.byteLength(serialized, "utf8") <= MAX_ARG_BYTES) return args;
+
+  const shrink = (v: unknown): unknown => {
+    if (typeof v === "string") {
+      const bytes = Buffer.byteLength(v, "utf8");
+      return bytes > 512 ? { __truncated: true, bytes, head: v.slice(0, 200) } : v;
+    }
+    if (Array.isArray(v)) return v.map(shrink);
+    if (v && typeof v === "object") {
+      return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, shrink(x)]));
+    }
+    return v;
+  };
+
+  const shrunk = shrink(args);
+  const after = JSON.stringify(shrunk) ?? "";
+  if (Buffer.byteLength(after, "utf8") <= MAX_ARG_BYTES) return shrunk;
+  return { __truncated: true, bytes: Buffer.byteLength(serialized, "utf8") };
+}
+
+/**
  * Max snapshots kept in memory at once. Each capture can hold up to a couple
  * thousand instance records, so the store is bounded — saving past the cap
  * evicts the oldest, mirroring how the macro store would behave under pressure.
@@ -58,7 +97,9 @@ export class SessionMemory {
   private readonly snapshots = new Map<string, Snapshot>();
 
   record(entry: HistoryEntry): void {
-    this.history.push(entry);
+    // Bound by bytes as well as by count, so a run of script writes can't pin
+    // 200 whole source files in memory (AUDIT.md #26).
+    this.history.push({ ...entry, args: truncateArgs(entry.args) });
     if (this.history.length > HISTORY_HIGH_WATER) {
       this.history.splice(0, HISTORY_TRIM_BATCH);
     }

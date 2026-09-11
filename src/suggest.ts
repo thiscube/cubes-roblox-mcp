@@ -171,11 +171,16 @@ export function suggestNext(tool: string, _args: unknown, payload: unknown): Nex
       break;
 
     case "snapshot":
-      out.push({
-        call: "diff",
-        args: { from: p.snapshot ?? p.snapshotId },
-        reason: "later, diff against this snapshot to see exactly what changed",
-      });
+      // The handler returns { name, path, instanceCount, capturedAt }. Reading
+      // `p.snapshot`/`p.snapshotId` produced an empty args object, so the
+      // "one-click follow-up" was unusable (AUDIT.md #19).
+      if (p.name) {
+        out.push({
+          call: "diff",
+          args: { from: p.name, to: "live" },
+          reason: "later, diff against this snapshot to see exactly what changed",
+        });
+      }
       break;
 
     case "camera_set":

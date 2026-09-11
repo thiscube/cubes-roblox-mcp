@@ -15,7 +15,7 @@
  * The file is local-only; the user owns it. No upload, no telemetry.
  */
 
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rename, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 
@@ -98,26 +98,77 @@ export async function loadProfile(
   }
 }
 
-export async function saveProfile(profile: ProjectProfile): Promise<void> {
-  profile.updatedAt = new Date().toISOString();
-  const path = profilePath(profile.placeId);
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(profile, null, 2), "utf8");
+/**
+ * Caps on the append-only logs. Without these the file grows forever across
+ * sessions (AUDIT.md #11). Oldest entries are dropped first.
+ */
+const MAX_DECISIONS = 200;
+const MAX_KNOWN_ISSUES = 100;
+const MAX_SESSION_LOG = 100;
+
+function capArrays(profile: ProjectProfile): void {
+  if (profile.decisions.length > MAX_DECISIONS) {
+    profile.decisions = profile.decisions.slice(-MAX_DECISIONS);
+  }
+  if (profile.knownIssues.length > MAX_KNOWN_ISSUES) {
+    profile.knownIssues = profile.knownIssues.slice(-MAX_KNOWN_ISSUES);
+  }
+  if (profile.sessionLog.length > MAX_SESSION_LOG) {
+    profile.sessionLog = profile.sessionLog.slice(-MAX_SESSION_LOG);
+  }
 }
 
 /**
- * Load → mutate via callback → save in one shot. Used by the `profile_update`
- * tool so concurrent writes serialize through the same load-mutate-save cycle.
+ * Write atomically: a plain `writeFile` truncates first, so a crash mid-write
+ * left a corrupt profile with no backup. Write a sibling temp file and rename,
+ * which is atomic on the same filesystem.
  */
+export async function saveProfile(profile: ProjectProfile): Promise<void> {
+  profile.updatedAt = new Date().toISOString();
+  capArrays(profile);
+  const path = profilePath(profile.placeId);
+  await mkdir(dirname(path), { recursive: true });
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await writeFile(tmp, JSON.stringify(profile, null, 2), "utf8");
+    await rename(tmp, path);
+  } catch (err) {
+    await unlink(tmp).catch(() => {});
+    throw err;
+  }
+}
+
+/**
+ * Serializes load-mutate-save per placeId.
+ *
+ * The old version claimed in its own comment that concurrent writes serialized
+ * here; nothing did, and ten parallel updates left one survivor (AUDIT.md #11).
+ * Each placeId now has a promise chain, so overlapping updates queue instead of
+ * racing. The chain is keyed per place so unrelated places don't block.
+ */
+const writeChains = new Map<number, Promise<unknown>>();
+
 export async function updateProfile(
   placeId: number,
   fn: (p: ProjectProfile) => void,
   placeName?: string,
 ): Promise<ProjectProfile> {
-  const profile = await loadProfile(placeId, placeName);
-  fn(profile);
-  await saveProfile(profile);
-  return profile;
+  const prior = writeChains.get(placeId) ?? Promise.resolve();
+  const next = prior
+    .catch(() => {}) // a failed predecessor must not poison the chain
+    .then(async () => {
+      const profile = await loadProfile(placeId, placeName);
+      fn(profile);
+      await saveProfile(profile);
+      return profile;
+    });
+  writeChains.set(placeId, next);
+  try {
+    return await next;
+  } finally {
+    // Drop the chain once it's the tail, so the map doesn't grow per place forever.
+    if (writeChains.get(placeId) === next) writeChains.delete(placeId);
+  }
 }
 
 /**

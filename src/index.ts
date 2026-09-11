@@ -2,6 +2,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StudioBridge } from "./bridge.js";
 import { createMcpServer } from "./server.js";
+import { lintAvailable } from "./lint.js";
 
 /**
  * Entry point. Two faces:
@@ -22,13 +23,27 @@ async function main(): Promise<void> {
   await server.connect(transport);
 
   console.error(
-    `[cubes-mcp] ready — MCP on stdio, Studio bridge on http://127.0.0.1:${PORT} ` +
-      `(install the plugin and it will start polling)`,
+    `[cubes-mcp] ready — MCP on stdio, Studio bridge on http://127.0.0.1:${PORT}`,
   );
+  if (bridge.tokenGenerated) {
+    console.error(
+      `[cubes-mcp] bridge token: ${bridge.token}\n` +
+        `[cubes-mcp] the Studio plugin must send this as 'Authorization: Bearer <token>'.\n` +
+        `[cubes-mcp] set CUBES_MCP_TOKEN to pin it across restarts.`,
+    );
+  } else {
+    console.error("[cubes-mcp] bridge token loaded from CUBES_MCP_TOKEN.");
+  }
+  const lint = await lintAvailable();
+  if (!lint.ok) {
+    console.error(`[cubes-mcp] inline Luau lint is OFF (${lint.reason}). Set CUBES_MCP_LINT_CWD if your selene.toml lives elsewhere.`);
+  }
 
   // The HTTP bridge keeps the event loop alive, so we must exit explicitly when
   // the MCP client disconnects (stdin EOF) or the process is asked to stop.
-  const shutdown = () => process.exit(0);
+  const shutdown = () => {
+    void bridge.stop().finally(() => process.exit(0));
+  };
   transport.onclose = shutdown;
   process.stdin.on("end", shutdown);
   process.on("SIGINT", shutdown);
