@@ -9,14 +9,16 @@ import http from "node:http";
 import { StudioBridge } from "../../dist/bridge.js";
 import { MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, protocolSupported } from "../../dist/protocol.js";
 
-let port = 45200;
-const nextPort = () => port++;
-
-/** Spin up a bridge on a fresh port; caller must stop it. */
+/**
+ * Spin up a bridge on an OS-assigned port; caller must stop it.
+ *
+ * Port 0, not a fixed counter: `node --test` runs test files in parallel, and
+ * hand-picked ranges collided intermittently with EADDRINUSE.
+ */
 async function makeBridge() {
-  const p = nextPort();
-  const bridge = new StudioBridge(p);
+  const bridge = new StudioBridge(0);
   await bridge.start();
+  const p = bridge.boundPort;
   const base = `http://127.0.0.1:${p}`;
   const call = (path, { method = "POST", headers = {}, body, token = bridge.token } = {}) =>
     fetch(`${base}${path}`, {

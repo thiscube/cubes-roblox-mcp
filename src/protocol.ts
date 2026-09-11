@@ -22,10 +22,13 @@
  *   1 - initial wire format.
  *   2 - bearer token required on /poll, /result and /rpc. Breaking: a v1 plugin
  *       sends no token, so MIN is 2 unless CUBES_MCP_ALLOW_UNAUTHENTICATED=1.
+ *   3 - additive: a `capture` command, answered with { png, width, height } from
+ *       StudioCaptureService. A v2 plugin has no such handler; `screenshot`
+ *       treats any failure as "use the OS path", so MIN stays 2.
  */
 
 /** Newest protocol this server speaks. Advertised in /health. */
-export const MAX_PROTOCOL_VERSION = 2;
+export const MAX_PROTOCOL_VERSION = 3;
 
 /** Oldest protocol this server still accepts. */
 export const MIN_PROTOCOL_VERSION = 2;

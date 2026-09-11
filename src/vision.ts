@@ -4,12 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 
-import type { ToolEntry } from "./registry.js";
+import type { ToolEntry, ToolContext } from "./registry.js";
 
 /**
  * Vision / observation tools.
  *
- * `screenshot` runs PURE SERVER-SIDE (no plugin call) — it shells out to the host
+ * `screenshot` prefers to ask STUDIO for the pixels and falls back to the host
+ * OS (PLAN.md #1). The plugin path uses `StudioCaptureService`, which hands back
+ * the framebuffer directly — so it cannot capture a window sitting on top of
+ * Studio, which the OS path can and does. The OS path is still needed, because
+ * `StudioCaptureService` is FFlag-gated and not present in every Studio build.
+ *
+ * The OS path shells out to the host
  * OS screen-capture tool, base64-encodes the PNG, and returns it via the
  * `__mcpContent` escape hatch so the agent can SEE the result inline.
  *
@@ -34,8 +40,73 @@ const MAX_INLINE_BYTES = 1_400_000;
 /** Longest edge we downscale to when a capture is over budget. */
 const DOWNSCALE_MAX_EDGE = 1400;
 const CAPTURE_TIMEOUT_MS = 15_000;
+/** How long to give Studio before falling back to the OS. */
+const STUDIO_CAPTURE_TIMEOUT_MS = 12_000;
+/**
+ * How long to remember that this plugin cannot capture.
+ *
+ * Long enough that a session with an old plugin does not pay a failed round trip
+ * on every screenshot, short enough that upgrading the plugin starts working
+ * without restarting the server.
+ */
+const STUDIO_CAPTURE_RETRY_MS = 60_000;
 
 export type Region = "full" | "studio" | "viewport";
+
+/** Where the pixels come from. */
+export type CaptureSource = "auto" | "studio" | "os";
+
+/** When Studio last told us it cannot capture. 0 means "never asked, or it can". */
+let studioCaptureUnavailableAt = 0;
+
+/** Test seam: forget what we learned about the plugin's capture support. */
+export function __resetStudioCaptureMemo(): void {
+  studioCaptureUnavailableAt = 0;
+}
+
+function studioCaptureWorthTrying(): boolean {
+  return Date.now() - studioCaptureUnavailableAt > STUDIO_CAPTURE_RETRY_MS;
+}
+
+/**
+ * Ask the plugin for the framebuffer.
+ *
+ * Returns the base64 PNG, or null when Studio cannot do it — in which case the
+ * caller falls back to the OS rather than failing, because an older plugin
+ * simply does not have the handler.
+ */
+async function studioCapture(
+  bridge: ToolContext["bridge"],
+  region: Region,
+): Promise<{ base64: string; width?: number; height?: number } | null> {
+  try {
+    const reply = (await bridge.send(
+      "capture",
+      // `region` is passed through so the plugin can crop to the 3D viewport
+      // itself. A plugin that ignores it returns the whole Studio window, which
+      // is still better than the OS path.
+      { region, maxEdge: DOWNSCALE_MAX_EDGE },
+      STUDIO_CAPTURE_TIMEOUT_MS,
+    )) as { png?: unknown; base64?: unknown; width?: unknown; height?: unknown; error?: unknown };
+
+    const data = typeof reply?.png === "string" ? reply.png : reply?.base64;
+    if (typeof data !== "string" || data.length === 0) {
+      // A structured error, or a plugin that has no `capture` handler at all.
+      studioCaptureUnavailableAt = Date.now();
+      return null;
+    }
+    return {
+      base64: data,
+      width: typeof reply.width === "number" ? reply.width : undefined,
+      height: typeof reply.height === "number" ? reply.height : undefined,
+    };
+  } catch {
+    // unknown_tool from an older plugin, a timeout, a disconnect. All of these
+    // mean "use the OS path", never "fail the screenshot".
+    studioCaptureUnavailableAt = Date.now();
+    return null;
+  }
+}
 
 export interface Insets {
   top: number;
@@ -219,10 +290,12 @@ export const screenshotTool: ToolEntry = {
   category: "viewport",
   subcategories: ["vision", "image"],
   keywords: ["screenshot", "image", "capture", "snap", "see", "view", "screen"],
-  channel: "local",
+  // Dispatches a `capture` command to the plugin before falling back to the OS,
+  // so the channel is dispatch. It only reads pixels, hence the opt-out.
+  channel: "dispatch",
   readOnly: true,
   description:
-    "Capture a PNG and return it inline so the agent can see what's on screen. Modes: 'viewport' (default — the Studio window cropped to the 3D area), 'studio' (the whole Studio window), 'full' (the entire primary monitor, which includes every other window you have open). Falls back to 'full' if the Studio window can't be found.",
+    "Capture a PNG inline so the agent can see the screen. Asks Studio for the framebuffer first (immune to windows covering Studio), falls back to an OS capture. Regions: 'viewport' (default, the 3D area), 'studio', 'full' (your whole monitor).",
   inputSchema: {
     type: "object",
     properties: {
@@ -232,10 +305,16 @@ export const screenshotTool: ToolEntry = {
         description:
           "What to capture. Default 'viewport'. Use 'full' deliberately — it captures your whole screen, not just Studio.",
       },
+      source: {
+        type: "string",
+        enum: ["auto", "studio", "os"],
+        description:
+          "Where the pixels come from. Default 'auto': Studio first, OS if it can't.",
+      },
       insets: {
         type: "object",
         description:
-          "Override the pixel insets cropped from the Studio window. Defaults for 'viewport' are { top: 110, right: 280, bottom: 200, left: 0 }. Values are clamped to 0-4096 integers.",
+          "Insets cropped from the Studio window on the OS path only. Defaults for 'viewport': { top: 110, right: 280, bottom: 200, left: 0 }. Clamped to 0-4096.",
         properties: {
           top: { type: "number" },
           right: { type: "number" },
@@ -245,11 +324,61 @@ export const screenshotTool: ToolEntry = {
       },
     },
   },
-  handler: async (args) => {
+  handler: async (args, ctx) => {
     const requested: Region =
       args?.region === "full" || args?.region === "studio" || args?.region === "viewport"
         ? args.region
         : "viewport";
+    const source: CaptureSource =
+      args?.source === "studio" || args?.source === "os" || args?.source === "auto"
+        ? args.source
+        : "auto";
+
+    // Studio first. It returns the framebuffer, so an overlapping window cannot
+    // end up in the shot — which is the whole reason this path exists. `full`
+    // means the whole monitor and is by definition an OS job.
+    if (source !== "os" && requested !== "full" && ctx?.bridge?.connected) {
+      if (source === "studio" || studioCaptureWorthTrying()) {
+        const shot = await studioCapture(ctx.bridge, requested);
+        if (shot) {
+          const bytes = Buffer.byteLength(shot.base64, "utf8");
+          if (bytes <= MAX_INLINE_BYTES) {
+            const meta: Record<string, unknown> = {
+              sizeBytes: bytes,
+              region: requested,
+              source: "studio",
+              platform: process.platform,
+            };
+            if (shot.width) meta.width = shot.width;
+            if (shot.height) meta.height = shot.height;
+            return {
+              __mcpContent: [
+                { type: "image", data: shot.base64, mimeType: "image/png" },
+                { type: "text", text: JSON.stringify(meta) },
+              ],
+              __structured: meta,
+            };
+          }
+          // Too big to inline. The OS path can downscale on disk; Studio's
+          // answer is already in memory, so fall through rather than ship it.
+          if (source === "studio") {
+            return {
+              error: "screenshot_too_large",
+              sizeBytes: bytes,
+              limitBytes: MAX_INLINE_BYTES,
+              source: "studio",
+              hint: "Studio returned more than the inline budget. Retry with source 'os', which downscales.",
+            };
+          }
+        } else if (source === "studio") {
+          return {
+            error: "studio_capture_unavailable",
+            hint: "This plugin has no capture handler, or StudioCaptureService is off in this build. Use source 'auto' or 'os'.",
+          };
+        }
+      }
+    }
+
     const insets = resolveInsets(requested, args?.insets);
     const path = join(tmpdir(), `cubes-mcp-screenshot-${randomBytes(8).toString("hex")}.png`);
 
@@ -309,6 +438,7 @@ export const screenshotTool: ToolEntry = {
       const meta: Record<string, unknown> = {
         sizeBytes: buf.length,
         region: actualRegion,
+        source: "os",
         platform: process.platform,
       };
       if (actualRegion !== requested) meta.requested = requested;
@@ -320,6 +450,7 @@ export const screenshotTool: ToolEntry = {
           { type: "image", data: base64, mimeType: "image/png" },
           { type: "text", text: JSON.stringify(meta) },
         ],
+        __structured: meta,
       };
     } catch (err) {
       return {

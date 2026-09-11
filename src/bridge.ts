@@ -161,6 +161,18 @@ export class StudioBridge implements StudioTransport {
     return this.queue.length;
   }
 
+  /**
+   * The port actually bound, after `start()`.
+   *
+   * Differs from the requested port only when 0 was requested, which is how
+   * tests ask the OS for a free one. Fixed test ports collided intermittently
+   * because `node --test` runs files in parallel.
+   */
+  get boundPort(): number {
+    const addr = this.httpServer?.address();
+    return typeof addr === "object" && addr ? addr.port : this.port;
+  }
+
   start(): Promise<void> {
     return new Promise((resolve, reject) => {
       this.httpServer = createServer((req, res) => {

@@ -134,10 +134,8 @@ describe("read-only build: the MCP surface", () => {
 });
 
 describe("read-only build: the /rpc door", () => {
-  // Fixed ports, like the other bridge tests. The bridge binds 127.0.0.1 only.
-  let port = 45400;
-  const nextPort = () => port++;
-
+  // Port 0: the OS picks a free one. Fixed ports collide because test files run
+  // in parallel. The bridge still binds 127.0.0.1 only.
   const post = (p, path, token, body) =>
     fetch(`http://127.0.0.1:${p}${path}`, {
       method: "POST",
@@ -158,9 +156,9 @@ describe("read-only build: the /rpc door", () => {
   }
 
   test("/rpc refuses writes even with the Studio toggle ON", async () => {
-    const p = nextPort();
-    const bridge = new StudioBridge(p, { readOnly: true });
+    const bridge = new StudioBridge(0, { readOnly: true });
     await bridge.start();
+    const p = bridge.boundPort;
     try {
       await enableWrites(p, bridge.token);
       assert.equal(bridge.writeEnabled, true, "the toggle really is on for this test");
@@ -176,9 +174,9 @@ describe("read-only build: the /rpc door", () => {
   });
 
   test("a read command still goes through on a read-only bridge", async () => {
-    const p = nextPort();
-    const bridge = new StudioBridge(p, { readOnly: true });
+    const bridge = new StudioBridge(0, { readOnly: true });
     await bridge.start();
+    const p = bridge.boundPort;
     try {
       await enableWrites(p, bridge.token);
       // `read` is on the allowlist, so this must get past the gate. It then
@@ -195,9 +193,9 @@ describe("read-only build: the /rpc door", () => {
   });
 
   test("a writable build refuses on the toggle instead, with the other error", async () => {
-    const p = nextPort();
-    const bridge = new StudioBridge(p);
+    const bridge = new StudioBridge(0);
     await bridge.start();
+    const p = bridge.boundPort;
     try {
       const res = await post(p, "/rpc", bridge.token, { tool: "mutate", args: { ops: [] } });
       assert.equal(res.status, 403);

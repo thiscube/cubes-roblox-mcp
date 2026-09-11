@@ -77,6 +77,7 @@ curl -s -X POST http://127.0.0.1:44820/rpc \
 - `src/registry.ts` — `capabilities()`, `outputSchemaFor()`, the tool constructors, `luaJson`.
 - `src/docs.ts` — the cached Roblox API dump behind the `docs_*` tools.
 - `src/paths.ts` — every on-disk location, resolved lazily (`CUBES_MCP_HOME`).
+- `docs/PLUGIN-PROTOCOL.md` — what the Studio half has to implement, since it isn't here.
 - `src/server.ts` — the five always-visible core tools (`search_tools`, `read`, `screenshot`,
   `mutate`, `run_code`) plus the resource handlers.
 - `src/tools/index.ts` — assembles every category into `ALL_TOOLS`.
