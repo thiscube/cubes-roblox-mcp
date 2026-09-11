@@ -217,7 +217,10 @@ return { undone = undone, requested = n }
   ),
   {
     name: "snapshot",
-    channel: "local",
+    // Dispatches a `snapshot` command to the plugin, so the channel is dispatch,
+    // not local. It only reads the DataModel, hence the explicit opt-out.
+    channel: "dispatch",
+    readOnly: true,
     category: "session",
     subcategories: ["version-control", "capture", "checkpoint"],
     keywords: [
@@ -293,7 +296,10 @@ return { undone = undone, requested = n }
   },
   {
     name: "diff",
-    channel: "local",
+    // Dispatches a `snapshot` command to the plugin, so the channel is dispatch,
+    // not local. It only reads the DataModel, hence the explicit opt-out.
+    channel: "dispatch",
+    readOnly: true,
     category: "session",
     subcategories: ["version-control", "compare", "delta"],
     keywords: [

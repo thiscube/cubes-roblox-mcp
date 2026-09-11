@@ -339,9 +339,33 @@ export function mutateTool(meta: Omit<ToolMeta, "readOnly">, buildOps: (args: an
 }
 
 /**
- * A specialist implemented entirely server-side (session memory, profile files,
- * snapshot diffing). It may still call the bridge through its handler, but its
- * own effect is local, so the Studio write toggle does not gate it.
+ * A specialist whose handler runs server-side but whose EFFECT lands in Studio
+ * through `ctx.handleMutate`.
+ *
+ * This exists because `script_edit` was written as a `localTool` — its
+ * find/replace really does happen in TypeScript — and that made it read as
+ * non-write-class, so it overwrote script source with the "Allow writes" toggle
+ * off. Where the computation happens is an implementation detail; the channel
+ * has to describe where the effect lands, or the whole derivation is worthless.
+ *
+ * `handleMutate` now re-checks the write gate itself, so this is belt and
+ * braces. Both are wanted: the gate stops the damage, the channel stops the
+ * tool from advertising itself to the model as safe.
+ */
+export function pipelineTool(
+  meta: Omit<ToolMeta, "readOnly">,
+  handler: (args: any, ctx: ToolContext) => Promise<unknown>,
+): ToolEntry {
+  return { ...meta, channel: "mutate", handler };
+}
+
+/**
+ * A specialist implemented entirely server-side (session memory, profile files).
+ * Its own effect is local, so the Studio write toggle does not gate it.
+ *
+ * If the handler reaches Studio at all, this is the wrong constructor: use
+ * `pipelineTool` when the effect is a mutate, or `dispatchTool` with
+ * `readOnly: true` when it only reads.
  */
 export function localTool(
   meta: Omit<ToolMeta, "readOnly">,

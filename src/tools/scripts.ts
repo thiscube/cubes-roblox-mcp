@@ -1,4 +1,4 @@
-import { type ToolEntry, evalTool, localTool, luaJson } from "../registry.js";
+import { type ToolEntry, evalTool, pipelineTool, luaJson } from "../registry.js";
 
 /**
  * Reading, searching and patching LuaSourceContainers.
@@ -101,7 +101,7 @@ return {
 }
 `,
   ),
-  localTool(
+  pipelineTool(
     {
       name: "script_edit",
       category: "scripts",

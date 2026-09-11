@@ -34,6 +34,22 @@ each line so you know what to care about.
 
 ---
 
+## Group 0 — Found while implementing PLAN.md
+
+**`#33` · HIGH · `script_edit` overwrote script source with writes OFF** *(fixed)*
+The fix for `#13` rewrote `script_edit` so its find/replace happens in TypeScript, which
+made it a "local" tool — and local tools aren't write-class, so the *Allow writes* toggle
+stopped applying to it. It read the script, patched it, and wrote it back with the toggle
+off. Proven end to end, not inferred.
+
+Two fixes, both wanted. The channel now describes where the *effect* lands, not where the
+computation happens (`pipelineTool`), so the tool is write-class again. And the gate moved
+to the entrance of the mutate pipeline itself, so any future caller on any channel is
+covered. `test/unit/write-gate.test.mjs` now asserts the invariant by behaviour: with
+writes off, no tool by any route can get a write command to Studio.
+
+---
+
 ## Group 1 — Anyone can control your Studio
 
 This is the worst group. The bridge on port 44820 has no lock on it at all. It never checks

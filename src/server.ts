@@ -722,6 +722,18 @@ export function createMcpServer(bridge: StudioTransport): Server {
     if (!Array.isArray(args.ops)) {
       return { error: "bad_args", hint: "mutate requires an 'ops' array." };
     }
+    // The write gate lives HERE, at the entrance to the pipeline, not only on
+    // the `mutate` tool name. `script_edit` reached this function from a tool
+    // the name-based check had already waved through, and overwrote script
+    // source with the toggle off. Any future caller is covered now, whatever
+    // channel it claims.
+    if (bridge.connected && !bridge.writeEnabled) {
+      return {
+        error: "write_mode_disabled",
+        tool: "mutate",
+        hint: "Writes are off. Open the Cubes MCP panel in Roblox Studio and enable 'Allow writes', then retry.",
+      };
+    }
     // Confirm-before-destructive: hard / nuclear batches need an explicit
     // confirm: true. The structured error hands back the exact retry.
     const assessment = assessDestructiveness(args.ops);
