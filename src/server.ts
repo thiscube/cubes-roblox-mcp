@@ -469,6 +469,15 @@ export function createMcpServer(bridge: StudioTransport): Server {
 
     let payload: unknown;
     try {
+      // Safety net: the agent called a specialist by name that it remembered from
+      // earlier. Unlock it BEFORE validating, so that if the call is rejected for
+      // bad arguments or because writes are off, the schema it needs is already in
+      // tools/list and the retry is informed. Only registry-known names unlock, so
+      // a hallucinated name still comes back as unknown_tool.
+      if (!session.isCore(name) && registry.has(name)) {
+        if (session.tools.unlock([name], session.turn).changed) await notifyListChanged();
+      }
+
       // Arguments are validated against the tool's own inputSchema before any
       // handler sees them. The MCP SDK does not do this, and every handler used
       // to cast blindly (AUDIT.md #3, #14).
@@ -512,8 +521,6 @@ export function createMcpServer(bridge: StudioTransport): Server {
               };
               break;
             }
-            // Safety net: agent remembered a tool name from earlier — just unlock it.
-            if (session.tools.unlock([name], session.turn).changed) await notifyListChanged();
             payload = await entry.handler(args, toolCtx);
           }
         }

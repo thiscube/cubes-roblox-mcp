@@ -74,7 +74,7 @@ return {
       subcategories: ["lifecycle", "simulate"],
       keywords: ["playtest", "play", "solo", "start", "simulate", "player"],
       description:
-        "Start Play Solo (StudioTestService:ExecutePlayModeAsync). Plugin stays connected — drive player via character_* tools during the session. Temporarily flips ServerScriptService.LoadStringEnabled to true so eval-based tools work in the play DM; restores the original value when play ends (`loadStringFlipped: true` in the response if it was changed).",
+        "Start Play Solo (StudioTestService:ExecutePlayModeAsync). Plugin stays connected, so drive the player with character_* tools. Temporarily enables LoadStringEnabled so eval tools work in the play DM, restored on stop (`loadStringFlipped`).",
       inputSchema: {
         type: "object",
         properties: {
@@ -194,7 +194,7 @@ return {
     subcategories: ["live", "eval", "tweak"],
     keywords: ["tune", "live", "eval", "playtest", "tweak", "gravity", "walkspeed", "stats", "mid-run", "hotfix"],
     description:
-      "Run arbitrary Luau inside the RUNNING playtest's server DataModel — the live game, not the edit place. Use to tweak values mid-playtest (workspace.Gravity, a player's Humanoid.WalkSpeed/JumpPower, enemy stats) and see the effect immediately. `return <value>` sends data back as JSON (a nil return comes back as { __void = true }). Requires a playtest to be running (start one with playtest_play); errors with `no_playtest` otherwise. This is the live-game counterpart to run_code, which runs in the edit DM.",
+      "Run Luau in the RUNNING playtest's server DataModel: the live game, not the edit place. Tweak values mid-playtest (Gravity, WalkSpeed, enemy stats) live. `return <value>` comes back as JSON. Needs a playtest, else `no_playtest`.",
     inputSchema: {
       type: "object",
       properties: {

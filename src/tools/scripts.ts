@@ -26,7 +26,7 @@ export const SCRIPTS_TOOLS: ToolEntry[] = [
           scope: {
             type: "string",
             description:
-              "Optional path/ref to limit the search root, e.g. 'ServerScriptService' or a folder ref. Default: scan the standard script-bearing services.",
+              "Search root (ref or dotted path). Default: the standard script-bearing services.",
           },
         },
         required: ["query"],
@@ -108,7 +108,7 @@ return {
       subcategories: ["code", "patch", "refactor"],
       keywords: ["edit", "patch", "modify", "change", "replace", "find", "refactor", "rewrite", "source"],
       description:
-        "Patch a script's Source with find/replace edits — far cheaper than reading and rewriting the whole source. Each edit is applied in order. By default a find string must match exactly once; pass `allowMultiple: true` to allow multiple matches. Fails the whole batch if any find string is missing (no silent no-ops). Goes through the same confirm gate and inline lint as `mutate`.",
+        "Patch a script's Source with find/replace edits, cheaper than rewriting it. Edits apply in order; each find must match once unless `allowMultiple`. A missing find fails the batch, no silent no-ops. Same confirm gate and lint as `mutate`.",
       inputSchema: {
         type: "object",
         properties: {

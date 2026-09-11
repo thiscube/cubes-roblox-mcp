@@ -15,7 +15,7 @@ export const DEBUG_TOOLS: ToolEntry[] = [
       subcategories: ["visualize", "overlay"],
       keywords: ["highlight", "outline", "color", "overlay", "mark", "see", "find", "show", "debug"],
       description:
-        "Add a colored Highlight overlay to one or more instances so the agent (via screenshot) can see exactly which parts a change targets. Highlights are AlwaysOnTop and live under Workspace._CubesMCPDebug. Pass duration>0 to auto-clear after N seconds.",
+        "Add a colored Highlight overlay to instances so a screenshot shows exactly which parts a change targets. AlwaysOnTop, parented under Workspace._CubesMCPDebug. duration>0 auto-clears after N seconds.",
       inputSchema: {
         type: "object",
         properties: {

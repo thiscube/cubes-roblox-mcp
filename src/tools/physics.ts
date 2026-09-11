@@ -91,11 +91,11 @@ return { registered = registered, rules = ruleCount, partsAssigned = assigned }
       subcategories: ["constraint", "joints", "rigging"],
       keywords: ["constraint", "hinge", "spring", "rope", "align", "weld", "joint", "physics"],
       description:
-        "Add a Constraint between two BaseParts. Type is any constraint class: HingeConstraint, SpringConstraint, RopeConstraint, AlignPosition, AlignOrientation, RodConstraint, etc. Creates the Attachments and sets Attachment0/1 automatically. Extra props pass through to the constraint.",
+        "Add a Constraint between two BaseParts. Type is any constraint class (HingeConstraint, SpringConstraint, AlignPosition, RodConstraint...). Creates the Attachments and wires Attachment0/1. Extra props pass through.",
       inputSchema: {
         type: "object",
         properties: {
-          type: { type: "string", description: "Constraint class name (HingeConstraint, SpringConstraint, AlignPosition, AlignOrientation, RopeConstraint, RodConstraint)." },
+          type: { type: "string", description: "Constraint class name (HingeConstraint, SpringConstraint, AlignPosition, RodConstraint)." },
           part0: { type: "string", description: "Ref/path of part0 (Attachment0 host)." },
           part1: { type: "string", description: "Ref/path of part1 (Attachment1 host). Optional for one-sided constraints like AlignPosition with a world target." },
           offset0: { type: "array", items: { type: "number" }, description: "Local [x,y,z] offset of Attachment0." },

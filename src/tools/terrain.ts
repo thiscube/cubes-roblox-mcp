@@ -16,7 +16,7 @@ export const TERRAIN_TOOLS: ToolEntry[] = [
       subcategories: ["voxel", "sculpt", "build"],
       keywords: ["terrain", "fill", "voxel", "sculpt", "hill", "lake", "dig", "carve", "material"],
       description:
-        "Fill a region of Terrain with a material. Shapes: block (size [x,y,z]), ball (radius), cylinder (radius + height). Material is any Enum.Material name — Grass, Sand, Rock, Snow, Ground, Asphalt, Concrete, Wood, Plastic, Water, etc. Use 'Air' to dig (carve caves). One ChangeHistory waypoint per call.",
+        "Fill a Terrain region with a material. Shapes: block (size [x,y,z]), ball (radius), cylinder (radius + height). Material is any Enum.Material name; use 'Air' to dig caves. One ChangeHistory waypoint per call.",
       inputSchema: {
         type: "object",
         properties: {

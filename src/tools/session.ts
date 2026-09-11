@@ -31,20 +31,20 @@ export const SESSION_TOOLS: ToolEntry[] = [
       "learn",
     ],
     description:
-      "Update the persistent per-place profile (~/.cubesmcp/profiles/{placeId}.json). Each field is an upsert: `genre`/`placeName`/`style`/`structure` shallow-merge; `decision`/`knownIssue`/`sessionSummary` append. Use this to record style decisions ('we chose elongated balls for ears, not WedgePart'), conventions ('models live under Workspace.Entities'), and per-session takeaways so the NEXT session opens with the project context already loaded.",
+      "Upsert the per-place profile (~/.cubesmcp/profiles/{placeId}.json). genre/placeName/style/structure shallow-merge; decision/knownIssue/sessionSummary append. Record conventions and style calls here so the next session starts with them.",
     inputSchema: {
       type: "object",
       properties: {
         genre: {
           type: "string",
           description:
-            "Set/replace the detected genre: 'obby' | 'simulator' | 'rpg' | 'racing' | 'tower_defense' | 'casual_sim' | 'social' | 'experimental' | 'unknown'.",
+            "Detected genre: obby, simulator, rpg, racing, tower_defense, casual_sim, social, experimental, unknown.",
         },
         placeName: { type: "string", description: "Set/replace the place name." },
         style: {
           type: "object",
           description:
-            "Shallow-merge into profile.style. Keys: palette (array of color strings), materials (array), naming (string), notes (string).",
+            "Shallow-merged into profile.style. Keys: palette[], materials[], naming, notes.",
         },
         structure: {
           type: "object",
@@ -165,7 +165,7 @@ export const SESSION_TOOLS: ToolEntry[] = [
         confirm: {
           type: "boolean",
           description:
-            "Required when the saved macro's ops are destructive (deletes / Source overwrites). Forwarded to the underlying mutate pipeline.",
+            "Required when the macro's ops are destructive. Forwarded to the mutate pipeline.",
         },
       },
       required: ["name"],
@@ -231,7 +231,7 @@ return { undone = undone, requested = n }
       "record state",
     ],
     description:
-      "Capture the current state of a subtree (a stable identity, ClassName, and projected properties per instance) and store it server-side under `name`. Returns only a small summary — NOT the captured tree. Pair with `diff` to see exactly what changed later. The capture lives in session memory (bounded; oldest evicted).",
+      "Capture a subtree's state (stable identity, ClassName, projected properties) server-side under `name`. Returns a small summary, NOT the tree. Pair with `diff` to see what changed later. Held in bounded session memory; oldest is dropped.",
     inputSchema: {
       type: "object",
       properties: {
@@ -242,7 +242,7 @@ return { undone = undone, requested = n }
         path: {
           type: "string",
           description:
-            "Subtree root to capture — a ref or dotted path, e.g. 'Workspace' or 'Workspace.Level'. Required: capturing the whole DataModel is intentionally not the default (too heavy).",
+            "Subtree root: a ref or dotted path. Required, because capturing the whole DataModel is too heavy to default to.",
         },
       },
       required: ["name", "path"],
@@ -308,7 +308,7 @@ return { undone = undone, requested = n }
       "version",
     ],
     description:
-      "Compare two snapshots and return a structured DELTA ONLY: { added, removed, changed }. `from` and `to` are snapshot names; `to` may instead be the literal 'live' to diff against a fresh capture of the current DataModel at the `from` snapshot's path. Never returns full trees — only the instances/properties that differ.",
+      "Compare two snapshots and return only the delta: { added, removed, changed }. `from` and `to` are snapshot names; `to` may be the literal 'live' to diff against a fresh capture at `from`'s path. Never returns full trees.",
     inputSchema: {
       type: "object",
       properties: {
@@ -316,7 +316,7 @@ return { undone = undone, requested = n }
         to: {
           type: "string",
           description:
-            "Later snapshot name, OR the literal 'live' to capture the DataModel now at the `from` snapshot's path and diff against that.",
+            "Later snapshot name, or 'live' to capture at `from`'s path now and diff against that.",
         },
       },
       required: ["from", "to"],
