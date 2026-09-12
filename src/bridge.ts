@@ -151,12 +151,9 @@ export class StudioBridge implements StudioTransport {
   ) {
     this.port = port;
     this.readOnly = opts.readOnly ?? false;
-    // Default to the plugin-native names only. Fails closed: a bridge built
-    // without the derived set refuses more than it needs to, never less.
-    this.readOnlyCommands = new Set([
-      ...PLUGIN_NATIVE_READ_COMMANDS,
-      ...(opts.readOnlyCommands ?? []),
-    ]);
+    // Empty by default. Fails closed: a bridge built without the derived set
+    // (src/rpc-policy.ts) refuses every /rpc call rather than guessing.
+    this.readOnlyCommands = new Set(opts.readOnlyCommands ?? []);
     const { token, generated } = resolveToken();
     this.token = token;
     this.tokenGenerated = generated;
@@ -291,6 +288,23 @@ export class StudioBridge implements StudioTransport {
         new BridgeError(
           "studio_not_connected",
           "The Roblox Studio plugin is not polling. Open Studio with a place loaded, install the Cubes MCP plugin, and make sure its toolbar button is active.",
+        ),
+      );
+    }
+    // Defence in depth. Until now the write gate lived only in callers, and
+    // `send()` — the one function that actually talks to Studio — enforced
+    // nothing. `handleMutate`'s guard is `connected && !writeEnabled`, so with
+    // the plugin disconnected a mutate falls through it into here; if the plugin
+    // reconnects before the queue drains, the command lands with the user's
+    // toggle off. Small window, needs a reconnect to hit, free to close. Same
+    // policy the /rpc door uses, so there is one rule and two doors.
+    if (!this.readOnlyCommands.has(tool) && (this.readOnly || !this.writeEnabled)) {
+      return Promise.reject(
+        new BridgeError(
+          this.readOnly ? "read_only_build" : "write_mode_disabled",
+          this.readOnly
+            ? `This server was started read-only; '${tool}' is a write command.`
+            : "Writes are off. Open the Cubes MCP panel in Roblox Studio and enable 'Allow writes', then retry.",
         ),
       );
     }
@@ -808,19 +822,7 @@ export class StudioBridge implements StudioTransport {
   }
 }
 
-/**
- * Plugin commands with no MCP tool of their own.
- *
- * `/rpc` classifies by NAME, and most names are tool names that `capabilities()`
- * already classifies — the composition root passes that derived set in. These
- * two are plugin-native commands a human might call over `/rpc` directly, so
- * they have no tool entry to derive from and are listed explicitly.
- *
- * This is the whole hand-maintained surface, and it is read-only by
- * construction. Everything else — including plugin commands this server has
- * never heard of — is treated as a write.
- */
-const PLUGIN_NATIVE_READ_COMMANDS: ReadonlySet<string> = new Set(["diagnostics", "viewport"]);
+
 
 type JsonBody =
   | { ok: true; value: any }

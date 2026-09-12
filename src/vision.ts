@@ -40,6 +40,8 @@ const MAX_INLINE_BYTES = 1_400_000;
 /** Longest edge we downscale to when a capture is over budget. */
 const DOWNSCALE_MAX_EDGE = 1400;
 const CAPTURE_TIMEOUT_MS = 15_000;
+/** The plugin command that returns the framebuffer. Protocol 3. */
+export const STUDIO_CAPTURE_COMMAND = "capture";
 /** How long to give Studio before falling back to the OS. */
 const STUDIO_CAPTURE_TIMEOUT_MS = 12_000;
 /**
@@ -56,16 +58,34 @@ export type Region = "full" | "studio" | "viewport";
 /** Where the pixels come from. */
 export type CaptureSource = "auto" | "studio" | "os";
 
-/** When Studio last told us it cannot capture. 0 means "never asked, or it can". */
-let studioCaptureUnavailableAt = 0;
+/**
+ * When a given transport last told us it cannot capture.
+ *
+ * Keyed by the transport, not stored in a module variable, because "this plugin
+ * has no capture handler" is a fact about a CONNECTION, not about this process.
+ * With one Studio window the difference is invisible; with several (PLAN.md #11)
+ * one old plugin would otherwise suppress the Studio path for every other window
+ * for a minute. A WeakMap so a dead transport takes its entry with it.
+ */
+const studioCaptureUnavailableAt = new WeakMap<object, number>();
 
-/** Test seam: forget what we learned about the plugin's capture support. */
-export function __resetStudioCaptureMemo(): void {
-  studioCaptureUnavailableAt = 0;
+/** Test seam: forget what we learned about a plugin's capture support. */
+export function __resetStudioCaptureMemo(bridge?: object): void {
+  if (bridge) studioCaptureUnavailableAt.delete(bridge);
+  else lastMemoKey && studioCaptureUnavailableAt.delete(lastMemoKey);
 }
 
-function studioCaptureWorthTrying(): boolean {
-  return Date.now() - studioCaptureUnavailableAt > STUDIO_CAPTURE_RETRY_MS;
+/** The most recent transport we recorded against, so a bare reset still works. */
+let lastMemoKey: object | null = null;
+
+function studioCaptureWorthTrying(bridge: object): boolean {
+  const at = studioCaptureUnavailableAt.get(bridge) ?? 0;
+  return Date.now() - at > STUDIO_CAPTURE_RETRY_MS;
+}
+
+function rememberCaptureUnavailable(bridge: object): void {
+  studioCaptureUnavailableAt.set(bridge, Date.now());
+  lastMemoKey = bridge;
 }
 
 /**
@@ -81,7 +101,7 @@ async function studioCapture(
 ): Promise<{ base64: string; width?: number; height?: number } | null> {
   try {
     const reply = (await bridge.send(
-      "capture",
+      STUDIO_CAPTURE_COMMAND,
       // `region` is passed through so the plugin can crop to the 3D viewport
       // itself. A plugin that ignores it returns the whole Studio window, which
       // is still better than the OS path.
@@ -92,7 +112,7 @@ async function studioCapture(
     const data = typeof reply?.png === "string" ? reply.png : reply?.base64;
     if (typeof data !== "string" || data.length === 0) {
       // A structured error, or a plugin that has no `capture` handler at all.
-      studioCaptureUnavailableAt = Date.now();
+      rememberCaptureUnavailable(bridge as object);
       return null;
     }
     return {
@@ -103,7 +123,7 @@ async function studioCapture(
   } catch {
     // unknown_tool from an older plugin, a timeout, a disconnect. All of these
     // mean "use the OS path", never "fail the screenshot".
-    studioCaptureUnavailableAt = Date.now();
+    rememberCaptureUnavailable(bridge as object);
     return null;
   }
 }
@@ -293,6 +313,7 @@ export const screenshotTool: ToolEntry = {
   // Dispatches a `capture` command to the plugin before falling back to the OS,
   // so the channel is dispatch. It only reads pixels, hence the opt-out.
   channel: "dispatch",
+  pluginCommand: STUDIO_CAPTURE_COMMAND,
   readOnly: true,
   description:
     "Capture a PNG inline so the agent can see the screen. Asks Studio for the framebuffer first (immune to windows covering Studio), falls back to an OS capture. Regions: 'viewport' (default, the 3D area), 'studio', 'full' (your whole monitor).",
@@ -334,11 +355,32 @@ export const screenshotTool: ToolEntry = {
         ? args.source
         : "auto";
 
+    // Someone asking for `source: "studio"` is opting into the framebuffer
+    // specifically — for occlusion, and for not shipping whatever else is on
+    // their monitor to a model. Refuse rather than quietly hand them an OS
+    // capture: that is the opposite of what they asked for. These two checks sit
+    // OUTSIDE the attempt below, which is where they were, so a disconnected
+    // plugin or `region: "full"` skipped the refusal along with the attempt.
+    if (source === "studio") {
+      if (requested === "full") {
+        return {
+          error: "studio_cannot_capture_full",
+          hint: "Studio can only return its own framebuffer. Use region 'viewport' or 'studio', or source 'os'.",
+        };
+      }
+      if (!ctx?.bridge?.connected) {
+        return {
+          error: "studio_not_connected",
+          hint: "source 'studio' needs the plugin connected. Use source 'auto' to fall back to the OS.",
+        };
+      }
+    }
+
     // Studio first. It returns the framebuffer, so an overlapping window cannot
     // end up in the shot — which is the whole reason this path exists. `full`
     // means the whole monitor and is by definition an OS job.
     if (source !== "os" && requested !== "full" && ctx?.bridge?.connected) {
-      if (source === "studio" || studioCaptureWorthTrying()) {
+      if (source === "studio" || studioCaptureWorthTrying(ctx.bridge)) {
         const shot = await studioCapture(ctx.bridge, requested);
         if (shot) {
           const bytes = Buffer.byteLength(shot.base64, "utf8");

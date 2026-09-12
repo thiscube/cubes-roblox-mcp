@@ -199,6 +199,55 @@ describe("write gate: behaviour, not labels", () => {
     );
   });
 
+  test("no tool file sets `channel` by hand", async () => {
+    // ToolEntry.channel says "set by the constructor, never by hand", and six
+    // tools were doing exactly that. It is not cosmetic: writing them as raw
+    // literals is how `pluginCommand` came to be missing from `snapshot` and
+    // `diff`, which left them out of the /rpc policy entirely.
+    const dir = join(SRC, "tools");
+    const offenders = [];
+    for (const file of (await readdir(dir)).filter((f) => f.endsWith(".ts"))) {
+      const text = await readFile(join(dir, file), "utf8");
+      for (const [, line] of text.split("\n").entries()) {
+        if (/^\s*channel:\s*"/.test(line)) offenders.push(`${file}: ${line.trim()}`);
+      }
+    }
+    assert.deepEqual(offenders, [], `hand-set channels: ${offenders.join(", ")}`);
+  });
+
+  test("a local tool that writes to disk has to say so", async () => {
+    // "Local" was being read as "harmless". profile_update is a local tool that
+    // writes a file in the user's home, and it survived the read-only build's
+    // filter because the filter only asked about Studio.
+    const dir = join(SRC, "tools");
+    const offenders = [];
+    for (const file of (await readdir(dir)).filter((f) => f.endsWith(".ts"))) {
+      const text = await readFile(join(dir, file), "utf8");
+      const writesFiles = /saveProfile|writeFile|mkdir|appendFile|rename\(/.test(text);
+      if (!writesFiles) continue;
+      for (const { name, body } of toolBlocks(text)) {
+        const entry = ALL_TOOLS.find((t) => t.name === name);
+        if (!entry || entry.channel !== "local") continue;
+        if (/saveProfile|writeFile|mkdir|appendFile/.test(body) && !entry.writesDisk) {
+          offenders.push(`${file}: ${name} persists state but does not declare writesDisk`);
+        }
+      }
+    }
+    assert.deepEqual(offenders, [], offenders.join("; "));
+  });
+
+  test("capabilities() fails closed on anything that is not a known opt-out", async () => {
+    // `entry.readOnly === undefined` read nicely and made `readOnly: false` —
+    // which means "not read-only" to any human — produce a READ-class tool.
+    for (const bad of [false, null, 0, "", "typo", {}, []]) {
+      const cap = capabilities({ channel: "eval", readOnly: bad });
+      assert.equal(cap.write, true, `readOnly: ${JSON.stringify(bad)} must stay write-class`);
+    }
+    assert.equal(capabilities({ channel: "eval" }).write, true);
+    assert.equal(capabilities({ channel: "eval", readOnly: true }).write, false);
+    assert.equal(capabilities({ channel: "eval", readOnly: "transient" }).write, false);
+  });
+
   test("capabilities() still derives, and deny-by-default still holds", () => {
     for (const entry of ALL_TOOLS) {
       const cap = capabilities(entry);
@@ -220,20 +269,96 @@ describe("write gate: behaviour, not labels", () => {
     }
   });
 
-  test("the /rpc allowlist is derived, not hand-listed", async () => {
-    // CLAUDE.md: capability is derived and never labelled. The bridge used to
-    // carry its own hardcoded Set, which drifted — sixteen read-only tools were
-    // refused and two entries named commands that are not tools.
+  test("the /rpc allowlist is derived, and in the right namespace", async () => {
+    // CLAUDE.md: capability is derived and never labelled. But /rpc queues a
+    // command straight to the plugin, so it speaks the PLUGIN COMMAND
+    // namespace. Deriving tool NAMES put 14 inert entries in the list and left
+    // out `capture`, so a read-only build could not screenshot over /rpc.
     const { rpcReadOnlyCommands } = await import("../../dist/rpc-policy.js");
+    const { screenshotTool } = await import("../../dist/vision.js");
     const allowed = new Set(rpcReadOnlyCommands());
+
     for (const entry of ALL_TOOLS) {
+      if (!entry.pluginCommand) continue;
       assert.equal(
-        allowed.has(entry.name),
+        allowed.has(entry.pluginCommand),
         !capabilities(entry).write,
-        `${entry.name}: /rpc allowlist disagrees with capabilities()`,
+        `${entry.name} (command ${entry.pluginCommand}): allowlist disagrees with capabilities()`,
       );
     }
+
+    // Every entry must be a command something actually sends, not a tool name.
+    const commands = new Set([
+      ...ALL_TOOLS.map((t) => t.pluginCommand).filter(Boolean),
+      screenshotTool.pluginCommand,
+      // Dispatched by the server itself, with no tool of their own.
+      "read",
+      "diagnostics",
+      "viewport",
+    ]);
+    for (const name of allowed) {
+      assert.ok(commands.has(name), `${name} is in the /rpc allowlist but nothing sends it`);
+    }
+
     assert.ok(allowed.has("read"), "the universal read verb must be allowed");
-    assert.ok(!allowed.has("mutate") && !allowed.has("run_code"));
+    assert.ok(allowed.has("capture"), "a read-only build must still be able to screenshot");
+    assert.ok(!allowed.has("mutate") && !allowed.has("eval") && !allowed.has("tune"));
+  });
+
+  test("the transport refuses writes too, not just its callers", async () => {
+    // Defence in depth: handleMutate's guard is `connected && !writeEnabled`, so
+    // a disconnected bridge falls through it into send(). If the plugin
+    // reconnects before the queue drains, the command lands with the toggle off.
+    const { StudioBridge } = await import("../../dist/bridge.js");
+    const { rpcReadOnlyCommands } = await import("../../dist/rpc-policy.js");
+    const { MAX_PROTOCOL_VERSION } = await import("../../dist/protocol.js");
+    const bridge = new StudioBridge(0, { readOnlyCommands: rpcReadOnlyCommands() });
+    await bridge.start();
+    try {
+      // A plugin polling with the toggle OFF: the state the window opens in.
+      // Not awaited — a poll with nothing queued long-holds for 25 seconds.
+      void fetch(`http://127.0.0.1:${bridge.boundPort}/poll`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${bridge.token}` },
+        body: JSON.stringify({ protocol: MAX_PROTOCOL_VERSION, writeEnabled: false }),
+      }).catch(() => {});
+      await new Promise((r) => setTimeout(r, 60));
+      assert.equal(bridge.connected, true);
+      assert.equal(bridge.writeEnabled, false);
+
+      // BridgeError carries the machine-readable reason on `code`; the message
+      // is the sentence a human reads. Assert on the code.
+      const codeOf = async (fn) => {
+        try {
+          await fn();
+          return "resolved";
+        } catch (err) {
+          return err.code ?? "no_code";
+        }
+      };
+      assert.equal(await codeOf(() => bridge.send("mutate", { ops: [] }, 500)), "write_mode_disabled");
+      assert.equal(await codeOf(() => bridge.send("eval", { luau: "x" }, 500)), "write_mode_disabled");
+      assert.equal(bridge.queueDepth, 0, "a refused write must never reach the queue");
+
+      // A read still gets as far as the queue: the gate is about writes.
+      assert.equal(await codeOf(() => bridge.send("read", { path: "Workspace" }, 250)), "studio_timeout");
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  test("the connected check still wins, so the error stays actionable", async () => {
+    // With no plugin at all, "Studio is not connected" is far more useful than
+    // "writes are off", so that check has to come first.
+    const { StudioBridge } = await import("../../dist/bridge.js");
+    const { rpcReadOnlyCommands } = await import("../../dist/rpc-policy.js");
+    const bridge = new StudioBridge(0, { readOnlyCommands: rpcReadOnlyCommands() });
+    await bridge.start();
+    try {
+      const err = await bridge.send("mutate", { ops: [] }, 300).catch((e) => e);
+      assert.equal(err.code, "studio_not_connected");
+    } finally {
+      await bridge.stop();
+    }
   });
 });

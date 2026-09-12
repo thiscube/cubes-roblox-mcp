@@ -79,7 +79,12 @@ relays it.
 `--read-only`, or `CUBES_MCP_READ_ONLY=1`. Every write-class tool is removed from
 the process: `mutate`, `run_code` and 41 specialists are not registered, cannot
 be called by name, cannot be found by `search_tools`. `/rpc` refuses writes
-whatever the Studio panel says.
+whatever the Studio panel says, and `send()` refuses them at the transport too.
+
+Tools that only write to disk are filtered as well, not just the ones that reach
+Studio. `profile_update` is server-local — it never touches the DataModel — and
+it was surviving into this build and writing a file in your home directory,
+which is not what "read-only" says on the tin.
 
 This is stronger than the toggle. There is no gate to get wrong and nothing for a
 determined model to argue its way past, because the tools are not there.

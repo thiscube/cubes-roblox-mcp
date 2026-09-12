@@ -82,6 +82,18 @@ export interface ToolEntry {
   /** How this tool reaches Studio. Set by the constructor, never by hand. */
   channel: Channel;
   /**
+   * The plugin command a `dispatch` tool sends. Set by `dispatchTool`.
+   *
+   * `/rpc` speaks the PLUGIN COMMAND namespace, not the MCP tool namespace, so
+   * anything deriving an `/rpc` policy has to read this rather than `name`.
+   */
+  pluginCommand?: string;
+  /**
+   * True when the tool writes persistent state under CUBES_MCP_HOME. Only
+   * meaningful for `local` tools; a Studio-channel tool is already write-class.
+   */
+  writesDisk?: true;
+  /**
    * Explicit opt-out of write-class. Two honest levels, and no third:
    *
    *   true          the generated Luau provably only reads.
@@ -96,7 +108,9 @@ export interface ToolEntry {
    * — the build whose entire purpose is inspection. The binary was the bug, not
    * the classification.
    *
-   * Deny-by-default is unchanged: absent means write-class.
+   * Deny-by-default is unchanged, and it is now enforced rather than implied:
+ * `capabilities()` treats ONLY these two values as an opt-out, so an unexpected
+ * one (`false`, a typo, null) stays write-class instead of failing open.
    */
   readOnly?: true | "transient";
   /**
@@ -134,6 +148,15 @@ export interface Capability {
   /** Touches the DataModel at all (false for server-local tools). */
   touchesStudio: boolean;
   /**
+   * Writes persistent state under CUBES_MCP_HOME.
+   *
+   * "Local" was being read as "harmless", and it is not the same thing:
+   * `profile_update` is a local tool that writes a file in the user's home, and
+   * it survived the read-only build's filter because the filter only asked about
+   * Studio. A read-only install should not be writing anything.
+   */
+  writesDisk: boolean;
+  /**
    * Constructs something in Studio but never parents it, so it changes nothing.
    * Read-class, but not a pure read — worth saying separately so annotations can
    * be accurate instead of merely safe.
@@ -141,15 +164,25 @@ export interface Capability {
   transient: boolean;
 }
 
-export function capabilities(entry: Pick<ToolEntry, "channel" | "readOnly">): Capability {
+export function capabilities(
+  entry: Pick<ToolEntry, "channel" | "readOnly" | "writesDisk">,
+): Capability {
+  const writesDisk = entry.writesDisk === true;
   const touchesStudio = entry.channel !== "local";
-  if (!touchesStudio) return { write: false, touchesStudio: false, transient: false };
+  if (!touchesStudio) return { write: false, touchesStudio: false, transient: false, writesDisk };
   // Deny by default: anything on a Studio channel is write-class unless it has
   // explicitly, and provably, opted out. Both opt-out levels are read-class.
+  // Fail closed on anything unexpected. `entry.readOnly === undefined` read
+  // nicely but made `readOnly: false` — which means "not read-only" to any human
+  // — produce a read-class tool. TypeScript rejects that value, but this
+  // function is exported, documented as the single source of truth for every
+  // gate, and takes a structural Pick<>. Only the two known opt-outs count.
+  const optedOut = entry.readOnly === true || entry.readOnly === "transient";
   return {
-    write: entry.readOnly === undefined,
+    write: !optedOut,
     touchesStudio: true,
     transient: entry.readOnly === "transient",
+    writesDisk,
   };
 }
 
@@ -312,6 +345,8 @@ interface ToolMeta {
   yieldBudgetMs?: (args: any) => number;
   /** Declared result shape. Defaults to the channel's shape when omitted. */
   outputSchema?: JsonSchema;
+  /** See ToolEntry.writesDisk. Declare it on any local tool that persists anything. */
+  writesDisk?: true;
 }
 
 /**
@@ -349,6 +384,7 @@ export function dispatchTool(meta: ToolMeta, pluginTool: string): ToolEntry {
   return {
     ...meta,
     channel: "dispatch",
+    pluginCommand: pluginTool,
     handler: async (args, ctx) =>
       ctx.bridge.send(pluginTool, (args ?? {}) as Record<string, unknown>, timeoutFor(meta, args)),
   };
@@ -384,6 +420,33 @@ export function pipelineTool(
   handler: (args: any, ctx: ToolContext) => Promise<unknown>,
 ): ToolEntry {
   return { ...meta, channel: "mutate", handler };
+}
+
+/**
+ * A specialist that dispatches a plugin command but needs its own handler around
+ * the call — to page a result, to compare two of them, to add server state.
+ *
+ * `dispatchTool` forwards arguments verbatim and returns the reply verbatim,
+ * which is not enough for `snapshot` and `diff`. Writing those as raw object
+ * literals meant setting `channel` by hand, which is exactly what
+ * `ToolEntry.channel` says never to do — and it is how `pluginCommand` came to
+ * be missing from both, which in turn left them out of the `/rpc` policy.
+ */
+export function commandTool(
+  meta: Omit<ToolMeta, "readOnly">,
+  pluginCommand: string,
+  handler: (args: any, ctx: ToolContext) => Promise<unknown>,
+): ToolEntry {
+  return { ...meta, channel: "dispatch", pluginCommand, handler };
+}
+
+/** `commandTool`, for a command that provably only reads. */
+export function readTool(
+  meta: Omit<ToolMeta, "readOnly">,
+  pluginCommand: string,
+  handler: (args: any, ctx: ToolContext) => Promise<unknown>,
+): ToolEntry {
+  return { ...commandTool(meta, pluginCommand, handler), readOnly: true };
 }
 
 /**

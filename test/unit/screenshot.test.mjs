@@ -39,7 +39,7 @@ const shoot = (args, b) => screenshotTool.handler(args, { bridge: b });
 const metaOf = (res) => res.__structured;
 
 describe("screenshot routing", () => {
-  beforeEach(__resetStudioCaptureMemo);
+  beforeEach(() => __resetStudioCaptureMemo());
 
   test("a connected plugin that can capture is used, and the OS is not", async () => {
     const b = bridge({ reply: () => ({ png: TINY_PNG, width: 1, height: 1 }) });
@@ -94,6 +94,37 @@ describe("screenshot routing", () => {
     const res = await shoot({ source: "studio" }, b);
     assert.equal(res.error, "studio_capture_unavailable");
     assert.match(res.hint, /source 'auto' or 'os'/);
+  });
+
+  test("source 'studio' is refused when the plugin is not connected", async () => {
+    // Someone asking for the framebuffer specifically is asking NOT to ship
+    // whatever else is on their monitor to a model. Quietly giving them an OS
+    // capture is the opposite of what they asked for. The refusal used to sit
+    // inside the connected guard, so it was skipped along with the attempt.
+    const b = bridge({ connected: false, reply: () => ({ png: TINY_PNG }) });
+    const res = await shoot({ source: "studio" }, b);
+    assert.equal(res.error, "studio_not_connected");
+    assert.deepEqual(b.sent, []);
+  });
+
+  test("source 'studio' with region 'full' is refused, not silently downgraded", async () => {
+    const b = bridge({ reply: () => ({ png: TINY_PNG }) });
+    const res = await shoot({ source: "studio", region: "full" }, b);
+    assert.equal(res.error, "studio_cannot_capture_full");
+    assert.deepEqual(b.sent, [], "Studio cannot see the rest of the monitor");
+  });
+
+  test("the capture memo is per connection, not per process", async () => {
+    // One Studio window with an old plugin must not suppress the Studio path for
+    // every other window (PLAN.md #11).
+    const old = bridge();
+    await shoot({}, old);
+    await shoot({}, old);
+    assert.equal(old.sent.length, 1, "the same plugin is not asked twice");
+
+    const fresh = bridge({ reply: () => ({ png: TINY_PNG }) });
+    const res = await shoot({}, fresh);
+    assert.equal(metaOf(res).source, "studio", "a different plugin gets its own chance");
   });
 
   test("source 'os' never asks the plugin", async () => {

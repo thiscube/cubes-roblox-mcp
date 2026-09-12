@@ -47,8 +47,16 @@ The channel must describe **where the effect lands**, not where the computation 
 A tool on a Studio channel is write-class **by default**. Two explicit opt-outs, both
 read-class: `readOnly: true` when the generated Luau provably only reads, and
 `readOnly: "transient"` when it constructs something it never parents (`docs_defaults`).
+Anything else — `false`, a typo — stays write-class; the function fails closed.
+
+**"Local" is not the same as "harmless."** A `local` tool that persists anything must
+declare `writesDisk: true`, or the read-only build will ship it and it will write to the
+user's home. And never set `channel` by hand: use `evalTool`, `mutateTool`, `dispatchTool`,
+`commandTool`, `readTool`, `pipelineTool` or `localTool`. Tests enforce both.
+
 Never add a hand-maintained write flag back — the `/rpc` allowlist was the last one and it
-had drifted by sixteen tools.
+had drifted by sixteen tools. Note that `/rpc` speaks the **plugin command** namespace, not
+the tool namespace: `src/rpc-policy.ts` derives it from each tool's `pluginCommand`.
 
 **2. The bridge authenticates in both directions.** Every route requires a bearer token,
 refuses any request carrying an `Origin`, requires a loopback `Host`, and requires

@@ -101,6 +101,19 @@ describe("read-only build: the MCP surface", () => {
     assert.deepEqual(leaked, [], `search surfaced write tools: ${leaked.join(", ")}`);
   });
 
+  test("tools that only write to disk are filtered too", async () => {
+    // "Local" is not the same as "harmless". profile_update never touches the
+    // DataModel, so the Studio-only filter let it through — and it wrote a file
+    // in the user's home directory from a build called read-only.
+    const ro = harness(true);
+    const p = ro.payloadOf(await ro.call("profile_update", { genre: "rpg" }));
+    assert.equal(p.error, "unknown_tool");
+
+    const full = harness(false);
+    const allowed = full.payloadOf(await full.call("profile_update", { genre: "rpg" }));
+    assert.equal(allowed.error, undefined, "it still works in the normal build");
+  });
+
   test("read tools still work, so the build is useful and not just safe", async () => {
     const ro = harness(true);
     assert.equal(ro.payloadOf(await ro.call("read", { path: "Workspace" })).error, undefined);

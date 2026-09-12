@@ -341,8 +341,18 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
   // Filtering the registry, not filtering the response: a write tool that is not
   // registered cannot be called by name, cannot be found by search_tools, and
   // cannot be auto-unlocked.
+  //
+  // `writesDisk` is filtered too, not just `write`. `profile_update` is a local
+  // tool — it never touches Studio — and it was surviving into the read-only
+  // build and writing a file in the user's home, which is not what "read-only"
+  // says on the tin.
   const registry = new ToolRegistry(
-    readOnly ? ALL_TOOLS.filter((t) => !capabilities(t).write) : ALL_TOOLS,
+    readOnly
+      ? ALL_TOOLS.filter((t) => {
+          const cap = capabilities(t);
+          return !cap.write && !cap.writesDisk;
+        })
+      : ALL_TOOLS,
   );
   const memory = new SessionMemory();
   const sourcemap = new SourceMap();
@@ -469,6 +479,15 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
      */
     const readOnlyEval = (luau: string) => bridge.send("eval", { luau });
 
+    /**
+     * The same rule for resources that dispatch a plugin command instead of
+     * shipping Luau. `studio://errors/recent` used to call `bridge.send`
+     * directly, which made the sentence above false — it was a read by
+     * convention, sitting outside the only audited path.
+     */
+    const readOnlyCommand = (command: "diagnostics" | "viewport", args: Record<string, unknown>) =>
+      bridge.send(command, args);
+
     try {
       switch (uri) {
         case "studio://overview":
@@ -498,7 +517,7 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
         case "studio://selection":
           return json(await readOnlyEval(SELECTION_LUAU));
         case "studio://errors/recent":
-          return json(await bridge.send("diagnostics", { n: 25 }));
+          return json(await readOnlyCommand("diagnostics", { n: 25 }));
         default:
           return json({ error: "unknown_resource", uri });
       }
@@ -824,7 +843,9 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
     // Inline lint: any op that writes script source gets selene'd server-side,
     // so the agent can fix issues now instead of discovering them at playtest.
     const lint = await lintScriptOps(Array.isArray(args.ops) ? args.ops : []);
-    if (lint.length > 0) result.lint = lint;
+    // Unconditional. Setting it only when non-empty meant a plugin's own `lint`
+    // field survived into a result the server had already declared the type of.
+    result.lint = lint;
     result.appliedLevel = assessment.level;
     return result;
   }

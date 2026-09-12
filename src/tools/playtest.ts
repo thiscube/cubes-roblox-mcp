@@ -1,4 +1,4 @@
-import { type ToolEntry, evalTool, dispatchTool, luaJson } from "../registry.js";
+import { type ToolEntry, commandTool, evalTool, dispatchTool, luaJson } from "../registry.js";
 
 /**
  * Driving and observing a running playtest.
@@ -187,22 +187,24 @@ return {
 }
 `,
   ),
-  {
-    name: "tune",
-    channel: "eval",
-    category: "playtest",
-    subcategories: ["live", "eval", "tweak"],
-    keywords: ["tune", "live", "eval", "playtest", "tweak", "gravity", "walkspeed", "stats", "mid-run", "hotfix"],
-    description:
-      "Run Luau in the RUNNING playtest's server DataModel: the live game, not the edit place. Tweak values mid-playtest (Gravity, WalkSpeed, enemy stats) live. `return <v>` comes back as JSON, a nil return as `{__void=true}`. Needs a playtest.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        luau: { type: "string", description: "Luau source to run in the live play-DM server. Use 'return <value>' to return data." },
+  commandTool(
+    {
+      name: "tune",
+      category: "playtest",
+      subcategories: ["live", "eval", "tweak"],
+      keywords: ["tune", "live", "eval", "playtest", "tweak", "gravity", "walkspeed", "stats", "mid-run", "hotfix"],
+      description:
+        "Run Luau in the RUNNING playtest's server DataModel: the live game, not the edit place. Tweak values mid-playtest (Gravity, WalkSpeed, enemy stats) live. `return <v>` comes back as JSON, a nil return as `{__void=true}`. Needs a playtest.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          luau: { type: "string", description: "Luau source to run in the live play-DM server. Use 'return <value>' to return data." },
+        },
+        required: ["luau"],
       },
-      required: ["luau"],
     },
-    handler: async (args, ctx) => {
+    "tune",
+    async (args, ctx) => {
       const luau = (args ?? {}).luau;
       if (typeof luau !== "string" || luau.trim() === "") {
         return { error: "bad_args", hint: "tune requires a non-empty 'luau' string." };
@@ -210,7 +212,7 @@ return {
       const result = await ctx.bridge.send("tune", { luau });
       return { result };
     },
-  },
+  ),
   dispatchTool(
     {
       name: "players_state",

@@ -1,4 +1,4 @@
-import { type ToolEntry, evalTool, luaJson } from "../registry.js";
+import { type ToolEntry, evalTool, localTool, luaJson, pipelineTool, readTool } from "../registry.js";
 import { diffSnapshots } from "../snapshot-diff.js";
 import type { SnapshotInstance } from "../memory.js";
 import { applyPatch, loadProfile, saveProfile, type ProfilePatch } from "../profile.js";
@@ -11,69 +11,73 @@ import { applyPatch, loadProfile, saveProfile, type ProfilePatch } from "../prof
  */
 
 export const SESSION_TOOLS: ToolEntry[] = [
-  {
-    name: "profile_update",
-    channel: "local",
-    category: "session",
-    subcategories: ["memory", "profile", "decision", "convention"],
-    keywords: [
-      "profile",
-      "remember",
-      "memory",
-      "decision",
-      "convention",
-      "style",
-      "genre",
-      "save",
-      "note",
-      "context",
-      "persist",
-      "learn",
-    ],
-    description:
-      "Upsert the per-place profile (~/.cubesmcp/profiles/{placeId}.json). genre/placeName/style/structure shallow-merge; decision/knownIssue/sessionSummary append. Record conventions and style calls here so the next session starts with them.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        genre: {
-          type: "string",
-          description:
-            "Detected genre: obby, simulator, rpg, racing, tower_defense, casual_sim, social, experimental, unknown.",
-        },
-        placeName: { type: "string", description: "Set/replace the place name." },
-        style: {
-          type: "object",
-          description:
-            "Shallow-merged into profile.style. Keys: palette[], materials[], naming, notes.",
-        },
-        structure: {
-          type: "object",
-          description:
-            "Shallow-merge into profile.structure. Free-form key/value (e.g. modelRoot='Workspace.Entities').",
-        },
-        decision: {
-          type: "object",
-          description: "Append to decisions log. { topic, choice }.",
-          properties: {
-            topic: { type: "string" },
-            choice: { type: "string" },
+  localTool(
+    {
+      // Writes ~/.cubesmcp/profiles/{placeId}.json. "Local" is not "harmless",
+      // and the read-only build filters on this.
+      writesDisk: true,
+      name: "profile_update",
+      category: "session",
+      subcategories: ["memory", "profile", "decision", "convention"],
+      keywords: [
+        "profile",
+        "remember",
+        "memory",
+        "decision",
+        "convention",
+        "style",
+        "genre",
+        "save",
+        "note",
+        "context",
+        "persist",
+        "learn",
+      ],
+      description:
+        "Upsert the per-place profile (~/.cubesmcp/profiles/{placeId}.json). genre/placeName/style/structure shallow-merge; decision/knownIssue/sessionSummary append. Record conventions and style calls here so the next session starts with them.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          genre: {
+            type: "string",
+            description:
+              "Detected genre: obby, simulator, rpg, racing, tower_defense, casual_sim, social, experimental, unknown.",
           },
-          required: ["topic", "choice"],
-        },
-        knownIssue: { type: "string", description: "Append to knownIssues." },
-        sessionSummary: {
-          type: "object",
-          description:
-            "Append to sessionLog. { session, summary }. Use at the end of a session to leave breadcrumbs for next time.",
-          properties: {
-            session: { type: "string" },
-            summary: { type: "string" },
+          placeName: { type: "string", description: "Set/replace the place name." },
+          style: {
+            type: "object",
+            description:
+              "Shallow-merged into profile.style. Keys: palette[], materials[], naming, notes.",
           },
-          required: ["session", "summary"],
+          structure: {
+            type: "object",
+            description:
+              "Shallow-merge into profile.structure. Free-form key/value (e.g. modelRoot='Workspace.Entities').",
+          },
+          decision: {
+            type: "object",
+            description: "Append to decisions log. { topic, choice }.",
+            properties: {
+              topic: { type: "string" },
+              choice: { type: "string" },
+            },
+            required: ["topic", "choice"],
+          },
+          knownIssue: { type: "string", description: "Append to knownIssues." },
+          sessionSummary: {
+            type: "object",
+            description:
+              "Append to sessionLog. { session, summary }. Use at the end of a session to leave breadcrumbs for next time.",
+            properties: {
+              session: { type: "string" },
+              summary: { type: "string" },
+            },
+            required: ["session", "summary"],
+          },
         },
       },
     },
-    handler: async (args, ctx) => {
+    async (args, ctx) => {
       const ctxData = await ctx.getPlaceContext();
       const profile = await loadProfile(ctxData.placeId, ctxData.placeName);
       const patch: ProfilePatch = {
@@ -109,32 +113,33 @@ export const SESSION_TOOLS: ToolEntry[] = [
         hint: "Read studio://project/profile to see the updated profile.",
       };
     },
-  },
-  {
-    name: "macro_save",
-    channel: "local",
-    category: "session",
-    subcategories: ["macro", "record"],
-    keywords: ["macro", "record", "save", "sequence", "replay", "reuse", "automate", "memory"],
-    description:
-      "Save a reusable macro. Either captures the mutate ops from the last N history entries (from_last) or takes an explicit ops array. Replay with macro_run. Note: only direct `mutate` ops are captured, not specialist-tool calls.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        name: { type: "string", description: "Macro name." },
-        from_last: {
-          type: "number",
-          description: "Capture mutate ops from the last N history entries (default 10).",
+  ),
+  localTool(
+    {
+      name: "macro_save",
+      category: "session",
+      subcategories: ["macro", "record"],
+      keywords: ["macro", "record", "save", "sequence", "replay", "reuse", "automate", "memory"],
+      description:
+        "Save a reusable macro. Either captures the mutate ops from the last N history entries (from_last) or takes an explicit ops array. Replay with macro_run. Note: only direct `mutate` ops are captured, not specialist-tool calls.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Macro name." },
+          from_last: {
+            type: "number",
+            description: "Capture mutate ops from the last N history entries (default 10).",
+          },
+          ops: {
+            type: "array",
+            items: { type: "object" },
+            description: "Explicit ops to save (alternative to from_last).",
+          },
         },
-        ops: {
-          type: "array",
-          items: { type: "object" },
-          description: "Explicit ops to save (alternative to from_last).",
-        },
+        required: ["name"],
       },
-      required: ["name"],
     },
-    handler: async (args, ctx) => {
+    async (args, ctx) => {
       const name = String(args.name ?? "").trim();
       if (!name) return { error: "bad_args", hint: "macro_save needs a 'name'." };
       const ops = Array.isArray(args.ops)
@@ -149,28 +154,29 @@ export const SESSION_TOOLS: ToolEntry[] = [
       const macro = ctx.memory.saveMacro(name, ops);
       return { saved: macro.name, opCount: macro.opCount, hint: `Replay with macro_run({ name: "${name}" }).` };
     },
-  },
-  {
-    name: "macro_run",
-    channel: "mutate",
-    category: "session",
-    subcategories: ["macro", "replay"],
-    keywords: ["macro", "run", "replay", "execute", "repeat", "reuse", "memory"],
-    description:
-      "Replay a saved macro — re-submits its ops as one atomic mutate batch (single undo waypoint). Lint results come back under the nested mutate result, same as a normal mutate.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        name: { type: "string", description: "Macro name to run." },
-        confirm: {
-          type: "boolean",
-          description:
-            "Required when the macro deletes anything or overwrites script Source. Forwarded to the mutate pipeline.",
+  ),
+  pipelineTool(
+    {
+      name: "macro_run",
+      category: "session",
+      subcategories: ["macro", "replay"],
+      keywords: ["macro", "run", "replay", "execute", "repeat", "reuse", "memory"],
+      description:
+        "Replay a saved macro — re-submits its ops as one atomic mutate batch (single undo waypoint). Lint results come back under the nested mutate result, same as a normal mutate.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Macro name to run." },
+          confirm: {
+            type: "boolean",
+            description:
+              "Required when the macro deletes anything or overwrites script Source. Forwarded to the mutate pipeline.",
+          },
         },
+        required: ["name"],
       },
-      required: ["name"],
     },
-    handler: async (args, ctx) => {
+    async (args, ctx) => {
       const name = String(args.name ?? "").trim();
       const macro = ctx.memory.getMacro(name);
       if (!macro) {
@@ -187,7 +193,7 @@ export const SESSION_TOOLS: ToolEntry[] = [
       const result = await ctx.handleMutate({ ops: macro.ops, confirm: args.confirm === true });
       return { ran: name, opCount: macro.opCount, result };
     },
-  },
+  ),
   evalTool(
     {
       name: "history_undo",
@@ -215,42 +221,41 @@ end
 return { undone = undone, requested = n }
 `,
   ),
-  {
-    name: "snapshot",
-    // Dispatches a `snapshot` command to the plugin, so the channel is dispatch,
-    // not local. It only reads the DataModel, hence the explicit opt-out.
-    channel: "dispatch",
-    readOnly: true,
-    category: "session",
-    subcategories: ["version-control", "capture", "checkpoint"],
-    keywords: [
-      "snapshot",
-      "capture",
-      "checkpoint",
-      "save state",
-      "baseline",
-      "version",
-      "before",
-      "record state",
-    ],
-    description:
-      "Capture a subtree's state (stable identity, ClassName, projected properties) server-side under `name`. Returns a small summary, NOT the tree. Pair with `diff` to see what changed later. Held in bounded session memory; oldest is dropped.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        name: {
-          type: "string",
-          description: "Key to store this snapshot under. Re-using a name overwrites it.",
+  readTool(
+    {
+      name: "snapshot",
+      category: "session",
+      subcategories: ["version-control", "capture", "checkpoint"],
+      keywords: [
+        "snapshot",
+        "capture",
+        "checkpoint",
+        "save state",
+        "baseline",
+        "version",
+        "before",
+        "record state",
+      ],
+      description:
+        "Capture a subtree's state (stable identity, ClassName, projected properties) server-side under `name`. Returns a small summary, NOT the tree. Pair with `diff` to see what changed later. Held in bounded session memory; oldest is dropped.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: {
+            type: "string",
+            description: "Key to store this snapshot under. Re-using a name overwrites it.",
+          },
+          path: {
+            type: "string",
+            description:
+              "Subtree root: a ref or dotted path. Required, because capturing the whole DataModel is too heavy to default to.",
+          },
         },
-        path: {
-          type: "string",
-          description:
-            "Subtree root: a ref or dotted path. Required, because capturing the whole DataModel is too heavy to default to.",
-        },
+        required: ["name", "path"],
       },
-      required: ["name", "path"],
     },
-    handler: async (args, ctx) => {
+    "snapshot",
+    async (args, ctx) => {
       const name = String(args.name ?? "").trim();
       if (!name) return { error: "bad_args", hint: "snapshot needs a non-empty 'name'." };
       const path = String(args.path ?? "").trim();
@@ -293,41 +298,40 @@ return { undone = undone, requested = n }
         hint: `Compare later with diff({ from: "${name}", to: "live" }), or against another snapshot.`,
       };
     },
-  },
-  {
-    name: "diff",
-    // Dispatches a `snapshot` command to the plugin, so the channel is dispatch,
-    // not local. It only reads the DataModel, hence the explicit opt-out.
-    channel: "dispatch",
-    readOnly: true,
-    category: "session",
-    subcategories: ["version-control", "compare", "delta"],
-    keywords: [
-      "diff",
-      "compare",
-      "delta",
-      "changed",
-      "what changed",
-      "difference",
-      "drift",
-      "since",
-      "version",
-    ],
-    description:
-      "Compare two snapshots and return only the delta: { added, removed, changed }. `from` and `to` are snapshot names; `to` may be the literal 'live' to diff against a fresh capture at `from`'s path. Never returns full trees.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        from: { type: "string", description: "Baseline snapshot name." },
-        to: {
-          type: "string",
-          description:
-            "Later snapshot name, or 'live' to capture at `from`'s path now and diff against that.",
+  ),
+  readTool(
+    {
+      name: "diff",
+      category: "session",
+      subcategories: ["version-control", "compare", "delta"],
+      keywords: [
+        "diff",
+        "compare",
+        "delta",
+        "changed",
+        "what changed",
+        "difference",
+        "drift",
+        "since",
+        "version",
+      ],
+      description:
+        "Compare two snapshots and return only the delta: { added, removed, changed }. `from` and `to` are snapshot names; `to` may be the literal 'live' to diff against a fresh capture at `from`'s path. Never returns full trees.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          from: { type: "string", description: "Baseline snapshot name." },
+          to: {
+            type: "string",
+            description:
+              "Later snapshot name, or 'live' to capture at `from`'s path now and diff against that.",
+          },
         },
+        required: ["from", "to"],
       },
-      required: ["from", "to"],
     },
-    handler: async (args, ctx) => {
+    "snapshot",
+    async (args, ctx) => {
       const fromName = String(args.from ?? "").trim();
       const toArg = String(args.to ?? "").trim();
       if (!fromName || !toArg) {
@@ -387,5 +391,5 @@ return { undone = undone, requested = n }
           : {}),
       };
     },
-  },
+  ),
 ];

@@ -231,10 +231,16 @@ describe("declared result shapes (PLAN #5)", () => {
     );
 
     const mutate = tools.find((t) => t.name === "mutate").outputSchema;
+    // appliedLevel is written by handleMutate on every successful batch, so it
+    // is one of the few mutate fields this server owns outright and can type.
     assert.ok(
-      validateArgs({ level: "catastrophic" }, mutate).length > 0,
+      validateArgs({ appliedLevel: "catastrophic" }, mutate).length > 0,
       "a value outside the declared enum must be rejected",
     );
+    assert.deepEqual(validateArgs({ appliedLevel: "hard" }, mutate), []);
+    // `level` comes back from the gate but shares a name a plugin might use, so
+    // it is deliberately untyped. Asserting that keeps the reasoning visible.
+    assert.deepEqual(validateArgs({ level: "anything at all" }, mutate), []);
   });
 
   test("a plugin returning a non-object still produces valid structuredContent", async () => {

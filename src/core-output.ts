@@ -81,13 +81,18 @@ export const CORE_OUTPUT_SCHEMAS: Record<string, JsonSchema> = {
   mutate: objectResult({
     applied: {},
     results: {},
+    // Always set by handleMutate on the success path, so they can be typed.
     lint: { type: "array" },
     appliedLevel: { type: "string", enum: ["none", "soft", "hard", "nuclear"] },
-    level: { type: "string", enum: ["none", "soft", "hard", "nuclear"] },
-    summary: { type: "string" },
-    detail: { type: "array" },
-    uncertain: { type: "boolean" },
-    retry_with: { type: "object" },
+    // The gate's own fields. They are server-written on the REFUSAL path, but
+    // this same schema also validates a plugin's success object, and a plugin
+    // that happens to use one of these names with a different shape would have
+    // its result rejected at the client over something we do not control.
+    level: {},
+    summary: {},
+    detail: {},
+    uncertain: {},
+    retry_with: {},
   }),
 
   /** Whatever the Luau returned, under one known wrapper field. */

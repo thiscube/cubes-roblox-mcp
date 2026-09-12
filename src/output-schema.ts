@@ -80,7 +80,7 @@ export const MUTATE_RESULT: JsonSchema = objectResult({
   results: {},
   lint: { type: "array" },
   appliedLevel: { type: "string", enum: ["none", "soft", "hard", "nuclear"] },
-  level: { type: "string", enum: ["none", "soft", "hard", "nuclear"] },
-  summary: { type: "string" },
-  retry_with: { type: "object" },
+  level: {},
+  summary: {},
+  retry_with: {},
 });
