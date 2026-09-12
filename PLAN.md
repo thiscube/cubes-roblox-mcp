@@ -15,14 +15,15 @@ Sizes: **S** = an afternoon. **M** = a day or two. **L** = a week or more.
 
 > ## Status: done, except what the engine and the missing plugin forbid
 >
-> **Part 1 and 12 of the 15 gaps are closed.** 258 tests, 47 suites, all running
+> **Part 1 and 12 of the 15 gaps are closed.** 303 tests, 51 suites, all running
 > with no Studio, no port, no plugin and no network.
 >
 > | | |
 > |---|---|
 > | Landed whole | 3 npm packaging · 4 docs tools · 5 output schemas · 6 catalog budget · 7 assets · 13 read-only build · 14 WebSocket · 15 SECURITY + config |
 > | Landed server-side, plugin half documented | 1 Studio screenshot · 8 perf and scene analysis · 9 non-pausing breakpoints · 11 multi-instance |
-> | Blocked, with evidence | 2 plugin source (not in this repo, and not obtainable from it) · 10 input simulation (every `VirtualInputManager` method is `RobloxScriptSecurity`) |
+> | Blocked, with evidence | 2 plugin source (not in this repo, and not obtainable from it) |
+> | Reopened and partly built | 10 input and movement — `character_goto` landed; real input needs the PlayClient relay, which needs the plugin |
 > | Ongoing by design | 12 test depth |
 >
 > **Two of the plan's own instructions turned out to be wrong**, and both are
@@ -31,6 +32,13 @@ Sizes: **S** = an afternoon. **M** = a day or two. **L** = a week or more.
 > as "needs a plugin handler", then as "unreachable at any security a plugin has" —
 > `VirtualInputManager` is indeed closed, but `UserInputService:CreateVirtualInput()`
 > is not, and it drives the real input pipeline. Item 10 is open work, not a dead end.
+>
+> **A third correction, and the one that explains the other two.** Every "X is not in
+> the API dump, therefore X does not exist" claim this document made was an artefact of
+> reading a *frozen* dump: 682 classes where the live Studio build has 916, missing
+> `StudioTestService`, `PluginConnectionService`, `VirtualInput` and
+> `StudioCaptureService`. A thin dump does not fail — it answers "no such class", which
+> reads like an answer. Fixed in `b46c6f2`; see item 4.
 >
 > **Five rounds of independent verification found 38 defects**, every one
 > reproduced before it was fixed. The two worth naming are opposites: a
