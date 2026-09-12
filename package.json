@@ -11,15 +11,15 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "test": "npm run build && node --test \"test/unit/*.test.mjs\"",
-    "test:unit": "node --test \"test/unit/*.test.mjs\"",
+    "test": "npm run build && node test/run.mjs",
+    "test:unit": "node test/run.mjs",
     "test:e2e": "node test/harness.mjs",
     "test:repl": "node test/harness.mjs --interactive",
     "bench": "node test/bench/tool-churn.mjs && node test/bench/poll-latency.mjs",
     "install-plugin": "node dist/index.js --install-plugin",
-    "prepublishOnly": "npm run build && node --test \"test/unit/*.test.mjs\"",
+    "prepublishOnly": "npm run build && node test/run.mjs",
     "prepare": "npm run build",
-    "ci": "npx tsc --noEmit && npm run build && CUBES_MCP_OFFLINE=1 node --test \"test/unit/*.test.mjs\""
+    "ci": "npx tsc --noEmit && npm run build && CUBES_MCP_OFFLINE=1 node test/run.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",

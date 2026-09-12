@@ -192,8 +192,11 @@ if #children == 0 then
 end
 
 ${beginUndo("Cubes MCP: asset_insert")}
-local inserted, err = nil, nil
-local ok = pcall(function()
+local inserted = nil
+local positionedCount = 0
+-- "local ok = pcall(...)" discarded the error, so every insert_failed reported
+-- message = "nil" — the one field that exists to explain the failure.
+local ok, err = pcall(function()
   for _, child in ipairs(children) do
     child.Parent = parent
     inserted = inserted or child
@@ -208,6 +211,7 @@ local ok = pcall(function()
     local anchor = nil
     for _, child in ipairs(children) do
       if child:IsA("PVInstance") then
+        positionedCount += 1
         if not anchor then
           anchor = child:GetPivot()
           child:PivotTo(target)
@@ -224,11 +228,15 @@ if not ok then ${cancelUndo} pcall(function() container:Destroy() end) return { 
 ${endUndo}
 pcall(function() container:Destroy() end)
 
+-- "inserted" is the first child of any class; "positioned" counts the ones that
+-- could actually be moved. With a Folder+Part asset those differ, and
+-- reporting only the first made the response read as if they were the same.
 return {
   ok = true,
   assetId = id,
   inserted = inserted and __MCP.refFor(inserted) or nil,
   path = inserted and inserted:GetFullName() or nil,
+  positioned = positionedCount,
   count = #children,
   stripped = stripped,
 }

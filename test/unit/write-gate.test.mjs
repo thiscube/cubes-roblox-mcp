@@ -215,52 +215,104 @@ describe("write gate: behaviour, not labels", () => {
     assert.deepEqual(offenders, [], `hand-set channels: ${offenders.join(", ")}`);
   });
 
-  test("a tool that touches disk or network has to declare it", async () => {
-    // The earlier version scanned four identifiers inside a tool's own body. It
-    // could not see one call deep and had no pattern for fetch, so it passed
-    // while every docs_* tool wrote 1.4 MB into the user's state directory and
-    // asset_upload read arbitrary files off the machine.
+  test("only named modules may reach outside the process at all", async () => {
+    // This is the half that generalises, and it is an ALLOWLIST of modules
+    // rather than a denylist of identifiers. The previous version matched
+    // eleven function names inside one directory, which meant a helper exported
+    // from src/ under any other name was invisible — and that is exactly the
+    // shape asset_upload had. Verification evaded it seven ways out of ten.
     //
-    // One call deep is what it needs, and no more: resolve the file's own
-    // helpers first (a local function whose body reaches outside is itself
-    // outward-reaching), then scan each tool block for either. A file-level
-    // scan was the other option and it over-fires — session.ts holds one tool
-    // that persists and five that do not.
-    const REACHES = {
-      state: /\b(saveProfile|writeFile|appendFile|mkdir)\s*\(/,
-      network: /\b(fetch|getJson|getApiDocs|searchAssets|assetDetails|assetThumbnails|uploadAsset)\s*\(/,
-    };
+    // So: node:fs, node:child_process and the HTTP modules may only be imported
+    // by modules that exist to do that. Every other file in src/ reaches the
+    // outside world through one of these or not at all.
+    const OUTWARD_MODULES = /from "node:(fs|fs\/promises|child_process|http|https|net|dgram|dns)"/;
+    const ALLOWED = new Set([
+      "assets.ts", // Roblox HTTP + the upload read
+      "bridge.ts", // the HTTP listener itself
+      "docs.ts", // the API dump fetch + cache
+      "install-plugin.ts", // copies the plugin into Studio's folder
+      "lint.ts", // spawns selene
+      "profile.ts", // per-place profiles
+      "sourcemap.ts", // reads sourcemap.json
+      "vision.ts", // spawns the capture tool, writes a temp PNG
+    ]);
 
-    /** Local helpers in this file that reach outside, so a call to one counts. */
-    function outwardHelpers(text, kind) {
-      const names = new Set();
-      const decl = /(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*(?::[^{]+)?\{/g;
-      for (const m of text.matchAll(decl)) {
-        // Take the body up to the next top-level declaration; good enough to
-        // tell "this helper reaches out" from "this one does not".
-        const from = m.index + m[0].length;
-        const next = text.indexOf("\nfunction ", from);
-        const body = text.slice(from, next < 0 ? from + 2000 : next);
-        if (REACHES[kind].test(body)) names.add(m[1]);
+    const srcFiles = [];
+    for (const dir of [SRC, join(SRC, "tools")]) {
+      for (const f of (await readdir(dir)).filter((n) => n.endsWith(".ts"))) {
+        srcFiles.push({ name: f, path: join(dir, f) });
       }
-      return names;
     }
+    const unexpected = [];
+    for (const { name, path } of srcFiles) {
+      const text = await readFile(path, "utf8");
+      if (!OUTWARD_MODULES.test(text)) continue;
+      if (!ALLOWED.has(name)) unexpected.push(name);
+    }
+    assert.deepEqual(
+      unexpected,
+      [],
+      `these reach outside the process and are not on the allowlist: ${unexpected.join(", ")}. ` +
+        `Route it through one of the named modules, or add it here with a reason.`,
+    );
 
+    // And the allowlist must not rot: an entry that no longer reaches out is a
+    // permission nobody is using.
+    const stale = [];
+    for (const name of ALLOWED) {
+      const match = srcFiles.find((f) => f.name === name);
+      if (!match) {
+        stale.push(`${name} (no such file)`);
+        continue;
+      }
+      if (!OUTWARD_MODULES.test(await readFile(match.path, "utf8"))) stale.push(name);
+    }
+    assert.deepEqual(stale, [], `stale allowlist entries: ${stale.join(", ")}`);
+  });
+
+  test("a tool whose file imports an outward module has to declare an effect", async () => {
+    // The second half: given the allowlist above, a tool file that imports one
+    // of those modules is reaching outside, whatever it calls it. Import edges,
+    // not function names — so a new export from src/assets.ts is covered the
+    // moment it is imported, without anyone remembering to add its name.
+    const EFFECT_MODULES = {
+      "../assets.js": "network",
+      "../docs.js": "network",
+      "../profile.js": "state",
+      "../vision.js": "process",
+      "../lint.js": "process",
+      "../install-plugin.js": "state",
+    };
     const dir = join(SRC, "tools");
     const offenders = [];
     for (const file of (await readdir(dir)).filter((f) => f.endsWith(".ts"))) {
       const text = await readFile(join(dir, file), "utf8");
-      for (const kind of ["state", "network"]) {
-        const helpers = outwardHelpers(text, kind);
-        const helperCall = helpers.size > 0 ? new RegExp(`\\b(${[...helpers].join("|")})\\s*\\(`) : null;
-        for (const { name, body } of toolBlocks(text)) {
-          const entry = ALL_TOOLS.find((t) => t.name === name);
-          if (!entry) continue;
-          const reaches = REACHES[kind].test(body) || (helperCall !== null && helperCall.test(body));
-          if (!reaches) continue;
-          const cap = capabilities(entry);
-          const declared = kind === "state" ? cap.writesDisk : cap.network !== "none";
-          if (!declared) offenders.push(`${file}: ${name} reaches ${kind} but declares nothing`);
+      const reaching = Object.entries(EFFECT_MODULES).filter(([mod]) => text.includes(`from "${mod}"`));
+      if (reaching.length === 0) continue;
+      // Which tools in this file actually call into it. Fall back to "all of
+      // them" only when the file has one tool, where there is no ambiguity.
+      const blocks = toolBlocks(text);
+      for (const { name, body } of blocks) {
+        const entry = ALL_TOOLS.find((t) => t.name === name);
+        if (!entry) continue;
+        const cap = capabilities(entry);
+        const declares =
+          cap.writesDisk !== false || cap.network !== "none" || cap.spawnsProcess;
+        // A tool that plainly does not use the import is fine: an eval template
+        // in the same file as a network call reaches nothing.
+        const usesIt = reaching.some(([mod]) => {
+          const symbols = new RegExp(
+            `import\\s*\\{([^}]+)\\}\\s*from\\s*"${mod.replace(/[.*+?^$()|[\]\\]/g, "\\$&")}"`,
+          ).exec(text);
+          if (!symbols) return false;
+          return symbols[1]
+            .split(",")
+            .map((s) => s.trim().split(/\s+as\s+/).pop().trim())
+            .filter((s) => s && !s.startsWith("type "))
+            .some((s) => new RegExp(`\\b${s}\\s*\\(`).test(body));
+        });
+        if (usesIt && !declares) {
+          offenders.push(`${file}: ${name} calls into an outward module and declares no effect`);
         }
       }
     }
@@ -268,12 +320,14 @@ describe("write gate: behaviour, not labels", () => {
   });
 
   test("that scan sees the tools it is meant to police", async () => {
-    // If the helper resolution silently matched nothing, the test above would
-    // pass vacuously — which is exactly how the version before it passed.
-    const { capabilities: cap } = await import("../../dist/registry.js");
-    const declared = ALL_TOOLS.filter((t) => cap(t).writesDisk || cap(t).network !== "none").map((t) => t.name);
+    // If the import resolution silently matched nothing, the test above would
+    // pass vacuously — which is how the version before it passed.
+    const declared = ALL_TOOLS.filter((t) => {
+      const c = capabilities(t);
+      return c.writesDisk !== false || c.network !== "none" || c.spawnsProcess;
+    }).map((t) => t.name);
     assert.ok(declared.includes("profile_update"), "the state case must be visible");
-    assert.ok(declared.includes("docs_class"), "the one-call-deep network case must be visible");
+    assert.ok(declared.includes("docs_class"), "the cache-plus-network case must be visible");
     assert.ok(declared.includes("asset_upload"), "the outward-write case must be visible");
     assert.ok(!declared.includes("asset_insert"), "an eval tool in the same file must NOT be swept up");
     assert.ok(!declared.includes("macro_save"), "nor a local tool beside one that persists");
@@ -298,18 +352,42 @@ describe("write gate: behaviour, not labels", () => {
       { method: "tools/list", params: {} },
       { signal: new AbortController().signal },
     );
+    const { INSPECTOR_EXEMPTIONS } = await import("../../dist/session.js");
     const listed = new Set(tools.map((t) => t.name));
-    const leaked = ALL_TOOLS.filter((t) => listed.has(t.name) && !capabilities(t).inspectorSafe);
+    const leaked = ALL_TOOLS.filter(
+      (t) => listed.has(t.name) && !capabilities(t).inspectorSafe && !INSPECTOR_EXEMPTIONS.includes(t.name),
+    );
     assert.deepEqual(
       leaked.map((t) => `${t.name} (${JSON.stringify(capabilities(t))})`),
       [],
-      "these can change the place, persist user data, or send bytes out",
+      "these can change the place, persist user data, spawn a process, or send bytes out",
     );
+
+    // The exemption list has to be exactly the tools that need one — no stale
+    // entries, and nothing exempt that derivation already allows.
+    const { screenshotTool } = await import("../../dist/vision.js");
+    const coreDefs = { screenshot: screenshotTool };
+    for (const name of INSPECTOR_EXEMPTIONS) {
+      const entry = ALL_TOOLS.find((t) => t.name === name) ?? coreDefs[name];
+      assert.ok(entry, `${name} is exempt but does not exist`);
+      assert.equal(
+        capabilities(entry).inspectorSafe,
+        false,
+        `${name} is on the exemption list but derivation already allows it — remove it`,
+      );
+      assert.ok(listed.has(name), `${name} is exempt but not actually in the build`);
+    }
     for (const t of ALL_TOOLS) {
       const cap = capabilities(t);
-      if (cap.write || cap.writesDisk || cap.network === "write") {
-        assert.equal(cap.inspectorSafe, false, `${t.name}: inspectorSafe disagrees with its effects`);
-      }
+      // `writesDisk: "cache"` is the one disk write that stays safe: the
+      // server's own copy of a public file, not the user's data. Anything else
+      // that leaves the process disqualifies.
+      const disqualifying = cap.write || cap.writesDisk === true || cap.network === "write" || cap.spawnsProcess;
+      assert.equal(
+        cap.inspectorSafe,
+        !disqualifying,
+        `${t.name}: inspectorSafe disagrees with its effects — ${JSON.stringify(cap)}`,
+      );
     }
   });
 

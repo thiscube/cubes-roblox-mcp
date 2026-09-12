@@ -100,14 +100,23 @@ export interface ToolEntry {
    * posts it to Roblox, shipped in the build whose whole promise is that it
    * cannot touch anything.
    *
-   *   state             persists data the user would miss, under CUBES_MCP_HOME.
-   *   network: "read"   fetches; a cache write under the state dir counts here,
-   *                     because server infrastructure is not the user's data.
-   *   network: "write"  sends the user's bytes somewhere they cannot be recalled.
+   *   state: true      persists data the user would miss, under CUBES_MCP_HOME.
+   *   state: "cache"   writes only the server's own cache of a public file. Still
+   *                    a disk write, and it has to be declared as one — the
+   *                    docs tools were saying `network: "read"` and writing
+   *                    1.4 MB, which makes the whole field a lie to the next
+   *                    reader. Inspector-safe, because a cache of a public API
+   *                    dump is infrastructure and an inspector without
+   *                    documentation is not worth shipping.
+   *   network: "read"  fetches. Not nothing: a search sends the model's query
+   *                    out. Inspector-safe because nothing is created remotely.
+   *   network: "write" sends the user's bytes somewhere they cannot be recalled.
+   *   process: true    spawns a binary. The widest blast radius of the three,
+   *                    and it had nowhere to be declared at all until this line.
    *
-   * The read-only build drops anything with `state` or `network: "write"`.
+   * The read-only build drops `state: true`, `network: "write"` and `process`.
    */
-  effects?: { state?: true; network?: "read" | "write" };
+  effects?: { state?: true | "cache"; network?: "read" | "write"; process?: true };
   /**
    * Undo policy, for a tool whose Luau changes the DataModel.
    *
@@ -176,10 +185,12 @@ export interface Capability {
   write: boolean;
   /** Touches the DataModel at all (false for server-local tools). */
   touchesStudio: boolean;
-  /** Persists data the user would miss, under CUBES_MCP_HOME. */
-  writesDisk: boolean;
+  /** Writes under CUBES_MCP_HOME. "cache" is the server's own copy of a public file. */
+  writesDisk: false | true | "cache";
   /** Makes outbound requests. "write" means it sends the user's bytes out. */
   network: "none" | "read" | "write";
+  /** Spawns a binary. */
+  spawnsProcess: boolean;
   /**
    * Belongs in a read-only build.
    *
@@ -199,9 +210,13 @@ export interface Capability {
 export function capabilities(
   entry: Pick<ToolEntry, "channel" | "readOnly" | "effects">,
 ): Capability {
-  const writesDisk = entry.effects?.state === true;
+  const writesDisk = entry.effects?.state ?? false;
   const network = entry.effects?.network ?? "none";
-  const safe = (write: boolean) => !write && !writesDisk && network !== "write";
+  const spawnsProcess = entry.effects?.process === true;
+  // A cache of a public file is infrastructure, so it does not disqualify a tool
+  // from the inspector build. Everything else that leaves the process does.
+  const safe = (write: boolean) =>
+    !write && writesDisk !== true && network !== "write" && !spawnsProcess;
   const touchesStudio = entry.channel !== "local";
   if (!touchesStudio) {
     return {
@@ -210,6 +225,7 @@ export function capabilities(
       transient: false,
       writesDisk,
       network,
+      spawnsProcess,
       inspectorSafe: safe(false),
     };
   }
@@ -228,6 +244,7 @@ export function capabilities(
     transient: entry.readOnly === "transient",
     writesDisk,
     network,
+    spawnsProcess,
     inspectorSafe: safe(write),
   };
 }
@@ -392,8 +409,8 @@ interface ToolMeta {
   yieldBudgetMs?: (args: any) => number;
   /** Declared result shape. Defaults to the channel's shape when omitted. */
   outputSchema?: JsonSchema;
-  /** See ToolEntry.effects. Declare it on any tool that touches disk or network. */
-  effects?: { state?: true; network?: "read" | "write" };
+  /** See ToolEntry.effects. Declare it on any tool that touches disk, network or a process. */
+  effects?: { state?: true | "cache"; network?: "read" | "write"; process?: true };
   /** See ToolEntry.undo. Only for mutating Luau that deliberately stays out of the undo stack. */
   undo?: "none";
 }

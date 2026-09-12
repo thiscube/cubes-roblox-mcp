@@ -82,11 +82,27 @@ be called by name, cannot be found by `search_tools`. `/rpc` refuses writes
 whatever the Studio panel says, and `send()` refuses them at the transport too.
 
 **Everything that reaches outside the process is filtered, not just Studio
-writes.** A tool can affect the world in exactly three ways — the DataModel, the
-disk, and the network — and the filter asks about all three. That was not always
-true, and both holes were real: `profile_update` shipped in this build and wrote
-a file in your home directory, and then `asset_upload` shipped in it too, a tool
-that read any file on the machine and posted it to Roblox.
+writes.** A tool can affect the world in four ways — the DataModel, the disk,
+the network, and spawning a binary — and the filter asks about all four. That
+was not always true, and the holes were real: `profile_update` shipped in this
+build and wrote a file in your home directory, and then `asset_upload` shipped
+in it too, a tool that read any file on the machine and posted it to Roblox.
+
+Two things it still does, both deliberate and both named in the code rather than
+implied by an omission:
+
+- **`screenshot` is exempt**, because seeing the place is what an inspector is
+  for. Its Studio path spawns nothing; the OS fallback spawns your platform's
+  capture tool. The exemption is one named constant (`INSPECTOR_EXEMPTIONS`) and
+  a test asserts nothing else is on it.
+- **The `docs_*` tools fetch the Roblox API dump and cache it.** That is an
+  outbound request and a 1.4 MB disk write, declared as both. It stays because a
+  cache of a public file is the server's own infrastructure, not your data, and
+  an inspector without documentation is not worth shipping. `CUBES_MCP_OFFLINE=1`
+  stops it.
+
+`asset_search` also sends its query terms to Roblox. Nothing about your place
+goes with them, but a search is still something you typed.
 
 `asset_upload` is now confined to the project directory, checks the extension,
 caps the size, and asks you directly every time the client can ask — `confirm:

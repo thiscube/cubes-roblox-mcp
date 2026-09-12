@@ -19,6 +19,21 @@ export const CORE_TOOLS = ["search_tools", "read", "screenshot", "mutate", "run_
  */
 export const READ_ONLY_CORE_TOOLS = ["search_tools", "read", "screenshot"] as const;
 
+/**
+ * The one thing in a read-only build that is not inspector-safe by derivation.
+ *
+ * `screenshot` falls back to spawning the host's capture binary and writing a
+ * PNG to the temp directory, which `capabilities()` correctly calls an outward
+ * effect. It is here anyway, and deliberately: seeing the place IS what an
+ * inspector build is for, and the alternative is an inspector that cannot look
+ * at anything. The Studio path it prefers spawns nothing at all.
+ *
+ * Named rather than implied, so the exemption is one line somebody can argue
+ * with instead of an omission nobody notices. A test asserts this list is the
+ * complete set of exemptions.
+ */
+export const INSPECTOR_EXEMPTIONS: readonly string[] = ["screenshot"];
+
 export interface UnlockResult {
   /** Everything in tools/list after the unlock, core first. */
   visible: string[];

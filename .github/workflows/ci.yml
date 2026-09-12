@@ -30,7 +30,7 @@ jobs:
         run: npm run build
 
       - name: Unit tests
-        run: npm run test:unit
+        run: npm run test:unit   # test/run.mjs — never a glob, see that file
         env:
           # Unit tests answer API-reference questions from a fixture. This makes a
           # stray network read fail the build instead of passing quietly on CI's

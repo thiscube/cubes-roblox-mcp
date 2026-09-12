@@ -315,6 +315,13 @@ export const screenshotTool: ToolEntry = {
   channel: "dispatch",
   pluginCommand: STUDIO_CAPTURE_COMMAND,
   readOnly: true,
+  // The OS fallback spawns powershell / screencapture / gnome-screenshot and
+  // writes a PNG into the temp directory. There was nowhere to say so until
+  // `process` existed, and spawning a binary is the widest-reaching of the three
+  // effects a tool can have. `screenshot` is core, so a read-only build carries
+  // it either way — declaring it makes that a visible exemption rather than an
+  // omission nobody noticed.
+  effects: { process: true },
   description:
     "Capture a PNG inline so the agent can see the screen. Asks Studio for the framebuffer first (immune to windows covering Studio), falls back to an OS capture. Regions: 'viewport' (default, the 3D area), 'studio', 'full' (your whole monitor).",
   inputSchema: {

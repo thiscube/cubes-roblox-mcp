@@ -54,7 +54,18 @@ describe("npm package metadata", () => {
 
   test("publishing runs the build and the tests first", () => {
     assert.match(pkg.scripts.prepublishOnly, /build/);
-    assert.match(pkg.scripts.prepublishOnly, /--test/);
+    assert.match(pkg.scripts.prepublishOnly, /test\/run\.mjs/);
+  });
+
+  test("every script that runs tests goes through the portable runner", () => {
+    // `node --test "test/unit/*.test.mjs"` is expanded by Node 22 and not by
+    // Node 20, so CI's Node 20 job failed on every push while `npm test` was
+    // green locally. Unquoting it would fix Linux and break Windows, where npm
+    // runs scripts through cmd.
+    for (const name of ["test", "test:unit", "ci", "prepublishOnly"]) {
+      assert.match(pkg.scripts[name], /test\/run\.mjs/, `${name} must use the runner`);
+      assert.doesNotMatch(pkg.scripts[name], /\*\.test\.mjs/, `${name} still passes a glob to node`);
+    }
   });
 });
 

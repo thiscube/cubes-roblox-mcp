@@ -115,10 +115,18 @@ local heavy = {}
 -- Yield periodically. Declaring a 20s budget makes the TIMEOUT survivable; it
 -- does nothing about Studio's main thread being held for the whole of it. A
 -- 200k-instance Workspace would freeze the editor solid without this.
+-- Guarded: this eval may run in a context that cannot yield (a BindableFunction
+-- invocation, a property-changed handler), where task.wait() errors outright
+-- with "attempt to yield across a C-call boundary". The plugin is not in this
+-- repo, so the safe assumption is that it might.
+local canYield = coroutine.isyieldable()
 local since = 0
 for _, d in ipairs(root:GetDescendants()) do
   since += 1
-  if since >= 5000 then since = 0 task.wait() end
+  if since >= 5000 then
+    since = 0
+    if canYield then task.wait() end
+  end
   total += 1
   byClass[d.ClassName] = (byClass[d.ClassName] or 0) + 1
   if d:IsA("BasePart") then
