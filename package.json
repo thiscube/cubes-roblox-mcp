@@ -1,11 +1,11 @@
 {
   "name": "cubes-roblox-mcp",
   "version": "0.2.0",
-  "private": true,
   "type": "module",
-  "description": "A next-gen MCP server for Roblox Studio — cheap calls, smart server, full Studio surface.",
+  "description": "An MCP server for Roblox Studio: progressive tool disclosure, a derived write gate, and the engine API reference built in.",
   "bin": {
-    "cubes-roblox-mcp": "dist/index.js"
+    "cubes-roblox-mcp": "dist/index.js",
+    "cubes-roblox-mcp-inspector": "dist/inspector.js"
   },
   "scripts": {
     "build": "tsc",
@@ -14,7 +14,11 @@
     "test": "npm run build && node --test \"test/unit/*.test.mjs\"",
     "test:unit": "node --test \"test/unit/*.test.mjs\"",
     "test:e2e": "node test/harness.mjs",
-    "test:repl": "node test/harness.mjs --interactive"
+    "test:repl": "node test/harness.mjs --interactive",
+    "bench": "node test/bench/tool-churn.mjs && node test/bench/poll-latency.mjs",
+    "install-plugin": "node dist/index.js --install-plugin",
+    "prepublishOnly": "npm run build && node --test \"test/unit/*.test.mjs\"",
+    "prepare": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
@@ -29,5 +33,34 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thiscube/cubes-roblox-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/thiscube/cubes-roblox-mcp/issues"
+  },
+  "homepage": "https://github.com/thiscube/cubes-roblox-mcp#readme",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "roblox",
+    "roblox-studio",
+    "luau",
+    "claude"
+  ],
+  "files": [
+    "dist",
+    "plugin",
+    "docs",
+    "README.md",
+    "SECURITY.md",
+    "CLAUDE.md",
+    "PLAN.md"
+  ],
+  "publishConfig": {
+    "access": "public"
   }
 }

@@ -118,6 +118,8 @@ export class StudioBridge implements StudioTransport {
   private wss?: WebSocketServer;
   private _writeEnabled = false;
   private lastHandshake: { protocol: number | null; ok: boolean; at: number } | null = null;
+  /** Last protocol we complained about, so a polling plugin doesn't spam stderr. */
+  private warnedProtocol: number | null | undefined;
   private httpServer?: Server;
   readonly token: string;
   readonly tokenGenerated: boolean;
@@ -341,6 +343,29 @@ export class StudioBridge implements StudioTransport {
     this.queue.push(cmd);
   }
 
+  /**
+   * Say it out loud, once per distinct version.
+   *
+   * A mismatched plugin polls every few seconds, so this cannot log every time —
+   * but it also cannot stay silent. Without it the only symptom is every tool
+   * call failing with `studio_not_connected`, which sends people looking at
+   * ports and firewalls instead of at the plugin they need to rebuild.
+   */
+  private noteHandshake(got: number | null, ok: boolean): void {
+    this.lastHandshake = { protocol: got, ok, at: Date.now() };
+    if (ok) {
+      this.warnedProtocol = undefined;
+      return;
+    }
+    if (this.warnedProtocol === got) return;
+    this.warnedProtocol = got;
+    process.stderr.write(
+      `[cubes-mcp] PROTOCOL MISMATCH: the Studio plugin reports protocol ${got ?? "none"}, ` +
+        `this server speaks ${MIN_PROTOCOL_VERSION}-${MAX_PROTOCOL_VERSION}. ` +
+        `Every tool call will fail until the plugin is rebuilt and Studio restarted.\n`,
+    );
+  }
+
   private markCancelled(id: string): void {
     this.cancelled.set(id, true);
     while (this.cancelled.size > CANCELLED_MAX) {
@@ -420,7 +445,7 @@ export class StudioBridge implements StudioTransport {
       case "hello": {
         const got: number | null = typeof msg.protocol === "number" ? msg.protocol : null;
         const ok = got !== null && protocolSupported(got);
-        this.lastHandshake = { protocol: got, ok, at: Date.now() };
+        this.noteHandshake(got, ok);
         if (!ok) {
           // Same answer as the 426 on /poll: rebuild the plugin.
           ws.send(
@@ -604,7 +629,7 @@ export class StudioBridge implements StudioTransport {
     }
     const got: number | null = typeof body.value?.protocol === "number" ? body.value.protocol : null;
     const ok = got !== null && protocolSupported(got);
-    this.lastHandshake = { protocol: got, ok, at: Date.now() };
+    this.noteHandshake(got, ok);
     if (!ok) {
       res.statusCode = 426;
       res.setHeader("content-type", "application/json");

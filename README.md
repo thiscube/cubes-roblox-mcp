@@ -108,21 +108,46 @@ starting a playtest unlocks `tune`, etc.).
 - **Node.js 18+**
 - **Roblox Studio**
 - **The CubesMCP Studio plugin** — the other half of the architecture diagram
-  above. The plugin is distributed separately from this repo. Drop the built
-  `.rbxm` into your local Studio plugins folder
-  (`%LOCALAPPDATA%\Roblox\Plugins` on Windows,
-  `~/Documents/Roblox/Plugins` on macOS) and restart Studio.
+  above, distributed separately from this repo. See the plugin note below.
 
-### 1 — Install + build the MCP server
+### 1 — Get the server
+
+Once published:
 
 ```bash
-git clone https://github.com/cubebented/cubes-roblox-mcp.git
+claude mcp add cubes-roblox -- npx -y cubes-roblox-mcp@latest
+```
+
+From source, which is what works today:
+
+```bash
+git clone https://github.com/thiscube/cubes-roblox-mcp.git
 cd cubes-roblox-mcp
 npm install
 npm run build
 ```
 
-### 2 — Register the server with an MCP client
+### 2 — Install the Studio plugin
+
+```bash
+npx cubes-roblox-mcp --install-plugin      # or: npm run install-plugin
+```
+
+This finds Studio's plugins folder for your platform and copies the model in.
+**Restart Studio afterwards** — plugins are cached at launch.
+
+It will currently tell you there is no plugin to install, because the plugin is
+not vendored in this repository yet. Build or download `CubesMCP.rbxm` and point
+the installer at it:
+
+```bash
+npx cubes-roblox-mcp --install-plugin --plugin ./CubesMCP.rbxm
+```
+
+Or copy it yourself into `%LOCALAPPDATA%\Roblox\Plugins` (Windows) or
+`~/Documents/Roblox/Plugins` (macOS).
+
+### 3 — Register the server with an MCP client
 
 For Claude Desktop, add to `claude_desktop_config.json`:
 
@@ -142,6 +167,19 @@ For Claude Code:
 ```bash
 claude mcp add cubes-roblox -- node "C:/path/to/cubes-roblox-mcp/dist/index.js"
 ```
+
+### A read-only install
+
+`cubes-roblox-mcp-inspector` is the same server with every write tool removed
+from the process — not gated, absent. Use it when a model should look at a place
+and not touch it.
+
+```bash
+claude mcp add cubes-roblox-ro -- node "C:/path/to/cubes-roblox-mcp/dist/inspector.js"
+```
+
+Configuration lives in [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md); the
+threat model is in [`SECURITY.md`](SECURITY.md).
 
 Then open a place in Studio, ensure the CubesMCP plugin is loaded (a "Cubes MCP"
 toolbar button appears), and you're connected. The plugin auto-connects to the
