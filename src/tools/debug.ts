@@ -461,3 +461,127 @@ return result
 `,
   ),
 ];
+
+/**
+ * Non-pausing breakpoints (PLAN.md #9).
+ *
+ * Checked against the API dump before writing a line of Luau: every member of
+ * `ScriptDebugger` and `DebuggerBreakpoint` is `Security: None`, and
+ * `DebuggerManager:AddDebugger` / `GetDebuggers` are too. So this needs no
+ * plugin change — only `EnableDebugging` is gated, and it is not needed to set a
+ * breakpoint on a script that is already being debugged.
+ *
+ * `ContinueExecution` is the whole point. A breakpoint that pauses the VM during
+ * a playtest is useless to an agent: nothing can answer the next tool call while
+ * Studio is stopped at a line. With it set, the breakpoint records the hit and
+ * carries on, which turns a breakpoint into a log line you did not have to edit
+ * the script to add.
+ */
+export const BREAKPOINT_TOOLS: ToolEntry[] = [
+  evalTool(
+    {
+      name: "breakpoint_set",
+      category: "debug",
+      subcategories: ["debugger", "inspect", "trace"],
+      keywords: ["breakpoint", "debug", "trace", "line", "hit", "watch", "log", "pause", "step"],
+      description:
+        "Set a breakpoint on a script line WITHOUT pausing the VM: it records the hit and execution continues. Optional condition and log expression. Turns a breakpoint into a log line you did not have to edit the script to add.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          target: { type: "string", description: "Ref or path of the script." },
+          line: { type: "number", description: "1-based line number." },
+          condition: { type: "string", description: "Luau expression; break only when true." },
+          logExpression: { type: "string", description: "Luau expression to record on each hit." },
+          pause: { type: "boolean", description: "Actually stop the VM. Default false." },
+        },
+        required: ["target", "line"],
+      },
+    },
+    (args) => `
+local a = __MCP.decode(${luaJson(args)})
+local inst = __MCP.resolve(a.target)
+if not inst then return { error = "not_found", target = a.target } end
+if not inst:IsA("LuaSourceContainer") then return { error = "not_a_script", class = inst.ClassName } end
+
+local manager = game:GetService("DebuggerManager")
+local debugger
+for _, d in ipairs(manager:GetDebuggers()) do
+  if d.Script == inst then debugger = d break end
+end
+if not debugger then
+  local ok, made = pcall(function() return manager:AddDebugger(inst) end)
+  if not ok or not made then
+    return { error = "debugger_unavailable", message = tostring(made), hint = "Script debugging may be disabled in this Studio build." }
+  end
+  debugger = made
+end
+
+local line = math.max(1, math.floor(tonumber(a.line) or 1))
+local okSet, bp = pcall(function() return debugger:SetBreakpoint(line, false) end)
+if not okSet or not bp then
+  return { error = "breakpoint_failed", line = line, message = tostring(bp) }
+end
+
+-- Continue by default. A breakpoint that stops the VM mid-playtest also stops
+-- the plugin answering, so the next tool call times out.
+bp.ContinueExecution = a.pause ~= true
+if a.condition then pcall(function() bp.Condition = a.condition end) end
+if a.logExpression then pcall(function() bp.LogExpression = a.logExpression end) end
+
+return {
+  ok = true,
+  script = inst:GetFullName(),
+  ref = __MCP.refFor(inst),
+  line = bp.Line,
+  pauses = not bp.ContinueExecution,
+  condition = bp.Condition ~= "" and bp.Condition or nil,
+}
+`,
+  ),
+
+  evalTool(
+    {
+      name: "breakpoint_list",
+      category: "debug",
+      subcategories: ["debugger", "inspect", "trace"],
+      keywords: ["breakpoint", "list", "debug", "debugger", "active", "show", "clear", "remove"],
+      description:
+        "List every active breakpoint across all debugged scripts, with line, condition and whether it pauses. Pass clear: true to remove them all instead. Read-only unless clearing.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          clear: { type: "boolean", description: "Remove every breakpoint instead of listing." },
+        },
+      },
+    },
+    (args) => `
+local a = __MCP.decode(${luaJson(args)})
+local manager = game:GetService("DebuggerManager")
+local out, removed = {}, 0
+
+for _, d in ipairs(manager:GetDebuggers()) do
+  local okBp, breakpoints = pcall(function() return d:GetBreakpoints() end)
+  if okBp and breakpoints then
+    for _, bp in ipairs(breakpoints) do
+      if a.clear == true then
+        pcall(function() bp:Destroy() end)
+        removed += 1
+      else
+        table.insert(out, {
+          script = d.Script and d.Script:GetFullName() or "?",
+          line = bp.Line,
+          enabled = bp.IsEnabled,
+          pauses = not bp.ContinueExecution,
+          condition = bp.Condition ~= "" and bp.Condition or nil,
+        })
+      end
+    end
+  end
+end
+
+if a.clear == true then return { ok = true, removed = removed } end
+return { breakpoints = out, count = #out }
+`,
+  ),
+];

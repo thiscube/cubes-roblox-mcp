@@ -28,10 +28,14 @@
  *   4 - additive: a WebSocket transport at /ws, as an alternative to long-poll.
  *       A plugin that does not open one keeps polling and nothing changes, so
  *       MIN stays 2.
+ *   5 - additive: `instanceId`, `placeId`, `placeName` and `role` on /poll and
+ *       on the WebSocket `hello`, so several Studio windows can share one
+ *       server. A plugin that sends none is filed under a single default id and
+ *       behaves exactly as before, so MIN stays 2.
  */
 
 /** Newest protocol this server speaks. Advertised in /health. */
-export const MAX_PROTOCOL_VERSION = 4;
+export const MAX_PROTOCOL_VERSION = 5;
 
 /** Oldest protocol this server still accepts. */
 export const MIN_PROTOCOL_VERSION = 2;

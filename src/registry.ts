@@ -42,6 +42,7 @@ export type Category =
   | "viewport"
   | "debug"
   | "docs"
+  | "perf"
   | "session";
 
 /** Everything a tool handler needs from the server. */
@@ -210,8 +211,9 @@ export function outputSchemaFor(entry: Pick<ToolEntry, "channel" | "outputSchema
 /** intent hint -> category clusters it biases toward. */
 const INTENT_CATEGORIES: Record<string, Category[]> = {
   building: ["instances", "physics", "terrain", "ui", "docs"],
-  debugging: ["scripts", "playtest", "debug", "docs"],
+  debugging: ["scripts", "playtest", "debug", "docs", "perf"],
   polishing: ["ui", "lighting", "audio", "animation"],
+  optimising: ["perf", "instances", "terrain"],
   reference: ["docs"],
 };
 

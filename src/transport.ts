@@ -14,11 +14,38 @@
 /** Which bridge channel a command travels down. Capability is derived from this. */
 export type Channel = "eval" | "mutate" | "dispatch" | "local";
 
+/**
+ * One connected Studio window (PLAN.md #11).
+ *
+ * Declared on the seam rather than in `bridge.ts` so a tool can read it without
+ * depending on the concrete HTTP bridge — the same reason everything else above
+ * this line depends on the interface.
+ */
+export interface StudioInstance {
+  /** Plugin-supplied, stable for the life of that Studio window. */
+  id: string;
+  placeId?: number;
+  placeName?: string;
+  /** What the plugin calls itself: "edit", "server", "client-1", ... */
+  role?: string;
+  transport: "websocket" | "long-poll";
+  writeEnabled: boolean;
+  lastSeen: number;
+  protocol: number | null;
+}
+
 export interface StudioTransport {
   /** Queue a command for Studio and await its result. Rejects with BridgeError. */
   send(tool: string, args: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
   /** True if something is currently polling us. */
   readonly connected: boolean;
+  /**
+   * Connected Studio windows, when the transport tracks them.
+   *
+   * Optional because a fake in a test does not have to, and because a second
+   * transport (Open Cloud) has no notion of a window at all.
+   */
+  listInstances?(): StudioInstance[];
   /** True only if connected AND the user has opted into writes. */
   readonly writeEnabled: boolean;
 }

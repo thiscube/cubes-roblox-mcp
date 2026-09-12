@@ -1,7 +1,7 @@
 import type { ToolEntry } from "../registry.js";
 import { INSTANCES_TOOLS } from "./instances.js";
 import { SCRIPTS_TOOLS } from "./scripts.js";
-import { DEBUG_TOOLS } from "./debug.js";
+import { BREAKPOINT_TOOLS, DEBUG_TOOLS } from "./debug.js";
 import { SESSION_TOOLS } from "./session.js";
 import { PLAYTEST_TOOLS } from "./playtest.js";
 import { VIEWPORT_TOOLS } from "./viewport.js";
@@ -13,6 +13,7 @@ import { PHYSICS_TOOLS } from "./physics.js";
 import { LIGHTING_TOOLS } from "./lighting.js";
 import { DOCS_TOOLS } from "./docs.js";
 import { ASSETS_TOOLS } from "./assets.js";
+import { PERF_TOOLS } from "./perf.js";
 
 /**
  * Every specialist tool, assembled from the per-category files.
@@ -26,6 +27,7 @@ export const ALL_TOOLS: ToolEntry[] = [
   ...INSTANCES_TOOLS,
   ...SCRIPTS_TOOLS,
   ...DEBUG_TOOLS,
+  ...BREAKPOINT_TOOLS,
   ...SESSION_TOOLS,
   ...PLAYTEST_TOOLS,
   ...VIEWPORT_TOOLS,
@@ -37,4 +39,5 @@ export const ALL_TOOLS: ToolEntry[] = [
   ...LIGHTING_TOOLS,
   ...DOCS_TOOLS,
   ...ASSETS_TOOLS,
+  ...PERF_TOOLS,
 ];

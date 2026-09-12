@@ -118,6 +118,32 @@ Do not expect this to be faster in any way you can feel. Measured on loopback
 noise next to Studio doing the work. The reason to implement it is that the
 plugin can push when nothing was asked of it, which long-poll cannot do.
 
+## Several Studio windows (protocol 5, optional)
+
+Add `instanceId`, and optionally `placeId`, `placeName` and `role`, to `/poll`
+and to the WebSocket `hello`:
+
+```json
+{ "protocol": 5, "writeEnabled": true,
+  "instanceId": "a-stable-id-for-this-window",
+  "placeId": 4242, "placeName": "Lobby", "role": "edit" }
+```
+
+`instanceId` must be stable for the life of that Studio window and different
+between windows. `role` is free text; `edit`, `server` and `client-N` are what
+the server's own output assumes.
+
+A plugin that sends none of this is filed under a single default id and behaves
+exactly as it always has — that is what makes protocol 5 additive.
+
+Routing, once ids are in play:
+
+- A command **addressed** to a window is only ever handed to that window. If it
+  is not connected, the command waits in the queue and eventually times out. It
+  is never diverted to a different window.
+- A command with **no** address goes to whoever polls first, which is what every
+  command did before this existed.
+
 ## The `__MCP` sandbox
 
 Generated Luau calls into a `__MCP` table the plugin injects. The declaration is

@@ -2,6 +2,7 @@ import { type ToolEntry, evalTool, localTool, luaJson, pipelineTool, readTool } 
 import { diffSnapshots } from "../snapshot-diff.js";
 import type { SnapshotInstance } from "../memory.js";
 import { applyPatch, loadProfile, saveProfile, type ProfilePatch } from "../profile.js";
+import { objectResult } from "../output-schema.js";
 
 /**
  * Server-side memory: profiles, macros, snapshots, undo.
@@ -11,6 +12,40 @@ import { applyPatch, loadProfile, saveProfile, type ProfilePatch } from "../prof
  */
 
 export const SESSION_TOOLS: ToolEntry[] = [
+  localTool(
+    {
+      name: "studio_instances",
+      category: "session",
+      subcategories: ["connection", "window", "place"],
+      keywords: ["instance", "window", "studio", "connected", "place", "which", "multi", "session", "target"],
+      description:
+        "List the Studio windows connected to this server: id, place, role, transport and whether writes are on for each. Use to find the id to target, or to check why a call went somewhere unexpected.",
+      inputSchema: { type: "object", properties: {} },
+      outputSchema: objectResult({
+        instances: { type: "array" },
+        count: { type: "number" },
+      }),
+    },
+    async (_args, ctx) => {
+      // Optional on the seam: a fake transport in a test has no windows, and a
+      // second transport (Open Cloud) has no notion of one at all.
+      const instances = ctx.bridge.listInstances?.() ?? [];
+      const now = Date.now();
+      return {
+        instances: instances.map((i) => ({
+          ...i,
+          secondsSinceSeen: Math.round((now - i.lastSeen) / 1000),
+        })),
+        count: instances.length,
+        ...(instances.length === 0
+          ? { hint: "No Studio window is connected. Open Studio with the Cubes MCP plugin active." }
+          : {}),
+        ...(instances.length > 1
+          ? { note: "Several windows are connected. Commands with no target go to whichever polls first." }
+          : {}),
+      };
+    },
+  ),
   localTool(
     {
       // Writes ~/.cubesmcp/profiles/{placeId}.json. "Local" is not "harmless",

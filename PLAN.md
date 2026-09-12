@@ -210,28 +210,35 @@ tools. `insert_asset` must strip scripts before parenting, same as theirs.
 
 **Done when:** the agent can find and place a tree it has never seen before.
 
-#### 8. Performance and memory analysis (**L**)
-
-**Now:** none.
+#### 8. Performance and memory analysis — PARTLY DONE
 
 **They:** `capture_micro_profiler` (bundles LibMP), `capture_script_profiler`,
 `get_memory_breakdown`, `get_scene_analysis`.
 
-**Do:** memory breakdown first, it is the cheapest and the most asked for. Profilers after.
+**Done:** `perf_stats` and `scene_analysis`. Every counter they need is
+`Security: None` in the API dump, so both are generated Luau with no plugin
+change. Checked against the dump rather than assumed.
 
-#### 9. Real debugging (**L**)
+**Still open:** the two profilers. `capture_micro_profiler` bundles LibMP into
+the plugin, and there is no `ScriptProfiler` class in the dump at all. Both are
+plugin-side work.
 
-**Now:** `tune` evaluates Luau in the running server DM, `debug_error` reads captured
-errors with source context. No breakpoints, no client context.
+#### 9. Real debugging — PARTLY DONE
 
 **They:** `breakpoints` records each hit without pausing the playtest.
 `eval_client_runtime` and `eval_server_runtime` run in live contexts sharing the game's
 `require` cache.
 
-**Do:** client-context eval first (smaller, and half the bugs are client-side anyway),
-then non-pausing breakpoints.
+**Done:** `breakpoint_set` and `breakpoint_list`. Every member of `ScriptDebugger`
+and `DebuggerBreakpoint` is `Security: None` in the dump, and
+`DebuggerManager:AddDebugger` is too, so this needed no plugin change.
+`ContinueExecution` is the important part: a breakpoint that pauses the VM during
+a playtest also stops the plugin answering, so the next tool call times out.
 
-#### 10. Input and device simulation (**M**)
+**Still open:** `eval_client_runtime`. It needs a client-context peer, which
+needs item 11 and the plugin half.
+
+#### 10. Input and device simulation — BLOCKED, and not for the reason I assumed
 
 **Now:** `character_walk`, `character_jump`, `character_teleport`. That puppeteers the
 humanoid, so it never touches the input stack and never catches an input bug.
@@ -239,7 +246,15 @@ humanoid, so it never touches the input stack and never catches an input bug.
 **They:** `simulate_mouse_input`, `simulate_keyboard_input`, `set_device_simulator`,
 `set_network_profile`, `capture_device_matrix`.
 
-**Do:** mouse and keyboard injection first, then the device simulator.
+**The blocker is the engine, not our plugin.** Every input method on
+`VirtualInputManager` — `SendKeyEvent`, `SendMouseButtonEvent`,
+`SendMouseMoveEvent`, `SendMouseWheelEvent`, all 26 members — is
+`RobloxScriptSecurity` in the API dump. No plugin can call them, and no amount of
+work on our side changes that. "Mouse and keyboard injection first" was wrong.
+
+If real input simulation matters, the route is `TestService` / the Studio test
+runner, not `VirtualInputManager`. Worth checking what their tools actually do
+before copying the design.
 
 #### 11. Multiple Studio windows (**L**)
 
@@ -249,8 +264,16 @@ better than the old permanent cache, but still single-target.
 **They:** `get_connected_instances`, role-suffixed instance ids, `multiplayerGroups`, and
 `manage_instance` to open and close Studio windows including older place revisions.
 
-**Do:** give each plugin connection an id, key the command queue by it, add an
-`instances` tool. Touches the bridge, so do it after the bridge is stable.
+**Done, server half.** Protocol 5 carries `instanceId`, `placeId`, `placeName`
+and `role` on `/poll` and on the WebSocket `hello`; the bridge tracks each window
+and the command queue is keyed by it. A command addressed to a window only ever
+goes to that window — if it is absent the command waits and times out rather than
+being diverted. `studio_instances` lists them, `/health` reports them.
+
+**Still open:** the plugin has to send a distinct `instanceId` per window, and
+`manage_instance` (opening and closing Studio windows) is plugin-side. A plugin
+that sends no id is filed under one default and behaves exactly as before, which
+is what makes protocol 5 additive.
 
 ### Tier 4: polish that makes it look finished
 

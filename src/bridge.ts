@@ -3,7 +3,7 @@ import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
 import { randomUUID, randomBytes, timingSafeEqual } from "node:crypto";
 import { MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, protocolSupported } from "./protocol.js";
-import { BridgeError, type StudioTransport } from "./transport.js";
+import { BridgeError, type StudioInstance, type StudioTransport } from "./transport.js";
 
 /**
  * The bridge between the MCP server (this process) and the Roblox Studio plugin.
@@ -48,7 +48,20 @@ export interface BridgeCommand {
   // native plugin tools dispatched from the plugin's Transport (playtest_*, event_*).
   tool: string;
   args: Record<string, unknown>;
+  /**
+   * Which Studio window this is for (PLAN.md #11). Undefined means "whoever
+   * asks first", which is what every command was before instances existed and
+   * what every command still is when only one plugin is connected.
+   */
+  target?: string;
 }
+
+/**
+ * A plugin that sends no instance id. Everything before protocol 5 is this, and
+ * so is every single-window session, so it is a real id rather than a special
+ * case threaded through the queue.
+ */
+const DEFAULT_INSTANCE = "studio";
 
 interface Pending {
   resolve: (value: unknown) => void;
@@ -57,7 +70,7 @@ interface Pending {
 }
 
 /** Returns true if it actually handed the command to a live socket. */
-type Waiter = (cmd: BridgeCommand | null) => boolean;
+type Waiter = ((cmd: BridgeCommand | null) => boolean) & { instance: string };
 
 /**
  * How long we hold a /poll request open before sending an empty 204 ("re-poll").
@@ -113,8 +126,18 @@ export class StudioBridge implements StudioTransport {
    */
   private readonly cancelled = new Map<string, true>();
   private lastSeen = 0;
+  /**
+   * Connected Studio windows, by id (PLAN.md #11).
+   *
+   * One entry for a normal session. The plugin half that reports distinct ids
+   * per window is not in this repo, so a plugin that sends none is recorded
+   * under a single default id and behaves exactly as it always has.
+   */
+  private readonly instances = new Map<string, StudioInstance>();
   /** The plugin's WebSocket, when it chose that transport. */
   private socket: WebSocket | null = null;
+  /** Which Studio window the socket belongs to. */
+  private socketInstance = DEFAULT_INSTANCE;
   private wss?: WebSocketServer;
   private _writeEnabled = false;
   private lastHandshake: { protocol: number | null; ok: boolean; at: number } | null = null;
@@ -206,6 +229,38 @@ export class StudioBridge implements StudioTransport {
     return this.queue.length;
   }
 
+  /** Every Studio window currently connected, most recently seen first. */
+  listInstances(): StudioInstance[] {
+    const alive = [...this.instances.values()].filter(
+      (i) => Date.now() - i.lastSeen < HEARTBEAT_WINDOW_MS || i.transport === "websocket",
+    );
+    return alive.sort((a, b) => b.lastSeen - a.lastSeen);
+  }
+
+  /** Record or refresh a connection. Returns the id it was filed under. */
+  private noteInstance(info: {
+    id?: unknown;
+    placeId?: unknown;
+    placeName?: unknown;
+    role?: unknown;
+    transport: "websocket" | "long-poll";
+    protocol: number | null;
+    writeEnabled: boolean;
+  }): string {
+    const id = typeof info.id === "string" && info.id.trim() ? info.id.trim().slice(0, 64) : DEFAULT_INSTANCE;
+    this.instances.set(id, {
+      id,
+      ...(typeof info.placeId === "number" ? { placeId: info.placeId } : {}),
+      ...(typeof info.placeName === "string" ? { placeName: info.placeName } : {}),
+      ...(typeof info.role === "string" ? { role: info.role } : {}),
+      transport: info.transport,
+      writeEnabled: info.writeEnabled,
+      lastSeen: Date.now(),
+      protocol: info.protocol,
+    });
+    return id;
+  }
+
   /**
    * The port actually bound, after `start()`.
    *
@@ -271,7 +326,12 @@ export class StudioBridge implements StudioTransport {
    * Queue a command for the Studio plugin and await its result.
    * Rejects fast with a structured BridgeError if the plugin isn't connected.
    */
-  send(tool: string, args: Record<string, unknown>, timeoutMs = 30_000): Promise<unknown> {
+  send(
+    tool: string,
+    args: Record<string, unknown>,
+    timeoutMs = 30_000,
+    target?: string,
+  ): Promise<unknown> {
     if (!this.connected) {
       const hs = this.lastHandshake;
       if (hs && !hs.ok) {
@@ -317,7 +377,7 @@ export class StudioBridge implements StudioTransport {
       );
     }
 
-    const cmd: BridgeCommand = { id: randomUUID(), tool, args };
+    const cmd: BridgeCommand = { id: randomUUID(), tool, args, ...(target ? { target } : {}) };
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(cmd.id);
@@ -339,7 +399,7 @@ export class StudioBridge implements StudioTransport {
    */
   private dispatch(cmd: BridgeCommand): void {
     // A live socket takes it immediately: no queue, no waiting for a poll.
-    if (this.socketOpen) {
+    if (this.socketOpen && (!cmd.target || cmd.target === this.socketInstance)) {
       try {
         this.socket?.send(
           JSON.stringify({ type: "command", id: cmd.id, tool: cmd.tool, args: cmd.args }),
@@ -350,9 +410,14 @@ export class StudioBridge implements StudioTransport {
         // through to the queue rather than dropping the command.
       }
     }
-    while (this.waiters.length > 0) {
-      const waiter = this.waiters.shift();
-      if (waiter && waiter(cmd)) return;
+    // Only hand it to a window it is addressed to. An untargeted command goes to
+    // whoever is parked, which is what every command did before instances.
+    for (let i = 0; i < this.waiters.length; i += 1) {
+      const waiter = this.waiters[i];
+      if (cmd.target && waiter.instance !== cmd.target) continue;
+      this.waiters.splice(i, 1);
+      if (waiter(cmd)) return;
+      i -= 1;
     }
     this.queue.push(cmd);
   }
@@ -431,6 +496,8 @@ export class StudioBridge implements StudioTransport {
     ws.on("close", () => {
       if (this.socket === ws) {
         this.socket = null;
+        this.instances.delete(this.socketInstance);
+        this.socketInstance = DEFAULT_INSTANCE;
         // Writes must never outlive the plugin that authorised them. Same rule
         // as a /poll that omits the field (AUDIT.md #24).
         this._writeEnabled = false;
@@ -475,7 +542,22 @@ export class StudioBridge implements StudioTransport {
           return;
         }
         this._writeEnabled = msg.writeEnabled === true;
-        ws.send(JSON.stringify({ type: "welcome", protocol: MAX_PROTOCOL_VERSION }));
+        this.socketInstance = this.noteInstance({
+          id: msg.instanceId,
+          placeId: msg.placeId,
+          placeName: msg.placeName,
+          role: msg.role,
+          transport: "websocket",
+          protocol: got,
+          writeEnabled: this._writeEnabled,
+        });
+        ws.send(
+          JSON.stringify({
+            type: "welcome",
+            protocol: MAX_PROTOCOL_VERSION,
+            instanceId: this.socketInstance,
+          }),
+        );
         // A socket that connects while commands are already queued should drain
         // them rather than wait for something new to happen.
         this.drainQueueToSocket();
@@ -500,7 +582,9 @@ export class StudioBridge implements StudioTransport {
 
   private drainQueueToSocket(): void {
     while (this.socketOpen && this.queue.length > 0) {
-      const cmd = this.queue.shift();
+      const idx = this.queue.findIndex((c) => !c.target || c.target === this.socketInstance);
+      if (idx < 0) break;
+      const [cmd] = this.queue.splice(idx, 1);
       if (!cmd) break;
       this.socket?.send(
         JSON.stringify({ type: "command", id: cmd.id, tool: cmd.tool, args: cmd.args }),
@@ -606,6 +690,7 @@ export class StudioBridge implements StudioTransport {
           ok: true,
           connected: this.connected,
           transport: this.transportKind,
+          instances: this.listInstances(),
           queued: this.queue.length,
           protocol: MAX_PROTOCOL_VERSION,
           protocolRange: [MIN_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION],
@@ -663,7 +748,16 @@ export class StudioBridge implements StudioTransport {
     // not inherit the previous session's toggle (AUDIT.md #24).
     this._writeEnabled = body.value?.writeEnabled === true;
     this.lastSeen = Date.now();
-    await this.holdPoll(res);
+    const instance = this.noteInstance({
+      id: body.value?.instanceId,
+      placeId: body.value?.placeId,
+      placeName: body.value?.placeName,
+      role: body.value?.role,
+      transport: "long-poll",
+      protocol: got,
+      writeEnabled: this._writeEnabled,
+    });
+    await this.holdPoll(res, instance);
   }
 
   private async routeResult(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -749,7 +843,7 @@ export class StudioBridge implements StudioTransport {
   }
 
   /** Long-poll: hand over a queued command immediately, or hold until one arrives. */
-  private holdPoll(res: ServerResponse): Promise<void> {
+  private holdPoll(res: ServerResponse, instance: string): Promise<void> {
     return new Promise((resolve) => {
       let settled = false;
       // Declared up front: the queued-command path below calls `waiter` (and so
@@ -764,7 +858,7 @@ export class StudioBridge implements StudioTransport {
         resolve();
       };
 
-      const waiter: Waiter = (cmd) => {
+      const waiter = ((cmd: BridgeCommand | null) => {
         if (settled) return false;
         // The socket may have died while parked. Report failure so the caller
         // re-dispatches instead of dropping the command (AUDIT.md #5).
@@ -781,11 +875,15 @@ export class StudioBridge implements StudioTransport {
           res.end();
         }
         return cmd !== null;
-      };
+      }) as Waiter;
+      waiter.instance = instance;
 
-      const queued = this.queue.shift();
-      if (queued) {
-        if (!waiter(queued)) this.queue.unshift(queued);
+      // Take the first queued command this window may run: its own, or one that
+      // never named a window. Anything addressed elsewhere stays put.
+      const idx = this.queue.findIndex((c) => !c.target || c.target === instance);
+      if (idx >= 0) {
+        const [queued] = this.queue.splice(idx, 1);
+        if (!waiter(queued)) this.queue.splice(idx, 0, queued);
         return;
       }
 
