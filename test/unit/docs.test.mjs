@@ -15,10 +15,11 @@ import {
   ApiDocs,
   getApiDocs,
   resolveStudioVersion,
+  fetchDump,
   __setApiDocsForTest,
   __setDocsFetchForTest,
 } from "../../dist/docs.js";
-import { DOCS_TOOLS } from "../../dist/tools/docs.js";
+import { DOCS_TOOLS, buildProvenance } from "../../dist/tools/docs.js";
 import { capabilities } from "../../dist/registry.js";
 import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { FAKE_DUMP, installFakeDump } from "./_fixtures.mjs";
@@ -525,10 +526,25 @@ describe("docs provenance never clobbers a tool's own keys", () => {
   });
 
   test("no provenance key collides with any key a docs tool sets", async () => {
-    // The general property. Drive every docs tool down a success and an error
-    // path with provenance OFF, collect every key each response owns, then
-    // assert the provenance key set is disjoint from it.
-    const PROVENANCE_KEYS = ["studio_version", "dump_age_hours", "dump_classes", "version_source", "dump_hint", "stale", "refresh_error"];
+    // Provenance is spread FIRST, so a tool's own key wins. That means a
+    // collision now shows up as a provenance value going MISSING from the
+    // response, which is something a test can actually see — the previous
+    // version of this compared a hand-typed key list and, per mutation testing,
+    // sailed straight past the very bug it was written for.
+    const status = {
+      studioVersion: "version-test",
+      versionSource: "legacy",
+      fetchedAt: Date.now(),
+      ageHours: 99,
+      stale: true,
+      refreshError: "boom",
+      classes: 1,
+      enums: 1,
+    };
+    const expected = buildProvenance(status);
+    assert.ok(Object.keys(expected).length >= 5, "the degraded case should emit every provenance key");
+    __setApiDocsForTest(ApiDocs.fromDump(FAKE_DUMP, status));
+
     const probes = [
       ["docs_class", { class: "Part" }],
       ["docs_class", { class: "NoSuchClassAnywhere" }],
@@ -539,18 +555,57 @@ describe("docs provenance never clobbers a tool's own keys", () => {
       ["docs_enum", { enum: "Material" }],
       ["docs_enum", { enum: "NoSuchEnum" }],
     ];
-    installFakeDump();
-    const owned = new Set();
     for (const [name, args] of probes) {
       const tool = DOCS_TOOLS.find((t) => t.name === name);
       if (!tool) continue;
       const res = await tool.handler(args, {});
-      // Provenance is off in this state except for the two always-on keys, so
-      // everything else present is a key the tool itself owns.
-      for (const k of Object.keys(res ?? {})) owned.add(k);
+      for (const [key, value] of Object.entries(expected)) {
+        assert.deepEqual(
+          res[key],
+          value,
+          `${name}(${JSON.stringify(args)}) overwrote provenance key "${key}" — ` +
+            `rename it, the way classes -> dump_classes and hint -> dump_hint were renamed`,
+        );
+      }
     }
-    const always = new Set(["studio_version", "dump_age_hours", "dump_classes"]);
-    const collisions = PROVENANCE_KEYS.filter((k) => owned.has(k) && !always.has(k));
-    assert.deepEqual(collisions, [], `provenance would overwrite tool-owned key(s): ${collisions.join(", ")}`);
+  });
+});
+
+describe("dump fetch fallback", () => {
+  const CHANNEL = "https://clientsettingscdn.roblox.com/v2/client-version/WindowsStudio64";
+  const LEGACY = "https://setup.rbxcdn.com/versionQTStudio";
+  const reply = (body) => ({ ok: true, status: 200, text: async () => body });
+
+  afterEach(() => __setDocsFetchForTest(null));
+
+  test("a dump 404 after a clean resolve falls back instead of failing outright", async () => {
+    // Real window: during a deploy the channel endpoint advertises a build whose
+    // dump has not been published yet. On a cold cache that used to be fatal.
+    const big = JSON.stringify({ Version: 1, Classes: [{ Name: "Part", Superclass: "Instance", Members: [] }], Enums: [] });
+    const pad = " ".repeat(600_000);
+    __setDocsFetchForTest(async (url) => {
+      if (url === CHANNEL) return reply(JSON.stringify({ clientVersionUpload: "version-aaaabbbb" }));
+      if (url === LEGACY) return reply("version-ccccdddd");
+      if (url.includes("version-aaaabbbb")) return { ok: false, status: 404, text: async () => "" };
+      return reply(big.slice(0, -1) + "," + '"_pad":"' + pad + '"}');
+    });
+    const res = await fetchDump(5_000);
+    assert.equal(res.versionSource, "legacy");
+    assert.equal(res.studioVersion, "version-ccccdddd");
+  });
+
+  test("when both routes fail the error names the live build, not just the fallback", async () => {
+    __setDocsFetchForTest(async (url) => {
+      if (url === CHANNEL) return reply(JSON.stringify({ clientVersionUpload: "version-aaaabbbb" }));
+      return { ok: false, status: 500, text: async () => "" };
+    });
+    await assert.rejects(
+      () => fetchDump(5_000),
+      (err) => {
+        assert.match(err.message, /version-aaaabbbb/, "the actionable half is which live dump is missing");
+        assert.match(err.message, /fallback also failed/);
+        return true;
+      },
+    );
   });
 });

@@ -1,5 +1,5 @@
 import { type ToolEntry, evalTool, localTool, luaJson } from "../registry.js";
-import { getApiDocs, type ApiMember, type ResolvedMember } from "../docs.js";
+import { getApiDocs, type ApiMember, type DocsStatus, type ResolvedMember } from "../docs.js";
 import { objectResult } from "../output-schema.js";
 
 /**
@@ -91,35 +91,53 @@ function summarize({ member, declaredOn, inherited }: ResolvedMember) {
   return out;
 }
 
-/** Every response says how fresh the dump is, so a stale answer is never silent. */
-async function docs() {
-  const api = await getApiDocs();
+/**
+ * The keys every docs response carries about the dump itself.
+ *
+ * Exported because the test that asserts these never collide with a key a tool
+ * owns used to hold its own typed copy of this list — which is general over
+ * seven named strings, not over the code, and mutation testing showed it missed
+ * the very bug it was written for. Deriving it here is the same rule the
+ * capability model follows: no hand-maintained second copy of a truth.
+ */
+export function buildProvenance(status: DocsStatus): Record<string, unknown> {
+  // ORDERING: callers spread this FIRST, so a tool's own key always wins.
+  //
+  // It used to go last, and twice overwrote the answer: `classes` replaced
+  // docs_search's result array, and `hint` replaced the guidance in
+  // docs_class/unknown_class and docs_search/bad_args -- the second telling a
+  // model that passed an empty query about the dump's age and never about the
+  // query. Losing a line of dump metadata is a far smaller failure than losing
+  // the answer, so the collision now falls on the metadata. The distinct key
+  // names below mean it should never come to that; the ordering is the backstop.
   const provenance: Record<string, unknown> = {
-    studio_version: api.status.studioVersion,
-    dump_age_hours: api.status.ageHours,
+    studio_version: status.studioVersion,
+    dump_age_hours: status.ageHours,
     // The number that would have caught the frozen-resolver bug. A thin dump
     // answers "no such class" rather than failing, so the size has to be visible.
-    // Named `dump_classes`, not `classes`: provenance is spread into every docs
-    // response and `docs_search` already returns a `classes` array of its own.
-    dump_classes: api.status.classes,
+    // Named `dump_classes`, not `classes`, because `docs_search` returns a
+    // `classes` array of its own -- see the ordering note below.
+    dump_classes: status.classes,
   };
-  if (api.status.versionSource === "legacy") {
+  if (status.versionSource === "legacy") {
     provenance.version_source = "legacy";
-    // `dump_hint`, not `hint`: provenance is spread LAST into every docs
-    // response, and two branches (docs_class/unknown_class, docs_search/bad_args)
-    // set a `hint` of their own first. A plain `hint` here replaced the only
-    // guidance in those payloads -- and "legacy" is exactly the state in which
-    // classes go missing, so unknown_class + legacy is the likeliest pairing
-    // in the whole system. Same lesson as `dump_classes`, one key over.
+    // `dump_hint`, not `hint`, for the same reason as `dump_classes`:
+    // docs_class/unknown_class and docs_search/bad_args both set a `hint`.
     provenance.dump_hint =
       "Resolved through the frozen versionQTStudio endpoint, which serves an old " +
       "build with far fewer classes. A missing class here may still exist in Studio.";
   }
-  if (api.status.stale) {
+  if (status.stale) {
     provenance.stale = true;
-    provenance.refresh_error = api.status.refreshError;
+    provenance.refresh_error = status.refreshError;
   }
-  return { api, provenance };
+  return provenance;
+}
+
+/** Every response says how fresh the dump is, so a stale answer is never silent. */
+async function docs() {
+  const api = await getApiDocs();
+  return { api, provenance: buildProvenance(api.status) };
 }
 
 /**
@@ -243,11 +261,11 @@ export const DOCS_TOOLS: ToolEntry[] = [
         const wanted = String(args.class ?? "").toLowerCase();
         const near = api.classNames().filter((n) => n.toLowerCase().includes(wanted)).slice(0, 10);
         return {
+          ...provenance,
           error: "unknown_class",
           class: args.class,
           ...(near.length > 0 ? { did_you_mean: near } : {}),
           hint: "Use docs_search to find a class by partial name.",
-          ...provenance,
         };
       }
 
@@ -263,6 +281,7 @@ export const DOCS_TOOLS: ToolEntry[] = [
       const chain = api.ancestry(cls.Name).slice(1).map((c) => c.Name);
 
       return {
+        ...provenance,
         class: cls.Name,
         superclasses: chain,
         ...(cls.Tags?.length ? { tags: cls.Tags } : {}),
@@ -272,7 +291,6 @@ export const DOCS_TOOLS: ToolEntry[] = [
         ...(!inherited && chain.length > 0
           ? { note: `Own members only. Pass inherited: true to include ${chain.join(" -> ")}.` }
           : {}),
-        ...provenance,
       };
     },
   ),
@@ -308,7 +326,7 @@ export const DOCS_TOOLS: ToolEntry[] = [
     async (args) => {
       const { api, provenance } = await docs();
       const cls = api.getClass(args.class);
-      if (!cls) return { error: "unknown_class", class: args.class, ...provenance };
+      if (!cls) return { ...provenance, error: "unknown_class", class: args.class };
 
       const found = api.findMember(cls.Name, args.member);
       if (!found) {
@@ -319,22 +337,22 @@ export const DOCS_TOOLS: ToolEntry[] = [
           .slice(0, 10)
           .map((m) => m.member.Name);
         return {
+          ...provenance,
           error: "unknown_member",
           class: cls.Name,
           member: args.member,
           ...(near.length > 0 ? { did_you_mean: near } : {}),
-          ...provenance,
         };
       }
 
       return {
+        ...provenance,
         class: cls.Name,
         member: summarize(found),
         declared_on: found.declaredOn,
         inherited: found.inherited,
         ...(found.member.Serialization ? { serialization: found.member.Serialization } : {}),
         ...(found.member.ThreadSafety ? { thread_safety: found.member.ThreadSafety } : {}),
-        ...provenance,
       };
     },
   ),
@@ -376,10 +394,10 @@ export const DOCS_TOOLS: ToolEntry[] = [
       if (!args.enum) {
         const all = api.enumNames().filter((n) => !filter || n.toLowerCase().includes(filter));
         return {
+          ...provenance,
           enums: all.slice(0, limit),
           total: all.length,
           ...(all.length > limit ? { truncated: true } : {}),
-          ...provenance,
         };
       }
 
@@ -388,20 +406,20 @@ export const DOCS_TOOLS: ToolEntry[] = [
         const wanted = String(args.enum).toLowerCase();
         const near = api.enumNames().filter((n) => n.toLowerCase().includes(wanted)).slice(0, 10);
         return {
+          ...provenance,
           error: "unknown_enum",
           enum: args.enum,
           ...(near.length > 0 ? { did_you_mean: near } : {}),
-          ...provenance,
         };
       }
 
       const items = found.Items.filter((i) => !filter || i.Name.toLowerCase().includes(filter));
       return {
+        ...provenance,
         enum: found.Name,
         items: items.slice(0, limit),
         total: items.length,
         ...(items.length > limit ? { truncated: true } : {}),
-        ...provenance,
       };
     },
   ),
@@ -438,7 +456,7 @@ export const DOCS_TOOLS: ToolEntry[] = [
     async (args) => {
       const { api, provenance } = await docs();
       const q = String(args.query ?? "").trim().toLowerCase();
-      if (!q) return { error: "bad_args", hint: "docs_search needs a non-empty 'query'.", ...provenance };
+      if (!q) return { ...provenance, error: "bad_args", hint: "docs_search needs a non-empty 'query'." };
 
       const limit = clampLimit(args.limit);
       const kind = args.kind ?? "all";
@@ -497,7 +515,7 @@ export const DOCS_TOOLS: ToolEntry[] = [
         truncated ||= ranked.length > limit;
       }
 
-      return { ...out, ...(truncated ? { truncated: true } : {}), ...provenance };
+      return { ...provenance, ...out, ...(truncated ? { truncated: true } : {}) };
     },
   ),
 

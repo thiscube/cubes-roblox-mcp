@@ -401,13 +401,25 @@ export async function fetchDump(
     return { dump: await downloadDump(studioVersion, fetchTimeoutMs), studioVersion, versionSource };
   } catch (err) {
     if (versionSource === "legacy") throw err;
-    const legacy = (await getText(LEGACY_VERSION_URL, 15_000)).trim();
-    if (!VERSION_RE.test(legacy) || legacy === studioVersion) throw err;
-    return {
-      dump: await downloadDump(legacy, fetchTimeoutMs),
-      studioVersion: legacy,
-      versionSource: "legacy",
-    };
+    try {
+      const legacy = (await getText(LEGACY_VERSION_URL, 15_000)).trim();
+      if (!VERSION_RE.test(legacy) || legacy === studioVersion) throw err;
+      return {
+        dump: await downloadDump(legacy, fetchTimeoutMs),
+        studioVersion: legacy,
+        versionSource: "legacy",
+      };
+    } catch (fallbackErr) {
+      // Both routes are down. Report both: the original names the live build
+      // whose dump is missing, which is the actionable half, and swallowing it
+      // left the caller staring at a versionQTStudio error for a version it
+      // never asked for.
+      if (fallbackErr === err) throw err;
+      throw new Error(
+        `${err instanceof Error ? err.message : String(err)} ` +
+          `(fallback also failed: ${fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)})`,
+      );
+    }
   }
 }
 
