@@ -63,11 +63,24 @@ Never add a hand-maintained write flag back — the `/rpc` allowlist was the las
 had drifted by sixteen tools. Note that `/rpc` speaks the **plugin command** namespace, not
 the tool namespace: `src/rpc-policy.ts` derives it from each tool's `pluginCommand`.
 
-**2. The bridge authenticates in both directions.** Every route requires a bearer token,
-refuses any request carrying an `Origin`, requires a loopback `Host`, and requires
-`application/json`. The token is generated per run and printed to stderr; pin it with
-`CUBES_MCP_TOKEN`. `CUBES_MCP_ALLOW_UNAUTHENTICATED=1` exists for older plugins and is
-unsafe — it re-opens write-toggle forgery.
+**2. The bridge authenticates in both directions.** Every route refuses a request
+carrying an `Origin`, requires a loopback `Host`, requires `application/json`, and
+requires a bearer token — with one deliberate exception: `/health` is two-tier, and
+serves liveness without a token while keeping the connection diagnosis behind it.
+
+The token is **persisted** at `$CUBES_MCP_HOME/token` (0600), created on first run
+and printed to stderr that once, so the value the user pastes into the Studio panel
+survives a restart. It used to be regenerated per run, which was not a security
+property: the protocol has no token handoff and a plugin cannot read files, so the
+human was the courier and a 401 was the reward for missing a step.
+`CUBES_MCP_TOKEN` overrides it and is never written to disk.
+
+`CUBES_MCP_ALLOW_UNAUTHENTICATED=1` exists for older plugins. It **forces writes
+off**: without a token the *Allow writes* toggle can be forged by anything that can
+post to `/poll`, so in that mode the toggle is not believed at all and write-class
+commands are refused however the panel is set. The hatch buys reads. (The forgery
+itself is closed — this note used to say it was re-opened, which stopped being true
+when the mode started forcing writes off.)
 
 ## Write mode
 

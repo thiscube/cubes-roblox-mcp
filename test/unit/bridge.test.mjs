@@ -19,7 +19,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { StudioBridge } from "../../dist/bridge.js";
+import { StudioBridge, tokenFileRefusal } from "../../dist/bridge.js";
 import { MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, protocolSupported } from "../../dist/protocol.js";
 import { rpcReadOnlyCommands } from "../../dist/rpc-policy.js";
 // Isolates on-disk state (CUBES_MCP_HOME) and the API dump. Import for the side effect.
@@ -660,5 +660,60 @@ describe("diagnosis is not poisoned by its own public probe", () => {
       else process.env.CUBES_MCP_HOME = prev;
       if (prevTok !== undefined) process.env.CUBES_MCP_TOKEN = prevTok;
     }
+  });
+});
+
+/**
+ * The token-file refusal rule, as a predicate.
+ *
+ * The end-to-end version can only reach the ownership branch as root — only root
+ * can chown a file to another uid — so in ordinary CI the rule that matters most
+ * would never execute. This covers every branch on every platform.
+ */
+describe("tokenFileRefusal", () => {
+  const stat = (over = {}) => ({
+    isSymbolicLink: () => false,
+    isFile: () => true,
+    mode: 0o100600,
+    uid: 1000,
+    ...over,
+  });
+
+  test("a file we created at 0600 is accepted", () => {
+    assert.equal(tokenFileRefusal("/t", stat(), 1000), null);
+  });
+
+  test("a symlink is refused before anything else is considered", () => {
+    // Checked first on purpose: following it turns persisting a token into an
+    // arbitrary file write, whatever the mode or owner says.
+    const r = tokenFileRefusal("/t", stat({ isSymbolicLink: () => true, mode: 0o100600, uid: 1000 }), 1000);
+    assert.match(r, /symlink/);
+  });
+
+  test("a non-regular file is refused", () => {
+    assert.match(tokenFileRefusal("/t", stat({ isFile: () => false }), 1000), /not a regular file/);
+  });
+
+  test("any group or other bit is refused", () => {
+    for (const mode of [0o100640, 0o100604, 0o100644, 0o100660, 0o100666, 0o100601]) {
+      const r = tokenFileRefusal("/t", stat({ mode }), 1000);
+      assert.match(r, /readable by other users/, `mode ${mode.toString(8)} should be refused`);
+    }
+  });
+
+  test("another user's file is refused even at a perfect 0600", () => {
+    const r = tokenFileRefusal("/t", stat({ uid: 65534 }), 1000);
+    assert.match(r, /owned by uid 65534/);
+  });
+
+  test("on a platform without mode bits, only the shape checks apply", () => {
+    // Windows has no meaningful mode or uid; refusing on them would make the
+    // token unusable there rather than safer.
+    assert.equal(tokenFileRefusal("/t", stat({ mode: 0o100666, uid: 9 }), null, false), null);
+    assert.match(
+      tokenFileRefusal("/t", stat({ isSymbolicLink: () => true }), null, false),
+      /symlink/,
+      "the shape checks still apply",
+    );
   });
 });

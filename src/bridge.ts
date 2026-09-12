@@ -170,6 +170,54 @@ const CHECKS_MODE = process.platform !== "win32";
  * content. And a group- or world-readable file is refused rather than repaired,
  * because by the time we notice, whatever could read it already has.
  */
+/** The subset of an lstat result the refusal rule needs. */
+export interface TokenFileStat {
+  isSymbolicLink(): boolean;
+  isFile(): boolean;
+  mode: number;
+  uid: number;
+}
+
+/**
+ * Why a token file on disk must not be trusted, or null if it may be.
+ *
+ * A pure predicate so the rule is testable on every platform and without root.
+ * The end-to-end tests can only reach the ownership branch as root — only root
+ * can hand a file to another uid — which would otherwise leave the security rule
+ * that matters most silently unexercised in ordinary CI.
+ */
+export function tokenFileRefusal(
+  file: string,
+  info: TokenFileStat,
+  myUid: number | null,
+  checkMode = CHECKS_MODE,
+): string | null {
+  if (info.isSymbolicLink()) {
+    return `${file} is a symlink; refusing to read or overwrite it.`;
+  }
+  if (!info.isFile()) {
+    return `${file} is not a regular file.`;
+  }
+  if (!checkMode) return null;
+  if ((info.mode & 0o077) !== 0) {
+    return (
+      `${file} is readable by other users (mode ${(info.mode & 0o777).toString(8)}). ` +
+      `Delete it and restart, or set CUBES_MCP_TOKEN.`
+    );
+  }
+  // Mode proves others cannot READ it. It does not prove we WROTE it: a file
+  // owned by someone else at 0600 is a token they know and we would adopt. That
+  // is unreachable under the default ~/.cubesmcp, and live the moment
+  // CUBES_MCP_HOME points at anywhere shared.
+  if (myUid !== null && info.uid !== myUid) {
+    return (
+      `${file} is owned by uid ${info.uid}, not by you. Refusing a token someone else ` +
+      `may know. Delete it, point CUBES_MCP_HOME somewhere you own, or set CUBES_MCP_TOKEN.`
+    );
+  }
+  return null;
+}
+
 function readTokenFile(file: string): string | null {
   let info;
   try {
@@ -177,28 +225,12 @@ function readTokenFile(file: string): string | null {
   } catch {
     return null;
   }
-  if (info.isSymbolicLink()) {
-    throw new Error(`${file} is a symlink; refusing to read or overwrite it.`);
-  }
-  if (!info.isFile()) {
-    throw new Error(`${file} is not a regular file.`);
-  }
-  if (CHECKS_MODE && (info.mode & 0o077) !== 0) {
-    throw new Error(
-      `${file} is readable by other users (mode ${(info.mode & 0o777).toString(8)}). ` +
-        `Delete it and restart, or set CUBES_MCP_TOKEN.`,
-    );
-  }
-  // Mode proves others cannot READ it. It does not prove we WROTE it: a file
-  // owned by someone else at 0600 is a token they know and we would adopt. That
-  // is unreachable under the default ~/.cubesmcp, and live the moment
-  // CUBES_MCP_HOME points at anywhere shared.
-  if (CHECKS_MODE && typeof process.getuid === "function" && info.uid !== process.getuid()) {
-    throw new Error(
-      `${file} is owned by uid ${info.uid}, not by you. Refusing a token someone else ` +
-        `may know. Delete it, point CUBES_MCP_HOME somewhere you own, or set CUBES_MCP_TOKEN.`,
-    );
-  }
+  const refusal = tokenFileRefusal(
+    file,
+    info,
+    typeof process.getuid === "function" ? process.getuid() : null,
+  );
+  if (refusal) throw new Error(refusal);
   const value = readFileSync(file, "utf8").trim();
   return value.length > 0 ? value : null;
 }
@@ -798,7 +830,7 @@ export class StudioBridge implements StudioTransport {
           role: msg.role,
           transport: "websocket",
           protocol: got,
-          writeEnabled: this._writeEnabled,
+          writeEnabled: this.writeEnabled,
         });
         ws.send(
           JSON.stringify({
@@ -1044,7 +1076,7 @@ export class StudioBridge implements StudioTransport {
       role: body.value?.role,
       transport: "long-poll",
       protocol: got,
-      writeEnabled: this._writeEnabled,
+      writeEnabled: this.writeEnabled,
     });
     await this.holdPoll(res, instance);
   }
