@@ -214,6 +214,16 @@ defaults come from a live `Instance.new(Class)[prop]` read over `eval`, not from
 names, types, and read/write security — with defaults available through a separate live
 read, clearly labelled as such.
 
+**Reopened: the feed is the wrong file.** `setup.rbxcdn.com/{version}-API-Dump.json` is a
+*filtered* dump — **682 classes** against the full dump's **921**. It has `Plugin`,
+`StudioService` and `ChangeHistoryService`, so it is a Studio dump, but it is missing
+`StudioTestService`, `PluginConnectionService`, `PluginConnection`, `VirtualInput` and
+`StudioCaptureService` — the exact surface this MCP is built on. Both of the false claims
+this document has made about what "does not exist" traced back to reading it. Measured
+2026-09-12 against `MaximumADHD/Roblox-Client-Tracker@roblox:Full-API-Dump.json`.
+Swap the feed, keep the current URL as a fallback, and make `docs_class` say which one
+answered.
+
 #### 5. Structured output schemas (**M**)
 
 **Now:** every tool returns a JSON blob inside a text block. The model has to parse prose.
@@ -284,7 +294,7 @@ a playtest also stops the plugin answering, so the next tool call times out.
 **Still open:** `eval_client_runtime`. It needs a client-context peer, which
 needs item 11 and the plugin half.
 
-#### 10. Input and movement — NOT blocked. I said it was, and I was wrong.
+#### 10. Input, movement, and the DataModel the client lives in
 
 **Now:** `character_walk`, `character_jump`, `character_teleport`. `character_walk` is
 `Humanoid:Move(direction)` for N seconds, blocking, capped at 10. It puppeteers the
@@ -295,49 +305,78 @@ controls: none of them fire, so none of their bugs show up.
 **They:** `simulate_mouse_input`, `simulate_keyboard_input`, `set_device_simulator`,
 `set_network_profile`, `capture_device_matrix`.
 
-**The correction.** An earlier version of this item said input simulation was blocked by
-the engine, because every method on `VirtualInputManager` is `RobloxScriptSecurity` in the
-API dump. That much is true, and their own source agrees — *"they silently never worked"*.
-The wrong part was the conclusion. There is another route:
+**Two corrections to earlier versions of this item.**
+
+An earlier version said input simulation was blocked by the engine, because every method
+on `VirtualInputManager` is `RobloxScriptSecurity`. That part is true. The conclusion was
+not: `UserInputService:CreateVirtualInput()` is a separate route and it is `Security: None`.
+
+The version after that said `CreateVirtualInput` is absent from the API dump and that there
+is no way to move the mouse. Both are wrong, and the reason for the first one turns out to
+matter more than the feature itself — see the dump note below.
 
 ```lua
 local vi = game:GetService("UserInputService"):CreateVirtualInput()
-vi:SendKey(true, Enum.KeyCode.W)          -- hold W
-vi:SendMouseButton(pos, Enum.UserInputType.MouseButton1, true)
+vi:SendKey(true, Enum.KeyCode.W, false)                              -- hold W
+vi:SendMouseButton(pos, Enum.UserInputType.MouseButton1, true, 0)    -- press
+vi:SendMouseDelta(Vector2.new(dx, dy))                               -- turn the camera
+vi:SendMousePosition(Vector2.new(x, y))
 vi:SendTextInput("hello")
+vi:SendPointerAction(pos, action)
 ```
 
-`CreateVirtualInput` is **not in the API dump at all** — the same situation as
-`StudioCaptureService` — but it is callable without RobloxScriptSecurity, and it drives the
-*real* input pipeline: `SendKey` reaches `UserInputService.InputBegan` and the control
-modules, so W walks the character at real WalkSpeed with the real controller attached.
-Their comment records the method set as verified live.
+Six methods, all `Security: None`, verified against `Full-API-Dump.json`. `SendMouseDelta`
+and `SendMousePosition` mean camera turning **is** possible. There is genuinely no
+`SendMouseWheel` and no touch method.
 
-Its limits, which are real:
+**The dump note, which is its own bug.** `docs.ts` fetches
+`setup.rbxcdn.com/{version}-API-Dump.json`. That file has **682 classes** and contains
+none of `VirtualInput`, `PluginConnection`, `PluginConnectionService`, `StudioTestService`
+or `StudioCaptureService`. The full dump has **921**. So every claim of the form "X is not
+in the dump, so X does not exist" that this document has made was an artefact of reading a
+filtered file — and the `docs_*` tools are blind to exactly the Studio surface an agent
+driving Studio needs most. Fix the feed before trusting the dump again.
 
-- **No `SendMouseMove` and no `SendMouseWheel`.** Those methods do not exist on the object,
-  so no camera turning and no scroll. You can only walk where the camera already points.
-- **Undocumented**, so it can disappear. Treat it the way `screenshot` treats
-  `StudioCaptureService`: try it, fall back, never fail the call because of it.
-- **Input is silently dropped when the window is not rendering** (minimised, no viewport).
-  They check for that and return an error rather than a false success. Worth copying
-  outright.
+**The real blocker was never security. It is which DataModel you are in.** A Studio
+playtest runs up to four DataModels — Standalone, Edit, PlayServer, PlayClient — and
+Studio clones the plugin into each. They are isolated: no Bindables, no Remotes, no shared
+`_G`. `UserInputService` only exists in PlayClient, so `CreateVirtualInput` has to be
+called there. And the plugin copy in PlayClient **cannot make HTTP requests at all**, so it
+cannot reach our bridge. That is why walking is puppeted today: the only copy that can talk
+to us is on the wrong side of the wall.
 
-**Do:** one `VirtualInput` cached per plugin VM so `press` and `release` can span calls —
-that is what makes holding W non-blocking, and it is the piece our design lacks most.
-Mouse clicks take viewport pixel coordinates, which means screenshot coordinates pass
-straight through.
+**`PluginConnectionService` is the wall's door**, added v0.715 (2026-04-01) and public:
 
-**And then the half nobody has.** Neither codebase contains `PathfindingService`,
-`Humanoid:MoveTo` or `MoveToFinished` — I grepped theirs. So "walk to that door" does not
-exist anywhere, and every route is hand-computed vectors with no arrival signal. Real input
-gives fidelity; a path gives intent. `character_goto(target)` — compute a path, follow the
-waypoints, jump on the jump actions, return `arrived` / `blocked` / `timeout` with the
-distance remaining — needs no plugin change at all, because `tune` already runs Luau in the
-live play DM.
+```lua
+local svc = game:GetService("PluginConnectionService")
+svc:CanHaveConnectionType(Enum.PluginConnectionTargetType.Test)   -- am I Edit?
+svc:GetPluginConnectionsOfType(Enum.PluginConnectionTargetType.Edit)
+svc.Connected:Connect(function(conn) ... end)
+conn:SendMessage(json)          -- string or buffer
+conn:BindToMessage(function(payload) ... end)
+conn.Type / conn.TargetId / conn.Connected
+```
+
+The shape that follows: **the edit-mode copy stays the sole external bridge**, and the
+PlayServer/PlayClient copies never poll us — they answer over `PluginConnection` and the
+edit copy relays. Detect which copy you are by connection direction, not by
+`plugin.HostDataModelType`, which reports `Edit` from a Run-mode clone.
+
+**Do:**
+- Relay first. Without it, nothing else in this item is reachable.
+- One `VirtualInput` cached per PlayClient VM so `press` and `release` span calls.
+- Refuse rather than lie when the window is not rendering, and when `SendKey` throws
+  because CoreGui holds keyboard focus.
+- `ui_inspect` in PlayClient: walk `PlayerGui` + `CoreGui`, return `AbsolutePosition`,
+  `AbsoluteSize`, `Text` and effective visibility. Click coordinates then come from the
+  UI tree rather than from guessing at a screenshot.
+- `character_goto(target)` — `PathfindingService`, follow waypoints, jump on jump actions,
+  return `arrived` / `blocked` / `timeout` with distance remaining. Needs no new plumbing,
+  because `tune` already runs Luau in the live play server.
 
 **Done when:** holding a key walks the character through the game's own control scripts,
-and `character_goto` crosses a map with obstacles and says whether it arrived.
+a click lands on a button located by name rather than by pixel, and `character_goto`
+crosses a map with obstacles and says whether it arrived.
 
 #### 11. Multiple Studio windows (**L**)
 
