@@ -30,11 +30,16 @@ Sizes: **S** = an afternoon. **M** = a day or two. **L** = a week or more.
 > handler", it is unreachable at any security level a plugin has; and item 2 was
 > not "un-gitignore it", because the source has never been in this checkout.
 >
-> Four rounds of independent verification found 27 defects across this work,
-> every one reproduced before it was fixed. Three were in code this effort had
-> just written; two were pre-existing bugs it uncovered
-> (`script_edit` writing with the *Allow writes* toggle off, and
-> `animation_play` leaking an instance on every play).
+> **Five rounds of independent verification found 38 defects**, every one
+> reproduced before it was fixed. The two worth naming are opposites: a
+> pre-existing bug this work uncovered (`script_edit` writing to Studio with the
+> *Allow writes* toggle off) and one it introduced (`asset_upload` reading any
+> file on the machine and posting it to Roblox — from the read-only build).
+>
+> Both came from the same mistaken idea, that a tool which does its work in
+> TypeScript is harmless. The channel now has to describe where the *effect*
+> lands, and `effects` names all three of the other ways out: disk, network, and
+> spawning a binary.
 
 ---
 
