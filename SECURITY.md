@@ -32,7 +32,8 @@ Every route runs all four before doing any work (`src/bridge.ts`, `guard()`):
 3. **`Content-Type: application/json`.** `text/plain` and the form encodings are
    CORS-"simple" and can be sent without a preflight. Requiring JSON forces a
    preflight that this server never answers.
-4. **A bearer token.** Generated per run, printed to stderr at startup. Compared
+4. **A bearer token.** Persisted at `$CUBES_MCP_HOME/token` (0600), created on
+   first run and printed to stderr that once. Compared
    with `timingSafeEqual`.
 
 Check 1 is the one carrying the most weight on the WebSocket, because **a
@@ -122,8 +123,21 @@ being protection. The server prints a warning to stderr for as long as it is set
 
 ## The token
 
-Generated per run with `randomBytes` and printed to stderr. Pin it across
-restarts with `CUBES_MCP_TOKEN` if your plugin stores it.
+`randomBytes(24)`, created on first run and written to `$CUBES_MCP_HOME/token`
+at mode 0600, so it survives a restart. `CUBES_MCP_TOKEN` still wins and is
+never written to disk.
+
+It used to be generated per run, which was not a security property — the
+protocol has no token handoff and a Roblox plugin cannot read files, so a
+token that changed on every start just meant the user re-copied it from stderr
+every time, and got a 401 when they did not.
+
+The file is a secret at rest, so it is read through `lstat` rather than `stat`
+(a planted symlink would otherwise be followed on write, turning this into an
+arbitrary file write), and a group- or world-readable file is refused outright
+rather than repaired — by the time we notice, whatever could read it already
+has. If it cannot be written safely the token stays in memory for that run and
+startup says so.
 
 On the WebSocket upgrade only, it may also travel as `?token=` in the URL,
 because Roblox's WebSocket client cannot be relied on to set custom headers. That

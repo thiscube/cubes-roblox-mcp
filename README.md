@@ -214,8 +214,10 @@ source — additionally need an explicit `confirm: true`. When your MCP client
 supports elicitation the server asks you directly; otherwise `mutate` returns a
 `needs_confirmation` error carrying the exact retry payload.
 
-**The bridge requires a token.** It is generated at startup and printed to stderr;
-set `CUBES_MCP_TOKEN` to pin it across restarts. Every route also refuses requests
+**The bridge requires a token.** It is created on first run, saved to
+`~/.cubesmcp/token` (mode 0600) and printed to stderr that once — so you paste
+it into the Studio panel a single time, not once per restart. `CUBES_MCP_TOKEN`
+overrides it and is never written to disk. Every route also refuses requests
 that carry an `Origin` header, that address a non-loopback `Host`, or that aren't
 `application/json` — which is what stops a web page or another local process from
 driving your Studio.

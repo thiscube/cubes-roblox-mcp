@@ -9,7 +9,7 @@ second place to look is a second place to be wrong.
 | Variable | Default | What it does |
 |---|---|---|
 | `CUBES_MCP_PORT` | `44820` | Bridge listen port. Must match the Studio panel. |
-| `CUBES_MCP_TOKEN` | generated per run | Pins the bridge token across restarts. |
+| `CUBES_MCP_TOKEN` | `$CUBES_MCP_HOME/token` | Overrides the persisted bridge token. |
 | `CUBES_MCP_RPC_TOKEN` | unset | Deprecated alias for the above. |
 | `CUBES_MCP_READ_ONLY` | unset | `1` removes every write tool from the process. |
 | `CUBES_MCP_HOME` | `~/.cubesmcp` | Where profiles and the API dump cache live. |
@@ -55,15 +55,19 @@ open at once — one server, one port, one Studio each.
 
 ## `CUBES_MCP_TOKEN`
 
-Without it, a fresh token is generated per run and printed to stderr:
+Without it, a token is created on first run, written to `$CUBES_MCP_HOME/token`
+at mode 0600, and printed to stderr that once:
 
 ```
 [cubes-mcp] bridge token: 9f2c…
-[cubes-mcp] the Studio plugin must send this as 'Authorization: Bearer <token>'.
+[cubes-mcp] paste this into the Cubes MCP panel in Studio. It is saved to
+[cubes-mcp] ~/.cubesmcp/token and will not change on restart.
 ```
 
-That is fine if your plugin reads it from the panel each time. Set the variable
-if you would rather paste it into the plugin once. Any long random string works;
+Later runs load the same value and do not re-echo it. So you paste it into the
+Studio panel once, not once per restart. Set the variable instead if you would
+rather keep the token out of `$CUBES_MCP_HOME` entirely — an env token is never
+written to disk. Any long random string works;
 it is compared byte for byte.
 
 See SECURITY.md for what the token does and does not protect.

@@ -24,6 +24,55 @@ loopback `Host`, and `Content-Type: application/json`.
 **`writeEnabled` is load-bearing.** A `/poll` that omits it means OFF. It is the
 user's "Allow writes" toggle and the server gates every write-class tool on it.
 
+## What the plugin half must honour
+
+None of this is enforceable from the server, and all of it is load-bearing.
+Sources are Roblox staff posts and reproduced community reports; the numbers are
+theirs, not guesses.
+
+**A plugin gets 5 concurrent HTTP requests, and the budget is GLOBAL.** Not per
+plugin — five across every plugin the user has installed. Rojo, an LSP companion,
+a Discord presence plugin and this bridge all draw from the same pool. Roblox
+staff, 2024-06-11: *"We now allow up to 5 parallel requests for plugins and 8 for
+user scripts in Studio."*
+
+That has three consequences:
+
+- A parked long-poll holds one of the five for as long as it is open. Two Studio
+  windows hold two.
+- An abandoned poll — the user hit Disconnect, the server restarted, the place
+  closed — keeps its slot until the request times out, and **the plugin cannot
+  cancel it**. This is Rojo's most reported bug, and the original report notes
+  *"the only way to clear this queue is to restart Roblox Studio."*
+- So: never open a second poll while one is outstanding, and let the server's
+  25s hold (`POLL_HOLD_MS`) bound the damage rather than inventing a longer one.
+
+**Guard the poll loop on `RunService:IsEdit()`.** Entering play mode instantiates
+a *separate copy of the whole plugin per DataModel* — edit, play-server and
+play-client all run your code independently. The play-client copy cannot make
+HTTP requests at all: it fails with `Http requests can only be executed by game
+server`. Without the guard, every playtest spawns extra pollers that burn the
+5-slot budget and one of them errors confusingly. A competing MCP has this bug
+filed: their event stream dies after 1–5 play cycles, and a four-hour automated
+run needed 36 Studio restarts.
+
+**The rate ceiling drops when Play starts.** Measured: 2000 requests/min for a
+plugin in edit mode, 500/min once a playtest is running, 0 on the client. The
+drop applies to the edit-context plugin too, not only the new copies.
+
+**Do not tell users to enable *Allow HTTP Requests*.** It has been irrelevant to
+plugins since March 2020 — *"All previously existing Studio plugins will now use
+the new model and ignore the game's Allow HTTP Requests setting"*. What replaced
+it is a per-domain permission prompt on first request, which locally-installed
+plugins bypass. Several Roblox MCP READMEs still carry the old instruction as a
+required setup step; it is pure friction and this one does not repeat it.
+
+**Consider `WebStreamClient` over long-polling.** Roblox shipped SSE (Aug 2025)
+and WebSockets (Oct 2025) in Studio explicitly to retire it — staff: *"we wanted
+to ensure that not all of them are blocked by long running streaming requests."*
+The `/ws` transport below is protocol 4 for this reason. The catch is a separate
+global budget of 4 stream clients, also shared with every other plugin.
+
 ## Commands
 
 | command | protocol | answer |
