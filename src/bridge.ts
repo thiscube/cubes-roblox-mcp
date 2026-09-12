@@ -189,6 +189,16 @@ function readTokenFile(file: string): string | null {
         `Delete it and restart, or set CUBES_MCP_TOKEN.`,
     );
   }
+  // Mode proves others cannot READ it. It does not prove we WROTE it: a file
+  // owned by someone else at 0600 is a token they know and we would adopt. That
+  // is unreachable under the default ~/.cubesmcp, and live the moment
+  // CUBES_MCP_HOME points at anywhere shared.
+  if (CHECKS_MODE && typeof process.getuid === "function" && info.uid !== process.getuid()) {
+    throw new Error(
+      `${file} is owned by uid ${info.uid}, not by you. Refusing a token someone else ` +
+        `may know. Delete it, point CUBES_MCP_HOME somewhere you own, or set CUBES_MCP_TOKEN.`,
+    );
+  }
   const value = readFileSync(file, "utf8").trim();
   return value.length > 0 ? value : null;
 }
@@ -260,6 +270,12 @@ export class StudioBridge implements StudioTransport {
   /** Last protocol we complained about, so a polling plugin doesn't spam stderr. */
   private warnedProtocol: number | null | undefined;
   private httpServer?: Server;
+  /**
+   * Whether the listener is actually up. `httpServer !== null` was wrong twice
+   * over: it is `undefined` before start (so `undefined !== null` claimed a
+   * listener that did not exist) and it stays set after stop().
+   */
+  private listening = false;
   readonly token: string;
   readonly tokenGenerated: boolean;
   /** True when the token came from, or was written to, the token file. */
@@ -367,7 +383,7 @@ export class StudioBridge implements StudioTransport {
       // Tracks the listener, not the configuration. `boundPort` returns the
       // requested port even when nothing is listening, so reading it here would
       // make the diagnostic lie in precisely the case it exists to explain.
-      listening: this.listenError === null && this.httpServer !== null,
+      listening: this.listenError === null && this.listening,
       port: this.boundPort,
       everPolled: this.everPolled,
       authRejections: this.authRejections,
@@ -516,6 +532,7 @@ export class StudioBridge implements StudioTransport {
         reject(err);
       });
       this.httpServer.listen(this.port, "127.0.0.1", () => {
+        this.listening = true;
         this.httpServer?.removeListener("error", reject);
         this.httpServer?.on("error", (err) => {
           process.stderr.write(`[cubes-mcp] bridge server error: ${String(err)}\n`);
@@ -527,6 +544,7 @@ export class StudioBridge implements StudioTransport {
 
   /** Shut the HTTP listener down. Used by tests and by clean exit paths. */
   stop(): Promise<void> {
+    this.listening = false;
     return new Promise((resolve) => {
       for (const [, p] of this.pending) {
         clearTimeout(p.timer);
@@ -582,7 +600,11 @@ export class StudioBridge implements StudioTransport {
           this.readOnly ? "read_only_build" : "write_mode_disabled",
           this.readOnly
             ? `This server was started read-only; '${tool}' is a write command.`
-            : "Writes are off. Open the Cubes MCP panel in Roblox Studio and enable 'Allow writes', then retry.",
+            : this.allowUnauthenticated
+              ? "Writes are off because CUBES_MCP_ALLOW_UNAUTHENTICATED=1 forces them off: " +
+                "without a token the 'Allow writes' toggle can be forged, so it is not believed. " +
+                "Unset that variable and give the plugin the bridge token."
+              : "Writes are off. Open the Cubes MCP panel in Roblox Studio and enable 'Allow writes', then retry.",
         ),
       );
     }
@@ -694,7 +716,10 @@ export class StudioBridge implements StudioTransport {
     // Same four checks as every HTTP route, minus content-type, which an upgrade
     // does not carry.
     const failure = this.guard(req, { requireJson: false, allowQueryToken: true });
-    if (failure) return StudioBridge.denySocket(socket, failure.status, failure.code);
+    if (failure) {
+      this.noteDenied(failure);
+      return StudioBridge.denySocket(socket, failure.status, failure.code);
+    }
 
     this.wss?.handleUpgrade(req, socket, head, (ws) => this.adoptSocket(ws));
   }
@@ -861,11 +886,21 @@ export class StudioBridge implements StudioTransport {
     if (!this.allowUnauthenticated) {
       const presented = this.presentedToken(req, opts.allowQueryToken === true);
       if (!presented || !tokenMatches(presented, this.token)) {
-        this.authRejections += 1;
-      return { status: 401, code: "unauthorized", message: "Missing or invalid bridge token." };
+        // NOT counted here. `/health` calls guard() and then tolerates this
+        // failure to serve its public tier, so counting at the check turned the
+        // plugin's own liveness probe into evidence of a token mismatch -- and
+        // the diagnosis then blamed the token on a perfectly healthy setup.
+        // A rejection is only a rejection where we actually reject, so the
+        // count lives in deny().
+        return { status: 401, code: "unauthorized", message: "Missing or invalid bridge token." };
       }
     }
     return null;
+  }
+
+  /** Record a refusal we actually acted on. See the note in guard(). */
+  private noteDenied(failure: { code: string }): void {
+    if (failure.code === "unauthorized") this.authRejections += 1;
   }
 
   private presentedToken(req: IncomingMessage, allowQuery = false): string {
@@ -915,7 +950,10 @@ export class StudioBridge implements StudioTransport {
     // token rather than being dropped, and the public tier says they exist.
     if (url === "/health") {
       const failure = this.guard(req, { requireJson: false });
-      if (failure && failure.code !== "unauthorized") return StudioBridge.deny(res, failure);
+      if (failure && failure.code !== "unauthorized") {
+        this.noteDenied(failure);
+        return StudioBridge.deny(res, failure);
+      }
       const authed = !failure;
       res.setHeader("content-type", "application/json");
       res.end(
@@ -936,6 +974,11 @@ export class StudioBridge implements StudioTransport {
           // The block to paste when asking for help: every maintainer in this
           // ecosystem closes connection issues asking for exactly this. Carries
           // no token material at either tier.
+          // Reported through the getter, not the raw per-instance flag: in
+          // unauthenticated mode the bridge does not believe the toggle, and a
+          // health document that says writesForcedOff next to writeEnabled:true
+          // is answering the same question two ways.
+          writeEnabled: this.writeEnabled,
           diagnosis: authed ? this.diagnosis : undefined,
           problem: authed && !this.connected ? this.describeDisconnect() : undefined,
           detail: authed ? undefined : "Send the bridge token to see why Studio is not connected.",
@@ -951,7 +994,10 @@ export class StudioBridge implements StudioTransport {
     }
 
     const failure = this.guard(req, { requireJson: true });
-    if (failure) return StudioBridge.deny(res, failure);
+    if (failure) {
+      this.noteDenied(failure);
+      return StudioBridge.deny(res, failure);
+    }
 
     if (url === "/poll") return this.routePoll(req, res);
     if (url === "/result") return this.routeResult(req, res);
@@ -1062,7 +1108,10 @@ export class StudioBridge implements StudioTransport {
           tool,
           hint: this.readOnly
             ? "This server was started read-only. Restart without CUBES_MCP_READ_ONLY to write."
-            : "Open the Cubes MCP panel in Roblox Studio and enable 'Allow writes', then retry.",
+            : this.allowUnauthenticated
+              ? "CUBES_MCP_ALLOW_UNAUTHENTICATED=1 forces writes off; the panel toggle cannot " +
+                "be trusted without a token. Unset it and give the plugin the bridge token."
+              : "Open the Cubes MCP panel in Roblox Studio and enable 'Allow writes', then retry.",
         }),
       );
       return;

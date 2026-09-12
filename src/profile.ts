@@ -129,7 +129,7 @@ export async function saveProfile(profile: ProjectProfile): Promise<void> {
   profile.updatedAt = new Date().toISOString();
   capArrays(profile);
   const path = profilePath(profile.placeId);
-  await mkdir(dirname(path), { recursive: true });
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
   try {
     await writeFile(tmp, JSON.stringify(profile, null, 2), "utf8");

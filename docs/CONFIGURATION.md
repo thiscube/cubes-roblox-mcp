@@ -154,24 +154,46 @@ confines nothing, and the appearance of a boundary is worse than none.
 ## `CUBES_MCP_ALLOW_UNAUTHENTICATED`
 
 `1` turns off the bridge token. Read SECURITY.md before you do. The short version
-is that it lets any local process forge your *Allow writes* toggle, so leaving
-writes off stops protecting you.
+is that any local process can then drive Studio.
+
+**It also forces writes off.** Without a token the *Allow writes* toggle can be
+forged by anyone who can post to `/poll`, so in this mode the toggle is not
+believed and every write-class command is refused. The hatch buys reads.
+
+Only the exact string `1` enters this mode — `true`, `yes` and `" 1"` do not.
+`/health` reports `unauthenticatedMode` and `writesForcedOff` without a token.
 
 It exists for plugins predating protocol 2. Unset it as soon as yours catches up.
 
 ## Checking it works
 
 ```bash
-TOKEN=...   # from stderr, or whatever you pinned
-curl -s -X POST -H "Authorization: Bearer $TOKEN" http://127.0.0.1:44820/health
+TOKEN=$(cat ~/.cubesmcp/token)   # or whatever you pinned in CUBES_MCP_TOKEN
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" http://127.0.0.1:44820/health
 ```
 
 ```json
-{ "ok": true, "connected": true, "transport": "long-poll", "queued": 0,
-  "protocol": 4, "protocolRange": [2, 4], "authRequired": true }
+{ "ok": true, "connected": true, "transport": "long-poll", "instances": [],
+  "queued": 0, "protocol": 5, "protocolRange": [2, 5], "authRequired": true,
+  "writeEnabled": false,
+  "diagnosis": { "listening": true, "port": 44820, "everPolled": true,
+                 "msSinceLastPoll": 812, "authRejections": 0,
+                 "protocolRejections": 0 } }
 ```
 
-`connected: false` means the plugin is not polling: wrong port, plugin not
-installed, or its toolbar button is off. `transport` says whether it is
-long-polling or holding a WebSocket. A `handshake` with `ok: false` means the
-plugin's protocol is outside `protocolRange` and it needs rebuilding.
+**This is the block to paste when asking for help.** It carries no token
+material at either tier.
+
+When `connected` is false the response also carries `problem` — one sentence
+naming the likeliest cause, worked out from what the server can actually prove
+rather than from a list of things to check:
+
+- the listener never came up, because the port is in use
+- something is polling and being **rejected for a bad token** (`authRejections`)
+- something is polling with a protocol outside `protocolRange`
+- nothing has ever polled — plugin missing, or Studio not restarted after install
+- it polled and went quiet, which usually means Studio entered **Play mode**
+
+Without a token you still get `ok`, `connected`, `transport` and `protocol`; the
+`diagnosis` and `problem` fields are replaced by a note saying to send the token.

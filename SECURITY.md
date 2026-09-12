@@ -41,8 +41,18 @@ WebSocket is not subject to CORS at all**. Any page on any site can open one to
 127.0.0.1 and the browser will not stop it. Refusing every upgrade that carries
 an `Origin` is the whole defence there.
 
-`/health` is the single exception: it skips the token, because liveness is not a
-secret. It still runs checks 1 and 2.
+`/health` is the single exception, and it is **two-tier**.
+
+Liveness is public: it reveals nothing a port scan does not, and the plugin
+probes it. Checks 1 and 2 still apply.
+
+The diagnosis is not public. `authRejections` would tell an unauthenticated
+caller that its own probes are landing, and `msSinceLastPoll` is a running
+account of when the user is at their desk, so both sit behind the token; the
+public tier just says they are there. Neither tier carries token material — not
+the value, not a prefix, not a length — and there is deliberately no breakdown of
+*why* a token was rejected, because a counter that separated "wrong length" from
+"wrong value" would undo the constant-time compare at the observability layer.
 
 ## What this does not protect against
 
@@ -117,9 +127,20 @@ determined model to argue its way past, because the tools are not there.
 Do not use this.
 
 It exists for a plugin too old to send a token. It disables check 4 on every
-route, which means any local process can drive Studio **and can forge the *Allow
-writes* toggle** by posting a fake `/poll` — so "just leave writes off" stops
-being protection. The server prints a warning to stderr for as long as it is set.
+route, so any local process can drive Studio.
+
+It used to be worse: an unauthenticated `/poll` could carry `writeEnabled: true`
+and **forge the *Allow writes* toggle**, so "just leave writes off" stopped being
+protection. That is closed. In this mode the toggle is not believed at all —
+`writeEnabled` is forced false, and write-class commands are refused however the
+panel is set. The hatch buys reads. Reproduced before and after: an
+unauthenticated `/poll`, an authenticated `/poll` and a `/ws` hello all now leave
+`writeEnabled` false, and `/rpc mutate` returns 403.
+
+The server warns on stderr for as long as it is set, and `/health` reports
+`unauthenticatedMode` and `writesForcedOff` on its **public** tier — an operator
+checking whether their bridge is exposed should not need the credential this mode
+disabled.
 
 ## The token
 

@@ -299,7 +299,7 @@ async function readCache(): Promise<CacheFile | null> {
 
 async function writeCache(entry: CacheFile): Promise<void> {
   const file = apiDumpFile();
-  await mkdir(dirname(file), { recursive: true });
+  await mkdir(dirname(file), { recursive: true, mode: 0o700 });
   // Write-then-rename: a crash mid-write must not leave a truncated dump behind
   // that then fails to parse on every subsequent start.
   const tmp = `${file}.${process.pid}.tmp`;

@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import {
   chmodSync,
+  chownSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -520,7 +521,11 @@ describe("bridge token persistence", () => {
     });
   });
 
-  test("the file is 0600, even if it already existed with looser bits", async () => {
+  test("a token file this server creates is 0600", async () => {
+    // Named for what it checks. The looser-bits case is NOT repair -- a
+    // pre-existing world-readable file is refused, and the test below is the one
+    // that pins that. Naming this one "even if it already existed with looser
+    // bits" invited a future reader to make the code repair instead of refuse.
     if (process.platform === "win32") return;
     const home = mkHome();
     await withHome(home, async () => {
@@ -577,6 +582,83 @@ describe("bridge token persistence", () => {
       else process.env.CUBES_MCP_TOKEN = prev;
       if (prevHome === undefined) delete process.env.CUBES_MCP_HOME;
       else process.env.CUBES_MCP_HOME = prevHome;
+    }
+  });
+});
+
+/**
+ * The diagnosis must not poison itself.
+ *
+ * `/health` serves an unauthenticated tier on purpose, and it reaches that tier
+ * by calling guard() and tolerating the 401. Counting the rejection at the check
+ * turned the plugin's own liveness probe into evidence of a token mismatch — so
+ * a perfectly healthy setup got told to go fix its token. That is the original
+ * bug ("always blames the missing plugin") wearing a new coat.
+ */
+describe("diagnosis is not poisoned by its own public probe", () => {
+  test("an unauthenticated /health does not count as an auth rejection", async () => {
+    const bridge = new StudioBridge(0, {});
+    await bridge.start();
+    try {
+      const before = bridge.describeDisconnect();
+      assert.match(before, /nothing has ever polled/i);
+      for (let i = 0; i < 3; i++) {
+        await fetch(`http://127.0.0.1:${bridge.boundPort}/health`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+        }).then((r) => r.json());
+      }
+      assert.equal(bridge.diagnosis.authRejections, 0, "a tolerated 401 is not a rejection");
+      assert.equal(bridge.describeDisconnect(), before, "the advice must not have changed");
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  test("a genuinely rejected request still counts", async () => {
+    const bridge = new StudioBridge(0, {});
+    await bridge.start();
+    try {
+      await fetch(`http://127.0.0.1:${bridge.boundPort}/rpc`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer wrong" },
+        body: JSON.stringify({ tool: "read", args: {} }),
+      }).catch(() => {});
+      assert.equal(bridge.diagnosis.authRejections, 1, "a route that denies must still count");
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  test("listening is false before start and after stop", async () => {
+    const bridge = new StudioBridge(0, {});
+    assert.equal(bridge.diagnosis.listening, false, "there is no listener before start()");
+    await bridge.start();
+    assert.equal(bridge.diagnosis.listening, true);
+    await bridge.stop();
+    assert.equal(bridge.diagnosis.listening, false, "and none after stop()");
+  });
+
+  test("a token owned by another user is refused", async () => {
+    // Mode proves others cannot read it; it does not prove we wrote it.
+    if (process.platform === "win32" || typeof process.getuid !== "function") return;
+    if (process.getuid() !== 0) return; // only root can hand a file to another uid
+    const home = mkdtempSync(join(tmpdir(), "cubes-own-"));
+    const file = join(home, "token");
+    writeFileSync(file, "token-they-know\n", { mode: 0o600 });
+    chownSync(file, 65534, 65534);
+    const prev = process.env.CUBES_MCP_HOME;
+    const prevTok = process.env.CUBES_MCP_TOKEN;
+    process.env.CUBES_MCP_HOME = home;
+    delete process.env.CUBES_MCP_TOKEN;
+    try {
+      const bridge = new StudioBridge(0, {});
+      assert.notEqual(bridge.token, "token-they-know");
+      assert.match(bridge.tokenWarning, /owned by uid/);
+    } finally {
+      if (prev === undefined) delete process.env.CUBES_MCP_HOME;
+      else process.env.CUBES_MCP_HOME = prev;
+      if (prevTok !== undefined) process.env.CUBES_MCP_TOKEN = prevTok;
     }
   });
 });
