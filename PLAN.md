@@ -26,9 +26,11 @@ Sizes: **S** = an afternoon. **M** = a day or two. **L** = a week or more.
 > | Ongoing by design | 12 test depth |
 >
 > **Two of the plan's own instructions turned out to be wrong**, and both are
-> corrected in place rather than quietly dropped: item 10 was not "needs a plugin
-> handler", it is unreachable at any security level a plugin has; and item 2 was
-> not "un-gitignore it", because the source has never been in this checkout.
+> corrected in place rather than quietly dropped. Item 2 was not "un-gitignore it",
+> because the source has never been in this checkout. Item 10 was wrong twice: first
+> as "needs a plugin handler", then as "unreachable at any security a plugin has" —
+> `VirtualInputManager` is indeed closed, but `UserInputService:CreateVirtualInput()`
+> is not, and it drives the real input pipeline. Item 10 is open work, not a dead end.
 >
 > **Five rounds of independent verification found 38 defects**, every one
 > reproduced before it was fixed. The two worth naming are opposites: a
@@ -282,23 +284,60 @@ a playtest also stops the plugin answering, so the next tool call times out.
 **Still open:** `eval_client_runtime`. It needs a client-context peer, which
 needs item 11 and the plugin half.
 
-#### 10. Input and device simulation — BLOCKED, and not for the reason I assumed
+#### 10. Input and movement — NOT blocked. I said it was, and I was wrong.
 
-**Now:** `character_walk`, `character_jump`, `character_teleport`. That puppeteers the
-humanoid, so it never touches the input stack and never catches an input bug.
+**Now:** `character_walk`, `character_jump`, `character_teleport`. `character_walk` is
+`Humanoid:Move(direction)` for N seconds, blocking, capped at 10. It puppeteers the
+humanoid, so it bypasses the entire control stack — which is precisely the code a
+playtest exists to exercise. Custom controllers, sprint keybinds, double jump, mobile
+controls: none of them fire, so none of their bugs show up.
 
 **They:** `simulate_mouse_input`, `simulate_keyboard_input`, `set_device_simulator`,
 `set_network_profile`, `capture_device_matrix`.
 
-**The blocker is the engine, not our plugin.** Every input method on
-`VirtualInputManager` — `SendKeyEvent`, `SendMouseButtonEvent`,
-`SendMouseMoveEvent`, `SendMouseWheelEvent`, all 26 members — is
-`RobloxScriptSecurity` in the API dump. No plugin can call them, and no amount of
-work on our side changes that. "Mouse and keyboard injection first" was wrong.
+**The correction.** An earlier version of this item said input simulation was blocked by
+the engine, because every method on `VirtualInputManager` is `RobloxScriptSecurity` in the
+API dump. That much is true, and their own source agrees — *"they silently never worked"*.
+The wrong part was the conclusion. There is another route:
 
-If real input simulation matters, the route is `TestService` / the Studio test
-runner, not `VirtualInputManager`. Worth checking what their tools actually do
-before copying the design.
+```lua
+local vi = game:GetService("UserInputService"):CreateVirtualInput()
+vi:SendKey(true, Enum.KeyCode.W)          -- hold W
+vi:SendMouseButton(pos, Enum.UserInputType.MouseButton1, true)
+vi:SendTextInput("hello")
+```
+
+`CreateVirtualInput` is **not in the API dump at all** — the same situation as
+`StudioCaptureService` — but it is callable without RobloxScriptSecurity, and it drives the
+*real* input pipeline: `SendKey` reaches `UserInputService.InputBegan` and the control
+modules, so W walks the character at real WalkSpeed with the real controller attached.
+Their comment records the method set as verified live.
+
+Its limits, which are real:
+
+- **No `SendMouseMove` and no `SendMouseWheel`.** Those methods do not exist on the object,
+  so no camera turning and no scroll. You can only walk where the camera already points.
+- **Undocumented**, so it can disappear. Treat it the way `screenshot` treats
+  `StudioCaptureService`: try it, fall back, never fail the call because of it.
+- **Input is silently dropped when the window is not rendering** (minimised, no viewport).
+  They check for that and return an error rather than a false success. Worth copying
+  outright.
+
+**Do:** one `VirtualInput` cached per plugin VM so `press` and `release` can span calls —
+that is what makes holding W non-blocking, and it is the piece our design lacks most.
+Mouse clicks take viewport pixel coordinates, which means screenshot coordinates pass
+straight through.
+
+**And then the half nobody has.** Neither codebase contains `PathfindingService`,
+`Humanoid:MoveTo` or `MoveToFinished` — I grepped theirs. So "walk to that door" does not
+exist anywhere, and every route is hand-computed vectors with no arrival signal. Real input
+gives fidelity; a path gives intent. `character_goto(target)` — compute a path, follow the
+waypoints, jump on the jump actions, return `arrived` / `blocked` / `timeout` with the
+distance remaining — needs no plugin change at all, because `tune` already runs Luau in the
+live play DM.
+
+**Done when:** holding a key walks the character through the game's own control scripts,
+and `character_goto` crosses a map with obstacles and says whether it arrived.
 
 #### 11. Multiple Studio windows (**L**)
 
