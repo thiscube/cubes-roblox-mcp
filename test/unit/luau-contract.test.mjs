@@ -68,19 +68,70 @@ describe("__MCP contract (A1)", () => {
   test("no template builds Luau by splicing a raw argument into source text", async () => {
     // Arguments must travel through luaJson (which emits a safe literal), never
     // through bare interpolation of a caller-controlled value.
+    //
+    // Only LUAU template literals are scanned. The first version of this scanned
+    // every `${...}` in the file and flagged three JavaScript strings that build
+    // an elicitation prompt — prose shown to a human, never executed anywhere.
+    // A check that cries wolf on prose gets disabled the first time it is
+    // inconvenient, so it has to be able to tell the two apart.
     const offenders = [];
     for (const { file, text } of await toolSources()) {
-      for (const m of text.matchAll(/\$\{([^}]+)\}/g)) {
-        const expr = m[1].trim();
-        const safe =
-          expr.startsWith("luaJson(") ||
-          /^(beginUndo\(|endUndo|cancelUndo|parseColorLua)/.test(expr) ||
-          /^[A-Z_][A-Z0-9_]*$/.test(expr) || // module-level constants
-          expr.startsWith("MAX_") ||
-          expr.startsWith("DOWNSCALE_");
-        if (!safe && /a\.|args\.|arg\b/.test(expr)) offenders.push(`${file}: \${${expr}}`);
+      for (const literal of templateLiterals(text)) {
+        if (!looksLikeLuau(literal)) continue;
+        for (const m of literal.matchAll(/\$\{([^}]+)\}/g)) {
+          const expr = m[1].trim();
+          const safe =
+            expr.startsWith("luaJson(") ||
+            /^(beginUndo\(|endUndo|cancelUndo|parseColorLua)/.test(expr) ||
+            /^[A-Z_][A-Z0-9_]*$/.test(expr) || // module-level constants
+            expr.startsWith("MAX_") ||
+            expr.startsWith("DOWNSCALE_");
+          if (!safe && /a\.|args\.|arg\b/.test(expr)) offenders.push(`${file}: \${${expr}}`);
+        }
       }
     }
     assert.deepEqual(offenders, [], `raw argument interpolation: ${offenders.join(", ")}`);
   });
+
+  test("the Luau detector is not passing everything through", async () => {
+    // If looksLikeLuau returned false for everything, the test above would be
+    // vacuous. Prove it still sees the real templates, and still ignores prose.
+    const sources = await toolSources();
+    const luau = sources.flatMap(({ file, text }) =>
+      templateLiterals(text).filter(looksLikeLuau).map(() => file),
+    );
+    assert.ok(luau.length > 20, `expected many Luau templates, found ${luau.length}`);
+    assert.equal(looksLikeLuau("Upload \"${args.name}\" to Roblox as a ${args.assetType}?"), false);
+    assert.equal(looksLikeLuau("local a = __MCP.decode(x)\nreturn { ok = true }"), true);
+  });
 });
+
+/** Every backtick template literal in a source file, contents only. */
+function templateLiterals(text) {
+  const out = [];
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] !== "`") continue;
+    if (i > 0 && text[i - 1] === "\\") continue;
+    let j = i + 1;
+    while (j < text.length && !(text[j] === "`" && text[j - 1] !== "\\")) j += 1;
+    out.push(text.slice(i + 1, j));
+    i = j;
+  }
+  return out;
+}
+
+/**
+ * Is this template generated Luau, or is it a JavaScript string that happens to
+ * be written with backticks?
+ *
+ * Every generated template either calls into the `__MCP` sandbox or is plainly
+ * Lua source. Prose built for an elicitation prompt is neither.
+ */
+function looksLikeLuau(literal) {
+  return (
+    literal.includes("__MCP.") ||
+    /^\s*local\s/m.test(literal) ||
+    /\bpcall\(/.test(literal) ||
+    /\breturn\s*\{/.test(literal)
+  );
+}

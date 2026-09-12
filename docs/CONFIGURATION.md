@@ -15,6 +15,7 @@ second place to look is a second place to be wrong.
 | `CUBES_MCP_OFFLINE` | unset | `1` forbids the API-dump download. |
 | `CUBES_MCP_SOURCEMAP` | autodetect | Path to a Rojo `sourcemap.json`. |
 | `CUBES_MCP_LINT_CWD` | repo root | Directory holding your `selene.toml`. |
+| `CUBES_MCP_OPEN_CLOUD_KEY` | unset | Open Cloud API key. Only `asset_upload` needs it. |
 | `CUBES_MCP_ALLOW_UNAUTHENTICATED` | unset | `1` disables the bridge token. Unsafe. |
 
 Plus `--read-only` on the command line, equivalent to `CUBES_MCP_READ_ONLY=1`.
@@ -115,6 +116,17 @@ points at the directory holding yours.
 
 If selene is not installed, or no config is found, linting is off and the server
 says so once at startup. Nothing else changes.
+
+## `CUBES_MCP_OPEN_CLOUD_KEY`
+
+Only `asset_upload` reads it. Searching the Creator Store, reading asset details
+and fetching thumbnails all use public endpoints and need no credentials, which
+is deliberate: the part people actually want works the moment they install.
+
+Create a key at https://create.roblox.com/dashboard/credentials with the asset
+write scope. `asset_upload` also needs `confirm: true`, or an elicitation-capable
+client so the server can ask you directly — uploading publishes to your account
+and nothing here can undo it.
 
 ## `CUBES_MCP_ALLOW_UNAUTHENTICATED`
 

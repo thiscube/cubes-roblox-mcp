@@ -110,8 +110,20 @@ Two things, both on purpose and both to Roblox:
 - **The API dump** (`setup.rbxcdn.com`), fetched for the `docs_*` tools and
   cached for 24 hours. Nothing about your place is sent. `CUBES_MCP_OFFLINE=1`
   stops it entirely.
+- **Asset lookups** (`apis.roblox.com`, `thumbnails.roblox.com`), when you use a
+  `asset_*` tool. The search terms go out; nothing about your place does.
 - **Nothing else.** No telemetry. Profiles, macros and snapshots are files under
   `~/.cubesmcp` and never leave.
+
+`asset_upload` is the one tool that publishes outward, and it is gated
+separately from the Studio write toggle — that toggle is about the open place,
+this is about your Roblox account. It needs `CUBES_MCP_OPEN_CLOUD_KEY` and
+either `confirm: true` or your answer to an elicitation prompt.
+
+`asset_insert` brings a stranger's model into your place. Scripts and
+PackageLinks are destroyed **before** anything is parented, and the strip is
+verified afterwards; if anything survived, the model is destroyed rather than
+inserted.
 
 Screenshots and place contents go to your MCP client, which is the point, and
 from there wherever that client sends them.
