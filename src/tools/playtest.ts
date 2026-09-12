@@ -22,6 +22,9 @@ import { objectResult } from "../output-schema.js";
  * rather than fidelity; real input needs the client DataModel, which cannot
  * reach this bridge at all (see PLAN.md #10).
  */
+const gotoBudgetMs = (args: any): number =>
+  (Math.min(60, Math.max(1, Number(args?.timeout) || 20)) + 10) * 1000;
+
 function gotoLuau(args: Record<string, unknown>): string {
   return `
 local a = __MCP.decode(${luaJson(args)})
@@ -336,7 +339,7 @@ return {
         },
         required: ["to"],
       },
-      yieldBudgetMs: (args) => (Math.min(60, Math.max(1, Number((args as any)?.timeout) || 20)) + 10) * 1000,
+      yieldBudgetMs: gotoBudgetMs,
       outputSchema: objectResult({
         arrived: { type: "boolean" },
         status: { type: "string" },
@@ -350,7 +353,7 @@ return {
       const result = await ctx.bridge.send(
         "tune",
         { luau: gotoLuau(args ?? {}) },
-        timeoutFor({ yieldBudgetMs: (a: any) => (Math.min(60, Math.max(1, Number(a?.timeout) || 20)) + 10) * 1000 }, args),
+        timeoutFor({ yieldBudgetMs: gotoBudgetMs }, args),
       );
       return { result };
     },
