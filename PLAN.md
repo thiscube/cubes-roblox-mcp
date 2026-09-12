@@ -370,9 +370,11 @@ edit copy relays. Detect which copy you are by connection direction, not by
 - `ui_inspect` in PlayClient: walk `PlayerGui` + `CoreGui`, return `AbsolutePosition`,
   `AbsoluteSize`, `Text` and effective visibility. Click coordinates then come from the
   UI tree rather than from guessing at a screenshot.
-- `character_goto(target)` — `PathfindingService`, follow waypoints, jump on jump actions,
-  return `arrived` / `blocked` / `timeout` with distance remaining. Needs no new plumbing,
-  because `tune` already runs Luau in the live play server.
+- `character_goto(target)` — **DONE** (`9bdeeaf`). `PathfindingService`, follows the
+  waypoints, jumps on jump actions, returns `arrived` / `blocked` / `timeout` with the
+  distance remaining. Needed no new plumbing, because `tune` already runs Luau in the live
+  play server. Still `Humanoid:MoveTo` underneath, so it buys intent, not fidelity: the
+  game's own control scripts do not run until the relay above exists.
 
 **Done when:** holding a key walks the character through the game's own control scripts,
 a click lands on a button located by name rather than by pixel, and `character_goto`
