@@ -5,6 +5,17 @@ import { randomUUID, randomBytes, timingSafeEqual } from "node:crypto";
 import { MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, protocolSupported } from "./protocol.js";
 import { BridgeError, type StudioInstance, type StudioTransport } from "./transport.js";
 
+/** What the server knows about why it cannot reach Studio. Carries no secrets. */
+export interface BridgeDiagnosis {
+  listening: boolean;
+  port: number;
+  listenError?: string;
+  everPolled: boolean;
+  msSinceLastPoll?: number;
+  authRejections: number;
+  protocolRejections: number;
+}
+
 /**
  * The bridge between the MCP server (this process) and the Roblox Studio plugin.
  *
@@ -141,6 +152,17 @@ export class StudioBridge implements StudioTransport {
   private wss?: WebSocketServer;
   private _writeEnabled = false;
   private lastHandshake: { protocol: number | null; ok: boolean; at: number } | null = null;
+  /**
+   * Why the bridge is unusable, when it is. Every field here exists because the
+   * old message could not tell three very different problems apart: a busy port,
+   * a plugin polling with the wrong token, and no plugin at all. It named the
+   * third one every time, so a token mismatch sent people to reinstall a plugin
+   * that was already installed and already running.
+   */
+  private listenError: string | null = null;
+  private authRejections = 0;
+  private protocolRejections = 0;
+  private everPolled = false;
   /** Last protocol we complained about, so a polling plugin doesn't spam stderr. */
   private warnedProtocol: number | null | undefined;
   private httpServer?: Server;
@@ -225,6 +247,77 @@ export class StudioBridge implements StudioTransport {
     return this.lastHandshake;
   }
 
+  /**
+   * Everything the server knows about why it cannot reach Studio.
+   *
+   * Deliberately carries no token material, not even a length or a prefix:
+   * `/health` needs a valid token to read this, but a diagnostic that leaks the
+   * secret it is diagnosing would be a poor trade whatever the door.
+   */
+  get diagnosis(): BridgeDiagnosis {
+    const out: BridgeDiagnosis = {
+      // Tracks the listener, not the configuration. `boundPort` returns the
+      // requested port even when nothing is listening, so reading it here would
+      // make the diagnostic lie in precisely the case it exists to explain.
+      listening: this.listenError === null && this.httpServer !== null,
+      port: this.boundPort,
+      everPolled: this.everPolled,
+      authRejections: this.authRejections,
+      protocolRejections: this.protocolRejections,
+    };
+    if (this.listenError) out.listenError = this.listenError;
+    if (this.everPolled) out.msSinceLastPoll = Date.now() - this.lastSeen;
+    return out;
+  }
+
+  /**
+   * One sentence naming the MOST LIKELY cause, in the order a user can act on.
+   *
+   * Ordered by what the server can actually prove, strongest evidence first. The
+   * research behind this is blunt about the real root causes: stale client
+   * config and needing to restart both halves dominate, and firewalls -- which
+   * every vendor's troubleshooting page leads with -- never turned out to be the
+   * cause in any issue I could find. So firewalls are not mentioned here.
+   */
+  describeDisconnect(): string {
+    const d = this.diagnosis;
+    if (d.listenError) {
+      return (
+        `The bridge never started: port ${d.port} is in use (${d.listenError}). ` +
+        `Another copy of this server is probably already running. Stop it, or set ` +
+        `CUBES_MCP_PORT on both this server and the Studio panel.`
+      );
+    }
+    if (!d.everPolled && d.authRejections > 0) {
+      return (
+        `Something is polling port ${d.port} and being rejected: ${d.authRejections} ` +
+        `request(s) had a missing or wrong bearer token. That is almost certainly the ` +
+        `plugin. Make the token in the Studio panel match this server's, or set ` +
+        `CUBES_MCP_TOKEN so it stops changing between runs.`
+      );
+    }
+    if (!d.everPolled && d.protocolRejections > 0) {
+      return (
+        `A plugin polled ${d.protocolRejections} time(s) but its protocol version is ` +
+        `outside ${MIN_PROTOCOL_VERSION}-${MAX_PROTOCOL_VERSION}. Update the Cubes MCP ` +
+        `plugin and restart Studio.`
+      );
+    }
+    if (!d.everPolled) {
+      return (
+        `Listening on 127.0.0.1:${d.port}, but nothing has ever polled it. Open Studio ` +
+        `with a place loaded, install the Cubes MCP plugin, and check its toolbar button ` +
+        `is active. Plugins are cached at launch, so restart Studio after installing.`
+      );
+    }
+    const secs = Math.round((d.msSinceLastPoll ?? 0) / 1000);
+    return (
+      `The plugin polled ${secs}s ago and has gone quiet. Studio is most likely in Play ` +
+      `mode (the edit-mode plugin stops polling), or the place was closed. If neither, ` +
+      `restart Studio and this MCP client.`
+    );
+  }
+
   get queueDepth(): number {
     return this.queue.length;
   }
@@ -300,7 +393,20 @@ export class StudioBridge implements StudioTransport {
 
       // Reject only the startup attempt; later errors must be logged, not
       // swallowed by a settled promise (AUDIT.md #23).
-      this.httpServer.once("error", reject);
+      this.httpServer.once("error", (err) => {
+        // Recorded BEFORE rejecting: index.ts catches this and starts the MCP
+        // server anyway, so the failure has to survive the rejection to be
+        // reportable later. A busy port used to take the whole process down.
+        this.listenError = err instanceof Error ? err.message : String(err);
+        // The dead server object now outlives the failure, because the process
+        // keeps running. Without a standing listener a later emit is an uncaught
+        // exception -- the old code got away with it only because a failed start
+        // killed the process.
+        this.httpServer?.on("error", (later) => {
+          process.stderr.write(`[cubes-mcp] bridge server error after failed start: ${String(later)}\n`);
+        });
+        reject(err);
+      });
       this.httpServer.listen(this.port, "127.0.0.1", () => {
         this.httpServer?.removeListener("error", reject);
         this.httpServer?.on("error", (err) => {
@@ -352,10 +458,7 @@ export class StudioBridge implements StudioTransport {
         );
       }
       return Promise.reject(
-        new BridgeError(
-          "studio_not_connected",
-          "The Roblox Studio plugin is not polling. Open Studio with a place loaded, install the Cubes MCP plugin, and make sure its toolbar button is active.",
-        ),
+        new BridgeError("studio_not_connected", this.describeDisconnect(), this.diagnosis),
       );
     }
     // Defence in depth. Until now the write gate lived only in callers, and
@@ -439,6 +542,8 @@ export class StudioBridge implements StudioTransport {
    */
   private noteHandshake(got: number | null, ok: boolean): void {
     this.lastHandshake = { protocol: got, ok, at: Date.now() };
+    if (ok) this.everPolled = true;
+    else this.protocolRejections += 1;
     if (ok) {
       this.warnedProtocol = undefined;
       return;
@@ -648,7 +753,8 @@ export class StudioBridge implements StudioTransport {
     if (!this.allowUnauthenticated) {
       const presented = this.presentedToken(req, opts.allowQueryToken === true);
       if (!presented || !tokenMatches(presented, this.token)) {
-        return { status: 401, code: "unauthorized", message: "Missing or invalid bridge token." };
+        this.authRejections += 1;
+      return { status: 401, code: "unauthorized", message: "Missing or invalid bridge token." };
       }
     }
     return null;
@@ -690,11 +796,19 @@ export class StudioBridge implements StudioTransport {
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = (req.url ?? "/").split("?")[0];
 
-    // /health is the one unauthenticated route: it reveals nothing but liveness
-    // and still refuses browsers and non-loopback hosts.
+    // /health is the one unauthenticated route, and it is TWO-TIER.
+    //
+    // Liveness has always been public here: it reveals nothing a port scan does
+    // not, and refusing it would break the plugin's own "can I see the server"
+    // probe. The diagnosis is different. `authRejections` tells an unauthenticated
+    // caller that its own probes are landing, and `msSinceLastPoll` is a running
+    // account of when the user is at their desk. Neither is catastrophic and both
+    // are genuinely useful to the person being helped -- so they go behind the
+    // token rather than being dropped, and the public tier says they exist.
     if (url === "/health") {
       const failure = this.guard(req, { requireJson: false });
       if (failure && failure.code !== "unauthorized") return StudioBridge.deny(res, failure);
+      const authed = !failure;
       res.setHeader("content-type", "application/json");
       res.end(
         JSON.stringify({
@@ -707,6 +821,12 @@ export class StudioBridge implements StudioTransport {
           protocolRange: [MIN_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION],
           handshake: this.lastHandshake,
           authRequired: !this.allowUnauthenticated,
+          // The block to paste when asking for help: every maintainer in this
+          // ecosystem closes connection issues asking for exactly this. Carries
+          // no token material at either tier.
+          diagnosis: authed ? this.diagnosis : undefined,
+          problem: authed && !this.connected ? this.describeDisconnect() : undefined,
+          detail: authed ? undefined : "Send the bridge token to see why Studio is not connected.",
         }),
       );
       return;

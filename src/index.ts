@@ -92,14 +92,39 @@ async function main(): Promise<void> {
     readOnly: READ_ONLY,
     readOnlyCommands: rpcReadOnlyCommands(),
   });
-  await bridge.start();
+  // The bridge failing must NEVER stop the MCP server from starting.
+  //
+  // This used to be `await bridge.start()` before `server.connect`, so a port
+  // already in use -- a second copy of this server, a leftover process -- took
+  // the whole thing down: the client saw a dead server with no tools at all and
+  // no way to find out why. blender-mcp hit the same shape and a user described
+  // it as breaking "the entire host client and prevents all my other MCP servers
+  // from loading". Tools stay listed; the ones that need Studio say what is wrong.
+  //
+  // Note what this deliberately does NOT do: scan for a free port. Auto-discovery
+  // was tried in this ecosystem and removed again, because it produces a plugin
+  // panel that reports "connected" while pointing at a port nothing is serving.
+  // A named failure beats a silent mismatch.
+  let bridgeStarted = true;
+  try {
+    await bridge.start();
+  } catch (err) {
+    bridgeStarted = false;
+    console.error(
+      `[cubes-mcp] the Studio bridge could not start: ${err instanceof Error ? err.message : String(err)}\n` +
+        `[cubes-mcp] MCP is still up and every tool is still listed; the ones that need\n` +
+        `[cubes-mcp] Studio will explain this instead of hanging. Fix the port and restart.`,
+    );
+  }
 
   const server = createMcpServer(bridge, { readOnly: READ_ONLY });
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
   console.error(
-    `[cubes-mcp] ready — MCP on stdio, Studio bridge on http://127.0.0.1:${PORT}`,
+    bridgeStarted
+      ? `[cubes-mcp] ready — MCP on stdio, Studio bridge on http://127.0.0.1:${PORT}`
+      : `[cubes-mcp] ready — MCP on stdio, Studio bridge DOWN (port ${PORT} unavailable)`,
   );
   if (READ_ONLY) {
     console.error(

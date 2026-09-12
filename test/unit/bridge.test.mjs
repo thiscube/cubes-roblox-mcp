@@ -318,3 +318,155 @@ describe("rpc write gate (#1)", () => {
     }
   });
 });
+
+/**
+ * Connection diagnosis.
+ *
+ * The old `studio_not_connected` message named one cause -- "the plugin is not
+ * polling" -- whatever had actually gone wrong. A busy port said it. A plugin
+ * polling with the wrong token said it. So a token mismatch sent people off to
+ * reinstall a plugin that was already installed and already running, which is
+ * the single most expensive wrong sentence this server can produce.
+ */
+describe("bridge connection diagnosis", () => {
+  test("a busy port is reported as a busy port, not as a missing plugin", async () => {
+    const first = new StudioBridge(0, {});
+    await first.start();
+    const port = first.boundPort;
+    const second = new StudioBridge(port, {});
+    try {
+      await assert.rejects(() => second.start());
+      const d = second.diagnosis;
+      assert.equal(d.listening, false);
+      assert.ok(d.listenError, "the listen failure has to survive the rejection");
+      assert.match(second.describeDisconnect(), /port .* is in use/);
+      assert.doesNotMatch(second.describeDisconnect(), /install the Cubes MCP plugin/);
+    } finally {
+      await first.stop();
+      await second.stop();
+    }
+  });
+
+  test("a rejected token is reported as a token problem", async () => {
+    const bridge = new StudioBridge(0, {});
+    await bridge.start();
+    try {
+      const port = bridge.boundPort;
+      for (let i = 0; i < 3; i++) {
+        await fetch(`http://127.0.0.1:${port}/poll`, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: "Bearer wrong" },
+          body: JSON.stringify({ protocol: MAX_PROTOCOL_VERSION }),
+        }).catch(() => {});
+      }
+      const d = bridge.diagnosis;
+      assert.equal(d.authRejections, 3);
+      assert.equal(d.everPolled, false);
+      const msg = bridge.describeDisconnect();
+      assert.match(msg, /wrong bearer token/);
+      assert.match(msg, /CUBES_MCP_TOKEN/, "it should name the fix, not just the fault");
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  test("nothing polling yet reads differently from polling that stopped", async () => {
+    const bridge = new StudioBridge(0, {});
+    await bridge.start();
+    try {
+      assert.match(bridge.describeDisconnect(), /nothing has ever polled/i);
+      const port = bridge.boundPort;
+      // A /poll is HELD OPEN for POLL_HOLD_MS. Awaiting it would park this test
+      // for 25 seconds, so fire it, wait for the handshake to be recorded, and
+      // abort -- the state under test is set before the hold begins.
+      const ctrl = new AbortController();
+      const inflight = fetch(`http://127.0.0.1:${port}/poll`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${bridge.token}`,
+        },
+        body: JSON.stringify({ protocol: MAX_PROTOCOL_VERSION }),
+        signal: ctrl.signal,
+      }).catch(() => {});
+      for (let i = 0; i < 100 && !bridge.diagnosis.everPolled; i++) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      ctrl.abort();
+      await inflight;
+      assert.equal(bridge.diagnosis.everPolled, true);
+      // Play mode is the most common reason a healthy plugin goes quiet, and
+      // users file it as a disconnect every time. Name it.
+      assert.match(bridge.describeDisconnect(), /Play mode/);
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  test("the diagnosis never carries token material", async () => {
+    const bridge = new StudioBridge(0, {});
+    await bridge.start();
+    try {
+      const blob = JSON.stringify(bridge.diagnosis) + bridge.describeDisconnect();
+      assert.ok(!blob.includes(bridge.token), "the diagnosis leaked the token");
+      // Not even a prefix or a length: both narrow a guess.
+      assert.ok(!blob.includes(bridge.token.slice(0, 6)), "the diagnosis leaked a token prefix");
+      assert.ok(!blob.includes(String(bridge.token.length)), "the diagnosis leaked the token length");
+    } finally {
+      await bridge.stop();
+    }
+  });
+});
+
+/**
+ * /health is deliberately the one unauthenticated route, which makes anything
+ * added to it public to every local process. The diagnosis counters are useful
+ * to the person being helped AND to someone probing the token, so they sit on
+ * the authenticated tier.
+ */
+describe("/health tiers", () => {
+  const get = (port, token) =>
+    fetch(`http://127.0.0.1:${port}/health`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+      },
+    }).then((r) => r.json());
+
+  test("liveness is public, the diagnosis is not", async () => {
+    const bridge = new StudioBridge(0, {});
+    await bridge.start();
+    try {
+      const port = bridge.boundPort;
+      const anon = await get(port);
+      assert.equal(anon.ok, true, "liveness must stay public");
+      assert.equal(anon.connected, false);
+      assert.equal(anon.diagnosis, undefined, "counters must not be world-readable");
+      assert.equal(anon.problem, undefined);
+      assert.match(anon.detail, /bridge token/, "it should say how to see more");
+
+      const authed = await get(port, bridge.token);
+      assert.ok(authed.diagnosis, "a token buys the diagnosis");
+      assert.equal(typeof authed.diagnosis.authRejections, "number");
+      assert.ok(authed.problem, "and the sentence that names the cause");
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  test("neither tier leaks token material", async () => {
+    const bridge = new StudioBridge(0, {});
+    await bridge.start();
+    try {
+      const port = bridge.boundPort;
+      for (const body of [await get(port), await get(port, bridge.token)]) {
+        const blob = JSON.stringify(body);
+        assert.ok(!blob.includes(bridge.token), "token in /health body");
+        assert.ok(!blob.includes(bridge.token.slice(0, 6)), "token prefix in /health body");
+      }
+    } finally {
+      await bridge.stop();
+    }
+  });
+});
