@@ -10,6 +10,7 @@ second place to look is a second place to be wrong.
 |---|---|---|
 | `CUBES_MCP_PORT` | `44820` | Bridge listen port. Must match the Studio panel. |
 | `CUBES_MCP_TOKEN` | generated per run | Pins the bridge token across restarts. |
+| `CUBES_MCP_RPC_TOKEN` | unset | Deprecated alias for the above. |
 | `CUBES_MCP_READ_ONLY` | unset | `1` removes every write tool from the process. |
 | `CUBES_MCP_HOME` | `~/.cubesmcp` | Where profiles and the API dump cache live. |
 | `CUBES_MCP_OFFLINE` | unset | `1` forbids the API-dump download. |
@@ -66,11 +67,15 @@ it is compared byte for byte.
 
 See SECURITY.md for what the token does and does not protect.
 
+`CUBES_MCP_RPC_TOKEN` is accepted as an alias, for configurations written before
+the variable was renamed. Prefer `CUBES_MCP_TOKEN`; if both are set, that one
+wins.
+
 ## `CUBES_MCP_READ_ONLY`
 
 `1`, `true`, or the `--read-only` flag. The server reports itself as
 `cubes-roblox-mcp-inspector` so the client can tell which build it got, and
-`tools/list` is `search_tools`, `read`, `screenshot` plus 22 read specialists.
+`tools/list` is `search_tools`, `read`, `screenshot` plus 27 inspector-safe specialists.
 
 Use it when you want a model looking at a place it must not touch.
 
