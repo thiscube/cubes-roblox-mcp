@@ -135,6 +135,25 @@ describe("asset search and details", () => {
     assert.deepEqual(calls, []);
   });
 
+  test("CUBES_MCP_OFFLINE guards the real network, not a stub", async () => {
+    // The guard used to sit above the seam, in getJson, so a test that had
+    // installed a stub was refused too — which failed the entire asset suite
+    // under the CUBES_MCP_OFFLINE=1 that CI sets. Offline means "do not reach
+    // Roblox"; a stub is not Roblox.
+    const before = process.env.CUBES_MCP_OFFLINE;
+    process.env.CUBES_MCP_OFFLINE = "1";
+    try {
+      stubNetwork([["marketplace/", { totalResults: 1, data: [{ id: 5 }] }], ["items/details", { data: [detailEntry(5)] }]]);
+      const res = await tool("asset_search").handler({ query: "tree" }, {});
+      assert.equal(res.error, undefined, "a stubbed fetch must still work offline");
+      assert.deepEqual(res.assets.map((a) => a.id), [5]);
+    } finally {
+      if (before === undefined) delete process.env.CUBES_MCP_OFFLINE;
+      else process.env.CUBES_MCP_OFFLINE = before;
+      __setAssetFetchForTest(null);
+    }
+  });
+
   test("offline refuses rather than reaching out", async () => {
     __setAssetFetchForTest(null);
     const before = process.env.CUBES_MCP_OFFLINE;

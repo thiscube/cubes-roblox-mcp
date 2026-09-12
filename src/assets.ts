@@ -65,16 +65,29 @@ export interface SearchResult {
 
 /** Test seam: swap the network out without a global mock. */
 type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
-let fetchImpl: FetchLike = (url, init) => fetch(url, init);
+
+/**
+ * The real network, with the offline guard on IT rather than on the caller.
+ *
+ * The guard used to sit in `getJson`, above the seam, which meant a test that
+ * had installed a stub still got refused — so the whole asset suite failed under
+ * the `CUBES_MCP_OFFLINE=1` that CI sets. Offline is about not reaching the real
+ * network; a stub is not the network.
+ */
+const realFetch: FetchLike = (url, init) => {
+  if (process.env.CUBES_MCP_OFFLINE === "1") {
+    return Promise.reject(new Error("CUBES_MCP_OFFLINE=1: refusing to reach Roblox for asset data."));
+  }
+  return fetch(url, init);
+};
+
+let fetchImpl: FetchLike = realFetch;
 
 export function __setAssetFetchForTest(impl: FetchLike | null): void {
-  fetchImpl = impl ?? ((url, init) => fetch(url, init));
+  fetchImpl = impl ?? realFetch;
 }
 
 async function getJson(url: string, init: RequestInit = {}): Promise<any> {
-  if (process.env.CUBES_MCP_OFFLINE === "1") {
-    throw new Error("CUBES_MCP_OFFLINE=1: refusing to reach Roblox for asset data.");
-  }
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
