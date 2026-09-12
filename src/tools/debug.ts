@@ -365,7 +365,7 @@ return { cleared = false, note = "no debug folder present" }
           },
           scriptRef: {
             type: "string",
-            description: "Optional ref/path of a specific script to read context from.",
+            description: "Optional ref/path of a script to read context from instead of searching errors.",
           },
           line: {
             type: "number",

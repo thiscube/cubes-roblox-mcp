@@ -97,7 +97,7 @@ return { registered = registered, rules = ruleCount, partsAssigned = assigned }
         properties: {
           type: { type: "string", description: "Any constraint class: HingeConstraint, SpringConstraint, RopeConstraint, RodConstraint, AlignPosition, AlignOrientation." },
           part0: { type: "string", description: "Ref/path of part0 (Attachment0 host)." },
-          part1: { type: "string", description: "Ref/path of part1. Optional for one-sided constraints with a world target." },
+          part1: { type: "string", description: "Ref/path of part1 (Attachment1 host). Optional for one-sided constraints." },
           offset0: { type: "array", items: { type: "number" }, description: "Local [x,y,z] offset of Attachment0." },
           offset1: { type: "array", items: { type: "number" }, description: "Local [x,y,z] offset of Attachment1." },
           props: { type: "object", description: "Extra props to set on the constraint (Stiffness, Damping, Length, Restitution, MaxForce, ...)." },
