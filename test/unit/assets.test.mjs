@@ -9,6 +9,12 @@
  */
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { rm, symlink } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 import { ASSETS_TOOLS } from "../../dist/tools/assets.js";
 import { __setAssetFetchForTest, ASSET_TYPES } from "../../dist/assets.js";
@@ -228,7 +234,48 @@ describe("asset_upload gate", () => {
         { confirmWithUser: async () => true },
       );
       assert.equal(res.error, "path_not_allowed", `${bad} was not refused`);
-      assert.match(res.message, /only files under|expected one of/);
+      // Three honest ways to refuse: outside the root, wrong kind of file, or —
+      // for a literal `~`, which nothing expands — not there at all.
+      assert.match(res.message, /only files under|expected one of|no such file/);
+    }
+  });
+
+  test("a symlink out of the project is refused, not followed", async () => {
+    // resolve() collapses `..` and knows nothing about symlinks, so a
+    // model.rbxm inside the project pointing at /etc/passwd walked straight
+    // through the first version of this check.
+    const link = join(ROOT, "test", "fixtures", "escape.rbxm");
+    await rm(link, { force: true });
+    await symlink("/etc/passwd", link);
+    try {
+      const res = await upload(
+        { filePath: "test/fixtures/escape.rbxm", assetType: "Model", name: "x", confirm: true },
+        { confirmWithUser: async () => true },
+      );
+      assert.equal(res.error, "path_not_allowed");
+      assert.match(res.message, /\/etc\/passwd/, "the refusal should name what it resolved to");
+    } finally {
+      await rm(link, { force: true });
+    }
+  });
+
+  test("a root that confines nothing is refused rather than pretended", async () => {
+    // The working directory is chosen by whoever launched the server. If that is
+    // `/` or a home directory, a boundary check against it is theatre.
+    const before = process.env.CUBES_MCP_UPLOAD_ROOT;
+    try {
+      for (const useless of ["/", homedir()]) {
+        process.env.CUBES_MCP_UPLOAD_ROOT = useless;
+        const res = await upload(
+          { filePath: "anything.rbxm", assetType: "Model", name: "x", confirm: true },
+          { confirmWithUser: async () => true },
+        );
+        assert.equal(res.error, "path_not_allowed", `${useless} should not be accepted as a root`);
+        assert.match(res.message, /confines nothing/);
+      }
+    } finally {
+      if (before === undefined) delete process.env.CUBES_MCP_UPLOAD_ROOT;
+      else process.env.CUBES_MCP_UPLOAD_ROOT = before;
     }
   });
 

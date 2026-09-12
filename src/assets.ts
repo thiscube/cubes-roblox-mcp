@@ -20,6 +20,8 @@
  * decides whether inserting it is safe.
  */
 
+import { realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { extname, resolve, sep } from "node:path";
 
 const TOOLBOX = "https://apis.roblox.com/toolbox-service/v1";
@@ -165,7 +167,35 @@ const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const UPLOAD_EXTENSIONS = new Set([".rbxm", ".rbxmx", ".png", ".jpg", ".jpeg", ".bmp", ".tga", ".mp3", ".ogg", ".wav"]);
 
 /**
- * Confine an upload to the working directory.
+ * Where an upload may read from. `CUBES_MCP_UPLOAD_ROOT`, else the working
+ * directory.
+ *
+ * The working directory is chosen by whoever launched the server, not by this
+ * code, so it is a default rather than a guarantee. A root of `/`, or a bare
+ * home directory, confines nothing — those are refused outright rather than
+ * providing the appearance of a boundary.
+ */
+export function uploadRoot(): string {
+  const configured = process.env.CUBES_MCP_UPLOAD_ROOT;
+  const base = resolve(configured && configured.trim() ? configured : process.cwd());
+  const parts = base.split(sep).filter(Boolean);
+  if (parts.length === 0) {
+    throw new Error(
+      "The upload root is the filesystem root, which confines nothing. " +
+        "Set CUBES_MCP_UPLOAD_ROOT to your project directory.",
+    );
+  }
+  if (base === homedir()) {
+    throw new Error(
+      `The upload root is your home directory (${base}), which confines nothing. ` +
+        "Set CUBES_MCP_UPLOAD_ROOT to the project you are working in.",
+    );
+  }
+  return base;
+}
+
+/**
+ * Confine an upload to that root.
  *
  * Without this, `asset_upload` is an arbitrary file read plus an exfiltration
  * channel: `filePath` went straight to `readFile` with no validation, so an
@@ -176,24 +206,46 @@ const UPLOAD_EXTENSIONS = new Set([".rbxm", ".rbxmx", ".png", ".jpg", ".jpeg", "
  *
  * Confinement is the hard boundary here, because every other check in this tool
  * is something the model itself supplies.
+ *
+ * The path is resolved through `realpathSync` first. `resolve()` alone collapses
+ * `..` but knows nothing about symlinks, so a `model.rbxm` inside the project
+ * pointing at `/etc/passwd` would have walked straight through.
  */
-export function resolveUploadPath(filePath: string, root = process.cwd()): string {
-  const base = resolve(root);
-  const full = resolve(base, filePath);
-  const inside = full === base || full.startsWith(base + sep);
-  if (!inside) {
+export function resolveUploadPath(filePath: string, root?: string): string {
+  const base = root ? resolve(root) : uploadRoot();
+  const requested = String(filePath ?? "");
+  if (requested.includes("\0")) throw new Error("Refusing a path containing a null byte.");
+
+  const full = resolve(base, requested);
+  let real: string;
+  try {
+    real = realpathSync(full);
+  } catch {
+    throw new Error(`Refusing to upload ${full}: no such file.`);
+  }
+  // Resolve the root too: on macOS the working directory is often reached
+  // through /tmp -> /private/tmp, and comparing one resolved path against one
+  // unresolved one rejects perfectly legitimate files.
+  let realBase: string;
+  try {
+    realBase = realpathSync(base);
+  } catch {
+    realBase = base;
+  }
+
+  if (real !== realBase && !real.startsWith(realBase + sep)) {
     throw new Error(
-      `Refusing to upload ${full}: only files under ${base} can be uploaded. ` +
+      `Refusing to upload ${real}: only files under ${realBase} can be uploaded. ` +
         `Copy it into the project first if that is really what you meant.`,
     );
   }
-  const ext = extname(full).toLowerCase();
+  const ext = extname(real).toLowerCase();
   if (!UPLOAD_EXTENSIONS.has(ext)) {
     throw new Error(
       `Refusing to upload ${ext || "a file with no extension"}: expected one of ${[...UPLOAD_EXTENSIONS].join(", ")}.`,
     );
   }
-  return full;
+  return real;
 }
 
 export function openCloudKey(): string | undefined {

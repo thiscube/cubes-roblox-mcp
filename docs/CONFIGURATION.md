@@ -17,6 +17,7 @@ second place to look is a second place to be wrong.
 | `CUBES_MCP_SOURCEMAP` | autodetect | Path to a Rojo `sourcemap.json`. |
 | `CUBES_MCP_LINT_CWD` | repo root | Directory holding your `selene.toml`. |
 | `CUBES_MCP_OPEN_CLOUD_KEY` | unset | Open Cloud API key. Only `asset_upload` needs it. |
+| `CUBES_MCP_UPLOAD_ROOT` | working directory | The only directory `asset_upload` may read from. |
 | `CUBES_MCP_ALLOW_UNAUTHENTICATED` | unset | `1` disables the bridge token. Unsafe. |
 
 Plus `--read-only` on the command line, equivalent to `CUBES_MCP_READ_ONLY=1`.
@@ -129,9 +130,22 @@ and fetching thumbnails all use public endpoints and need no credentials, which
 is deliberate: the part people actually want works the moment they install.
 
 Create a key at https://create.roblox.com/dashboard/credentials with the asset
-write scope. `asset_upload` also needs `confirm: true`, or an elicitation-capable
-client so the server can ask you directly — uploading publishes to your account
-and nothing here can undo it.
+write scope.
+
+`asset_upload` asks you directly whenever the client can show a prompt. There is
+no way for the model to skip that — `confirm: true` is only honoured by clients
+that cannot prompt at all, because `confirm` is a field the model itself writes.
+
+## `CUBES_MCP_UPLOAD_ROOT`
+
+The only directory `asset_upload` may read from. Defaults to the working
+directory, which is chosen by whoever launched the server rather than by this
+code — so set it explicitly if you care.
+
+Paths are resolved through their symlinks before the boundary is checked, so a
+`.rbxm` inside the project pointing somewhere else is refused. A root of `/` or
+a bare home directory is refused outright: a boundary check against those
+confines nothing, and the appearance of a boundary is worse than none.
 
 ## `CUBES_MCP_ALLOW_UNAUTHENTICATED`
 
