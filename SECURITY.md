@@ -81,10 +81,16 @@ the process: `mutate`, `run_code` and 41 specialists are not registered, cannot
 be called by name, cannot be found by `search_tools`. `/rpc` refuses writes
 whatever the Studio panel says, and `send()` refuses them at the transport too.
 
-Tools that only write to disk are filtered as well, not just the ones that reach
-Studio. `profile_update` is server-local — it never touches the DataModel — and
-it was surviving into this build and writing a file in your home directory,
-which is not what "read-only" says on the tin.
+**Everything that reaches outside the process is filtered, not just Studio
+writes.** A tool can affect the world in exactly three ways — the DataModel, the
+disk, and the network — and the filter asks about all three. That was not always
+true, and both holes were real: `profile_update` shipped in this build and wrote
+a file in your home directory, and then `asset_upload` shipped in it too, a tool
+that read any file on the machine and posted it to Roblox.
+
+`asset_upload` is now confined to the project directory, checks the extension,
+caps the size, and asks you directly every time the client can ask — `confirm:
+true` does not skip that prompt, because the model is what supplies `confirm`.
 
 This is stronger than the toggle. There is no gate to get wrong and nothing for a
 determined model to argue its way past, because the tools are not there.

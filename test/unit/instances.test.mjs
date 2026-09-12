@@ -247,7 +247,10 @@ describe("studio_instances tool", () => {
     );
     assert.equal(res.count, 2);
     assert.equal(res.instances[0].secondsSinceSeen, 3);
-    assert.match(res.note, /polls first/);
+    // The note has to say the honest thing: the bridge can route by id, but no
+    // tool accepts one yet, so a second window is a hazard rather than a target.
+    assert.match(res.note, /answers first/);
+    assert.match(res.note, /does not expose it/);
   });
 
   test("it is read-only, so the inspector build keeps it", async () => {

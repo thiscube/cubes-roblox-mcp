@@ -346,13 +346,14 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
   // tool — it never touches Studio — and it was surviving into the read-only
   // build and writing a file in the user's home, which is not what "read-only"
   // says on the tin.
+  //
+  // `inspectorSafe` covers all three ways a tool can affect the world: the
+  // DataModel, the disk, and the network. Filtering on `write` alone shipped
+  // `profile_update` (writes the user's home) and then `asset_upload` (reads a
+  // file and posts it to Roblox) in the build whose promise is that it cannot
+  // touch anything.
   const registry = new ToolRegistry(
-    readOnly
-      ? ALL_TOOLS.filter((t) => {
-          const cap = capabilities(t);
-          return !cap.write && !cap.writesDisk;
-        })
-      : ALL_TOOLS,
+    readOnly ? ALL_TOOLS.filter((t) => capabilities(t).inspectorSafe) : ALL_TOOLS,
   );
   const memory = new SessionMemory();
   const sourcemap = new SourceMap();

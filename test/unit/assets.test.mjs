@@ -209,45 +209,91 @@ describe("asset_upload gate", () => {
     delete process.env.CUBES_MCP_OPEN_CLOUD_KEY;
   });
 
+  const upload = (args, ctx = {}) => tool("asset_upload").handler(args, ctx);
+  const inProject = "test/fixtures/model.rbxm";
+
   test("no key is a clear refusal, not a failed request", async () => {
     delete process.env.CUBES_MCP_OPEN_CLOUD_KEY;
-    const res = await tool("asset_upload").handler({ filePath: "/tmp/x", assetType: "Model", name: "x" }, {});
+    const res = await upload({ filePath: inProject, assetType: "Model", name: "x" });
     assert.equal(res.error, "no_open_cloud_key");
   });
 
-  test("it asks the human when the client can be asked", async () => {
-    let asked = null;
-    const res = await tool("asset_upload").handler(
-      { filePath: "/tmp/x.rbxm", assetType: "Model", name: "My Tree" },
-      {
-        confirmWithUser: async (q, detail) => {
-          asked = { q, detail };
-          return false;
-        },
-      },
+  test("a file outside the project is refused, whatever else the call says", async () => {
+    // This is the finding that made the rest of the gate beside the point:
+    // filePath went straight to readFile, so an absolute path to an SSH key was
+    // uploaded to Roblox as a "Model" and the tool reported success.
+    for (const bad of ["/root/.ssh/id_rsa", "/etc/passwd", "../../../etc/shadow", "~/.aws/credentials"]) {
+      const res = await upload(
+        { filePath: bad, assetType: "Model", name: "totally-a-model", confirm: true },
+        { confirmWithUser: async () => true },
+      );
+      assert.equal(res.error, "path_not_allowed", `${bad} was not refused`);
+      assert.match(res.message, /only files under|expected one of/);
+    }
+  });
+
+  test("a file inside the project but of the wrong kind is refused too", async () => {
+    // An extension check is weak on its own, but combined with confinement it
+    // stops the obvious "upload the source tree as a Model" shape.
+    for (const bad of ["package.json", "src/server.ts", "dist/index.js", ".env"]) {
+      const res = await upload(
+        { filePath: bad, assetType: "Model", name: "x", confirm: true },
+        { confirmWithUser: async () => true },
+      );
+      assert.equal(res.error, "path_not_allowed", `${bad} was not refused`);
+    }
+  });
+
+  test("the path is checked BEFORE anyone is asked anything", async () => {
+    // Otherwise the human gets prompted about a file that was never going to be
+    // allowed, which trains them to click through the prompt.
+    let asked = false;
+    const res = await upload(
+      { filePath: "/etc/passwd", assetType: "Model", name: "x" },
+      { confirmWithUser: async () => { asked = true; return true; } },
     );
-    assert.match(asked.q, /Upload "My Tree"/);
-    assert.ok(asked.detail.some((d) => d.includes("cannot be deleted")));
+    assert.equal(res.error, "path_not_allowed");
+    assert.equal(asked, false);
+  });
+
+  test("confirm: true does NOT skip the human when the client can be asked", async () => {
+    // The model supplies `confirm`, so treating it as consent makes the gate a
+    // suggestion to an LLM — the exact thing this project criticises the
+    // competition for. It is the fallback for a client that cannot prompt, not
+    // a way around one that can.
+    let asked = 0;
+    const res = await upload(
+      { filePath: inProject, assetType: "Model", name: "Tree", confirm: true },
+      { confirmWithUser: async () => { asked += 1; return false; } },
+    );
+    assert.equal(asked, 1, "the human must still be asked");
     assert.equal(res.error, "declined_by_user");
   });
 
-  test("a client that cannot ask gets a structured refusal with the exact retry", async () => {
-    const res = await tool("asset_upload").handler(
-      { filePath: "/tmp/x.rbxm", assetType: "Model", name: "x" },
-      {},
+  test("a decline is final, and says so", async () => {
+    const res = await upload(
+      { filePath: inProject, assetType: "Model", name: "Tree" },
+      { confirmWithUser: async () => false },
     );
-    assert.equal(res.error, "needs_confirmation");
-    assert.equal(res.retry_with.confirm, true);
-    assert.equal(res.retry_with.filePath, "/tmp/x.rbxm");
+    assert.equal(res.error, "declined_by_user");
+    assert.match(res.hint, /without new instructions/);
   });
 
-  test("it is not gated by the Studio write toggle, and says why", () => {
-    // The toggle is about the open place. This publishes to the user's Roblox
-    // account, so it carries its own gate rather than riding that one.
+  test("a client that cannot ask falls back to confirm, with the exact retry", async () => {
+    const noPrompt = await upload({ filePath: inProject, assetType: "Model", name: "x" }, {});
+    assert.equal(noPrompt.error, "needs_confirmation");
+    assert.equal(noPrompt.retry_with.confirm, true);
+    assert.match(noPrompt.hint, /cannot show a prompt/);
+  });
+
+  test("it is not in the read-only build, because it sends bytes off the machine", async () => {
     const entry = tool("asset_upload");
-    assert.equal(entry.channel, "local");
-    assert.equal(capabilities(entry).write, false);
-    assert.match(entry.description, /confirm: true/);
+    const cap = capabilities(entry);
+    assert.equal(cap.network, "write");
+    assert.equal(cap.inspectorSafe, false, "an inspector build must not be able to upload");
+    // Reading is fine in that build; sending is not.
+    assert.equal(capabilities(tool("asset_search")).inspectorSafe, true);
+    assert.equal(capabilities(tool("asset_details")).inspectorSafe, true);
   });
 });
 

@@ -20,6 +20,8 @@
  * decides whether inserting it is safe.
  */
 
+import { extname, resolve, sep } from "node:path";
+
 const TOOLBOX = "https://apis.roblox.com/toolbox-service/v1";
 const THUMBNAILS = "https://thumbnails.roblox.com/v1";
 const OPEN_CLOUD_ASSETS = "https://apis.roblox.com/assets/v1";
@@ -153,6 +155,47 @@ export async function assetThumbnails(
   }));
 }
 
+/**
+ * Biggest file we will read to upload. A model or a decal is kilobytes; a
+ * multi-megabyte read is a sign something other than an asset is being sent.
+ */
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
+
+/** Extensions an asset upload can plausibly be. */
+const UPLOAD_EXTENSIONS = new Set([".rbxm", ".rbxmx", ".png", ".jpg", ".jpeg", ".bmp", ".tga", ".mp3", ".ogg", ".wav"]);
+
+/**
+ * Confine an upload to the working directory.
+ *
+ * Without this, `asset_upload` is an arbitrary file read plus an exfiltration
+ * channel: `filePath` went straight to `readFile` with no validation, so an
+ * absolute path to an SSH key was uploaded to Roblox as a "Model" and the tool
+ * reported success. Found in verification, reproduced end to end, and reachable
+ * from the read-only build, which is the build whose entire promise is that it
+ * cannot touch anything.
+ *
+ * Confinement is the hard boundary here, because every other check in this tool
+ * is something the model itself supplies.
+ */
+export function resolveUploadPath(filePath: string, root = process.cwd()): string {
+  const base = resolve(root);
+  const full = resolve(base, filePath);
+  const inside = full === base || full.startsWith(base + sep);
+  if (!inside) {
+    throw new Error(
+      `Refusing to upload ${full}: only files under ${base} can be uploaded. ` +
+        `Copy it into the project first if that is really what you meant.`,
+    );
+  }
+  const ext = extname(full).toLowerCase();
+  if (!UPLOAD_EXTENSIONS.has(ext)) {
+    throw new Error(
+      `Refusing to upload ${ext || "a file with no extension"}: expected one of ${[...UPLOAD_EXTENSIONS].join(", ")}.`,
+    );
+  }
+  return full;
+}
+
 export function openCloudKey(): string | undefined {
   const key = process.env.CUBES_MCP_OPEN_CLOUD_KEY;
   return key && key.trim() ? key.trim() : undefined;
@@ -178,8 +221,14 @@ export async function uploadAsset(opts: {
   if (!key) throw new Error("CUBES_MCP_OPEN_CLOUD_KEY is not set; uploading needs an Open Cloud API key.");
   if (!opts.userId && !opts.groupId) throw new Error("Uploading needs a userId or a groupId to own the asset.");
 
-  const { readFile } = await import("node:fs/promises");
-  const bytes = await readFile(opts.filePath);
+  const { readFile, stat } = await import("node:fs/promises");
+  const full = resolveUploadPath(opts.filePath);
+  const info = await stat(full);
+  if (!info.isFile()) throw new Error(`${full} is not a file.`);
+  if (info.size > MAX_UPLOAD_BYTES) {
+    throw new Error(`${full} is ${info.size} bytes; the upload limit is ${MAX_UPLOAD_BYTES}.`);
+  }
+  const bytes = await readFile(full);
   const form = new FormData();
   form.append(
     "request",

@@ -36,7 +36,18 @@ export interface StudioInstance {
 
 export interface StudioTransport {
   /** Queue a command for Studio and await its result. Rejects with BridgeError. */
-  send(tool: string, args: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
+  /**
+   * `target` names one Studio window (see `listInstances`). The bridge honours
+   * it; nothing above this line passes it yet, so with several windows open a
+   * command still goes to whichever answers first. The gap is real and is
+   * recorded in PLAN.md item 11 rather than papered over here.
+   */
+  send(
+    tool: string,
+    args: Record<string, unknown>,
+    timeoutMs?: number,
+    target?: string,
+  ): Promise<unknown>;
   /** True if something is currently polling us. */
   readonly connected: boolean;
   /**

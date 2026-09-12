@@ -309,10 +309,13 @@ and the command queue is keyed by it. A command addressed to a window only ever
 goes to that window — if it is absent the command waits and times out rather than
 being diverted. `studio_instances` lists them, `/health` reports them.
 
-**Still open:** the plugin has to send a distinct `instanceId` per window, and
-`manage_instance` (opening and closing Studio windows) is plugin-side. A plugin
-that sends no id is filed under one default and behaves exactly as before, which
-is what makes protocol 5 additive.
+**Still open, and this is the part that matters:** the routing works and is
+unreachable. `StudioTransport.send` takes a `target`, the bridge honours it, and
+no tool passes one — so with two windows open every call still goes to whoever
+answers first. Exposing it means either a reserved argument on every tool schema
+or a session-level "current window", and that is a design decision, not a typo.
+Also still open: the plugin has to send a distinct `instanceId` per window, and
+`manage_instance` is plugin-side.
 
 ### Tier 4: polish that makes it look finished
 

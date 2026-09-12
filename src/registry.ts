@@ -90,10 +90,24 @@ export interface ToolEntry {
    */
   pluginCommand?: string;
   /**
-   * True when the tool writes persistent state under CUBES_MCP_HOME. Only
-   * meaningful for `local` tools; a Studio-channel tool is already write-class.
+   * What this tool does outside this process, beyond reaching Studio.
+   *
+   * There are exactly three ways a tool can affect the world: the DataModel,
+   * the disk, and the network. The channel covers the first. This covers the
+   * other two, and it exists as one field because adding a separate boolean
+   * each time a new effect turned up is how `asset_upload` came to be
+   * classified as harmless — a tool that reads any file on the machine and
+   * posts it to Roblox, shipped in the build whose whole promise is that it
+   * cannot touch anything.
+   *
+   *   state             persists data the user would miss, under CUBES_MCP_HOME.
+   *   network: "read"   fetches; a cache write under the state dir counts here,
+   *                     because server infrastructure is not the user's data.
+   *   network: "write"  sends the user's bytes somewhere they cannot be recalled.
+   *
+   * The read-only build drops anything with `state` or `network: "write"`.
    */
-  writesDisk?: true;
+  effects?: { state?: true; network?: "read" | "write" };
   /**
    * Undo policy, for a tool whose Luau changes the DataModel.
    *
@@ -162,15 +176,18 @@ export interface Capability {
   write: boolean;
   /** Touches the DataModel at all (false for server-local tools). */
   touchesStudio: boolean;
-  /**
-   * Writes persistent state under CUBES_MCP_HOME.
-   *
-   * "Local" was being read as "harmless", and it is not the same thing:
-   * `profile_update` is a local tool that writes a file in the user's home, and
-   * it survived the read-only build's filter because the filter only asked about
-   * Studio. A read-only install should not be writing anything.
-   */
+  /** Persists data the user would miss, under CUBES_MCP_HOME. */
   writesDisk: boolean;
+  /** Makes outbound requests. "write" means it sends the user's bytes out. */
+  network: "none" | "read" | "write";
+  /**
+   * Belongs in a read-only build.
+   *
+   * False for anything that can change the place, persist the user's data, or
+   * send their bytes off the machine. "Local" only ever meant the computation
+   * was here.
+   */
+  inspectorSafe: boolean;
   /**
    * Constructs something in Studio but never parents it, so it changes nothing.
    * Read-class, but not a pure read — worth saying separately so annotations can
@@ -180,11 +197,22 @@ export interface Capability {
 }
 
 export function capabilities(
-  entry: Pick<ToolEntry, "channel" | "readOnly" | "writesDisk">,
+  entry: Pick<ToolEntry, "channel" | "readOnly" | "effects">,
 ): Capability {
-  const writesDisk = entry.writesDisk === true;
+  const writesDisk = entry.effects?.state === true;
+  const network = entry.effects?.network ?? "none";
+  const safe = (write: boolean) => !write && !writesDisk && network !== "write";
   const touchesStudio = entry.channel !== "local";
-  if (!touchesStudio) return { write: false, touchesStudio: false, transient: false, writesDisk };
+  if (!touchesStudio) {
+    return {
+      write: false,
+      touchesStudio: false,
+      transient: false,
+      writesDisk,
+      network,
+      inspectorSafe: safe(false),
+    };
+  }
   // Deny by default: anything on a Studio channel is write-class unless it has
   // explicitly, and provably, opted out. Both opt-out levels are read-class.
   // Fail closed on anything unexpected. `entry.readOnly === undefined` read
@@ -193,11 +221,14 @@ export function capabilities(
   // function is exported, documented as the single source of truth for every
   // gate, and takes a structural Pick<>. Only the two known opt-outs count.
   const optedOut = entry.readOnly === true || entry.readOnly === "transient";
+  const write = !optedOut;
   return {
-    write: !optedOut,
+    write,
     touchesStudio: true,
     transient: entry.readOnly === "transient",
     writesDisk,
+    network,
+    inspectorSafe: safe(write),
   };
 }
 
@@ -361,8 +392,8 @@ interface ToolMeta {
   yieldBudgetMs?: (args: any) => number;
   /** Declared result shape. Defaults to the channel's shape when omitted. */
   outputSchema?: JsonSchema;
-  /** See ToolEntry.writesDisk. Declare it on any local tool that persists anything. */
-  writesDisk?: true;
+  /** See ToolEntry.effects. Declare it on any tool that touches disk or network. */
+  effects?: { state?: true; network?: "read" | "write" };
   /** See ToolEntry.undo. Only for mutating Luau that deliberately stays out of the undo stack. */
   undo?: "none";
 }

@@ -4,9 +4,11 @@ import { objectResult } from "../output-schema.js";
 /**
  * Performance and memory (PLAN.md #8).
  *
- * Every counter here is `Security: None` in the API dump, so this is all
- * reachable from generated Luau with no plugin change — checked rather than
- * assumed, with `docs_class` against the dump the server already caches.
+ * Every `Stats` member these tools call is `Security: None` in the API dump, so
+ * this is reachable from generated Luau with no plugin change — checked rather
+ * than assumed, with `docs_class` against the dump the server already caches.
+ * (The class as a whole is not all-open: `GetBrowserTrackerId` and
+ * `GetPaginatedMemoryByTexture` are RobloxScriptSecurity. Neither is used.)
  *
  * The two profilers the competitor ships are NOT here. `capture_micro_profiler`
  * bundles LibMP into the plugin, and there is no `ScriptProfiler` class in the
@@ -110,7 +112,13 @@ local byClass, total = {}, 0
 local unanchored, collidable, transparent, decals, scripts, meshes = 0, 0, 0, 0, 0, 0
 local heavy = {}
 
+-- Yield periodically. Declaring a 20s budget makes the TIMEOUT survivable; it
+-- does nothing about Studio's main thread being held for the whole of it. A
+-- 200k-instance Workspace would freeze the editor solid without this.
+local since = 0
 for _, d in ipairs(root:GetDescendants()) do
+  since += 1
+  if since >= 5000 then since = 0 task.wait() end
   total += 1
   byClass[d.ClassName] = (byClass[d.ClassName] or 0) + 1
   if d:IsA("BasePart") then

@@ -188,6 +188,11 @@ export const DOCS_TOOLS: ToolEntry[] = [
   localTool(
     {
       name: "docs_class",
+      // Fetches the API dump on a cold cache and writes it under the state
+      // dir. That cache is server infrastructure, not the user's data, so it
+      // is a network read rather than a state write — and stays in the
+      // inspector build, which would be far less useful without it.
+      effects: { network: "read" },
       category: "docs",
       subcategories: ["reference", "api", "lookup"],
       keywords: ["docs", "api", "class", "property", "properties", "method", "event", "reference", "schema", "what"],
@@ -258,6 +263,11 @@ export const DOCS_TOOLS: ToolEntry[] = [
   localTool(
     {
       name: "docs_member",
+      // Fetches the API dump on a cold cache and writes it under the state
+      // dir. That cache is server infrastructure, not the user's data, so it
+      // is a network read rather than a state write — and stays in the
+      // inspector build, which would be far less useful without it.
+      effects: { network: "read" },
       category: "docs",
       subcategories: ["reference", "api", "lookup"],
       keywords: ["docs", "api", "member", "property", "method", "signature", "parameters", "returns", "security"],
@@ -315,6 +325,11 @@ export const DOCS_TOOLS: ToolEntry[] = [
   localTool(
     {
       name: "docs_enum",
+      // Fetches the API dump on a cold cache and writes it under the state
+      // dir. That cache is server infrastructure, not the user's data, so it
+      // is a network read rather than a state write — and stays in the
+      // inspector build, which would be far less useful without it.
+      effects: { network: "read" },
       category: "docs",
       subcategories: ["reference", "api", "lookup"],
       keywords: ["docs", "enum", "material", "easing", "keycode", "values", "items", "options", "allowed"],
@@ -377,6 +392,11 @@ export const DOCS_TOOLS: ToolEntry[] = [
   localTool(
     {
       name: "docs_search",
+      // Fetches the API dump on a cold cache and writes it under the state
+      // dir. That cache is server infrastructure, not the user's data, so it
+      // is a network read rather than a state write — and stays in the
+      // inspector build, which would be far less useful without it.
+      effects: { network: "read" },
       category: "docs",
       subcategories: ["reference", "api", "lookup"],
       keywords: ["docs", "search", "find", "api", "which", "class", "property", "enum", "lookup", "name"],
@@ -467,6 +487,7 @@ export const DOCS_TOOLS: ToolEntry[] = [
   evalTool(
     {
       name: "docs_defaults",
+      effects: { network: "read" },
       category: "docs",
       subcategories: ["reference", "api", "lookup"],
       keywords: ["docs", "default", "defaults", "initial", "value", "starting", "api", "property"],

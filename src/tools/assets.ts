@@ -5,6 +5,7 @@ import {
   assetDetails,
   assetThumbnails,
   openCloudKey,
+  resolveUploadPath,
   searchAssets,
   uploadAsset,
 } from "../assets.js";
@@ -38,6 +39,7 @@ export const ASSETS_TOOLS: ToolEntry[] = [
   localTool(
     {
       name: "asset_search",
+      effects: { network: "read" },
       category: "assets",
       subcategories: ["marketplace", "library", "find"],
       keywords: ["asset", "search", "find", "model", "tree", "marketplace", "toolbox", "library", "free", "store"],
@@ -82,6 +84,7 @@ export const ASSETS_TOOLS: ToolEntry[] = [
   localTool(
     {
       name: "asset_details",
+      effects: { network: "read" },
       category: "assets",
       subcategories: ["marketplace", "inspect"],
       keywords: ["asset", "details", "info", "thumbnail", "preview", "creator", "triangles", "scripts", "check"],
@@ -196,9 +199,25 @@ local ok = pcall(function()
     inserted = inserted or child
   end
   if inserted and a.name then inserted.Name = a.name end
-  if inserted and type(a.position) == "table" and inserted:IsA("PVInstance") then
+  -- Position EVERY child, not just the first. A multi-child asset used to land
+  -- with one piece where you asked for it and the rest wherever they loaded,
+  -- while the count cheerfully reported them all as inserted.
+  if type(a.position) == "table" then
     local p = a.position
-    inserted:PivotTo(CFrame.new(p[1] or 0, p[2] or 0, p[3] or 0))
+    local target = CFrame.new(p[1] or 0, p[2] or 0, p[3] or 0)
+    local anchor = nil
+    for _, child in ipairs(children) do
+      if child:IsA("PVInstance") then
+        if not anchor then
+          anchor = child:GetPivot()
+          child:PivotTo(target)
+        else
+          -- Keep the asset's internal layout: move each piece by the same
+          -- offset the first one moved, rather than stacking them all on one point.
+          child:PivotTo(target * anchor:ToObjectSpace(child:GetPivot()))
+        end
+      end
+    end
   end
 end)
 if not ok then ${cancelUndo} pcall(function() container:Destroy() end) return { error = "insert_failed", message = tostring(err) } end
@@ -219,21 +238,25 @@ return {
   localTool(
     {
       name: "asset_upload",
+      // The one tool that sends the user's bytes somewhere they cannot be
+      // recalled. That is what keeps it out of the read-only build; being
+      // "local" never said anything about where the effect lands.
+      effects: { network: "write" },
       category: "assets",
       subcategories: ["marketplace", "publish"],
       keywords: ["asset", "upload", "publish", "opencloud", "create", "share"],
       description:
-        "Publish a local file to the user's Roblox account via Open Cloud. Needs CUBES_MCP_OPEN_CLOUD_KEY and confirm: true — this leaves the machine and cannot be undone, so it is gated separately from the Studio write toggle.",
+        "Publish a file from the project directory to the user's Roblox account via Open Cloud. Needs CUBES_MCP_OPEN_CLOUD_KEY. Files outside the project are refused, and the user is asked directly whenever the client can ask. Cannot be undone.",
       inputSchema: {
         type: "object",
         properties: {
-          filePath: { type: "string", description: "Local file to upload." },
+          filePath: { type: "string", description: "File to upload. Must be inside the project directory." },
           assetType: { type: "string", enum: ["Model", "Decal", "Audio"], description: "Asset type." },
           name: { type: "string", description: "Display name." },
           description: { type: "string", description: "Asset description." },
           userId: { type: "string", description: "Owning user id. One of userId or groupId." },
           groupId: { type: "string", description: "Owning group id." },
-          confirm: { type: "boolean", description: "Required. Uploading is public and permanent." },
+          confirm: { type: "boolean", description: "Only honoured when the client cannot show a prompt." },
         },
         required: ["filePath", "assetType", "name"],
       },
@@ -246,29 +269,51 @@ return {
           hint: "Set CUBES_MCP_OPEN_CLOUD_KEY to an Open Cloud API key with asset write scope.",
         };
       }
-      // The Studio write toggle is about the open place. This publishes to the
-      // user's Roblox account, where nothing can be undone, so it gets its own
-      // gate — and asks the human directly when the client can be asked.
-      if (args.confirm !== true) {
-        const approved = await ctx.confirmWithUser?.(
-          `Upload "${args.name}" to Roblox as a ${args.assetType}?`,
-          [
-            `File: ${args.filePath}`,
-            "This publishes to the Roblox account behind your Open Cloud key.",
-            "It is public and cannot be deleted by this tool.",
-          ],
-        );
-        if (approved !== true) {
-          return {
-            error: approved === false ? "declined_by_user" : "needs_confirmation",
-            hint: "Uploading is permanent and public. Retry with confirm: true once the user has agreed.",
-            retry_with: { ...args, confirm: true },
-          };
-        }
+      // Confine the path BEFORE asking anyone anything, so a refusal names the
+      // real problem instead of prompting the human about a file that was never
+      // going to be allowed.
+      let resolved: string;
+      try {
+        resolved = resolveUploadPath(String(args.filePath ?? ""));
+      } catch (err) {
+        return {
+          error: "path_not_allowed",
+          message: err instanceof Error ? err.message : String(err),
+          hint: "Only files inside the project directory can be uploaded.",
+        };
       }
+
+      // Ask the human EVERY time the client can be asked. `confirm: true` does
+      // not skip it: the model supplies that field, so treating it as consent
+      // makes the gate a suggestion to an LLM — the exact thing this project
+      // criticises the competition for. It is honoured only as the fallback for
+      // a client that cannot show a prompt at all.
+      const approved = await ctx.confirmWithUser?.(
+        `Upload "${args.name}" to Roblox as a ${args.assetType}?`,
+        [
+          `File: ${resolved}`,
+          "This publishes to the Roblox account behind your Open Cloud key.",
+          "It is public and cannot be deleted by this tool.",
+        ],
+      );
+      if (approved === false) {
+        return {
+          error: "declined_by_user",
+          hint: "The user declined this upload. Do not retry it without new instructions.",
+        };
+      }
+      if (approved !== true && args.confirm !== true) {
+        return {
+          error: "needs_confirmation",
+          hint: "This client cannot show a prompt. Confirm with the user yourself, then retry with confirm: true.",
+          file: resolved,
+          retry_with: { ...args, confirm: true },
+        };
+      }
+
       try {
         const result = await uploadAsset({
-          filePath: String(args.filePath),
+          filePath: resolved,
           assetType: args.assetType,
           name: String(args.name),
           description: String(args.description ?? ""),

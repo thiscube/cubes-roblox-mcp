@@ -215,25 +215,102 @@ describe("write gate: behaviour, not labels", () => {
     assert.deepEqual(offenders, [], `hand-set channels: ${offenders.join(", ")}`);
   });
 
-  test("a local tool that writes to disk has to say so", async () => {
-    // "Local" was being read as "harmless". profile_update is a local tool that
-    // writes a file in the user's home, and it survived the read-only build's
-    // filter because the filter only asked about Studio.
+  test("a tool that touches disk or network has to declare it", async () => {
+    // The earlier version scanned four identifiers inside a tool's own body. It
+    // could not see one call deep and had no pattern for fetch, so it passed
+    // while every docs_* tool wrote 1.4 MB into the user's state directory and
+    // asset_upload read arbitrary files off the machine.
+    //
+    // One call deep is what it needs, and no more: resolve the file's own
+    // helpers first (a local function whose body reaches outside is itself
+    // outward-reaching), then scan each tool block for either. A file-level
+    // scan was the other option and it over-fires — session.ts holds one tool
+    // that persists and five that do not.
+    const REACHES = {
+      state: /\b(saveProfile|writeFile|appendFile|mkdir)\s*\(/,
+      network: /\b(fetch|getJson|getApiDocs|searchAssets|assetDetails|assetThumbnails|uploadAsset)\s*\(/,
+    };
+
+    /** Local helpers in this file that reach outside, so a call to one counts. */
+    function outwardHelpers(text, kind) {
+      const names = new Set();
+      const decl = /(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*(?::[^{]+)?\{/g;
+      for (const m of text.matchAll(decl)) {
+        // Take the body up to the next top-level declaration; good enough to
+        // tell "this helper reaches out" from "this one does not".
+        const from = m.index + m[0].length;
+        const next = text.indexOf("\nfunction ", from);
+        const body = text.slice(from, next < 0 ? from + 2000 : next);
+        if (REACHES[kind].test(body)) names.add(m[1]);
+      }
+      return names;
+    }
+
     const dir = join(SRC, "tools");
     const offenders = [];
     for (const file of (await readdir(dir)).filter((f) => f.endsWith(".ts"))) {
       const text = await readFile(join(dir, file), "utf8");
-      const writesFiles = /saveProfile|writeFile|mkdir|appendFile|rename\(/.test(text);
-      if (!writesFiles) continue;
-      for (const { name, body } of toolBlocks(text)) {
-        const entry = ALL_TOOLS.find((t) => t.name === name);
-        if (!entry || entry.channel !== "local") continue;
-        if (/saveProfile|writeFile|mkdir|appendFile/.test(body) && !entry.writesDisk) {
-          offenders.push(`${file}: ${name} persists state but does not declare writesDisk`);
+      for (const kind of ["state", "network"]) {
+        const helpers = outwardHelpers(text, kind);
+        const helperCall = helpers.size > 0 ? new RegExp(`\\b(${[...helpers].join("|")})\\s*\\(`) : null;
+        for (const { name, body } of toolBlocks(text)) {
+          const entry = ALL_TOOLS.find((t) => t.name === name);
+          if (!entry) continue;
+          const reaches = REACHES[kind].test(body) || (helperCall !== null && helperCall.test(body));
+          if (!reaches) continue;
+          const cap = capabilities(entry);
+          const declared = kind === "state" ? cap.writesDisk : cap.network !== "none";
+          if (!declared) offenders.push(`${file}: ${name} reaches ${kind} but declares nothing`);
         }
       }
     }
     assert.deepEqual(offenders, [], offenders.join("; "));
+  });
+
+  test("that scan sees the tools it is meant to police", async () => {
+    // If the helper resolution silently matched nothing, the test above would
+    // pass vacuously — which is exactly how the version before it passed.
+    const { capabilities: cap } = await import("../../dist/registry.js");
+    const declared = ALL_TOOLS.filter((t) => cap(t).writesDisk || cap(t).network !== "none").map((t) => t.name);
+    assert.ok(declared.includes("profile_update"), "the state case must be visible");
+    assert.ok(declared.includes("docs_class"), "the one-call-deep network case must be visible");
+    assert.ok(declared.includes("asset_upload"), "the outward-write case must be visible");
+    assert.ok(!declared.includes("asset_insert"), "an eval tool in the same file must NOT be swept up");
+    assert.ok(!declared.includes("macro_save"), "nor a local tool beside one that persists");
+  });
+
+  test("the read-only build excludes every outward effect, not just Studio writes", async () => {
+    // Tested as a class rather than as the one instance that was found. The
+    // filter asked only about Studio, which is how profile_update shipped in the
+    // inspector build, and then asset_upload — a tool that reads a file and
+    // posts it to Roblox.
+    const { createMcpServer } = await import("../../dist/server.js");
+    const transport = { connected: true, writeEnabled: true, async send() { return { ok: true }; } };
+    const server = createMcpServer(transport, { readOnly: true });
+    const { ListToolsRequestSchema } = await import("@modelcontextprotocol/sdk/types.js");
+    for (const t of ALL_TOOLS) {
+      await server._requestHandlers.get(CallToolRequestSchema.shape.method.value)(
+        { method: "tools/call", params: { name: t.name, arguments: {} } },
+        { signal: new AbortController().signal },
+      );
+    }
+    const { tools } = await server._requestHandlers.get(ListToolsRequestSchema.shape.method.value)(
+      { method: "tools/list", params: {} },
+      { signal: new AbortController().signal },
+    );
+    const listed = new Set(tools.map((t) => t.name));
+    const leaked = ALL_TOOLS.filter((t) => listed.has(t.name) && !capabilities(t).inspectorSafe);
+    assert.deepEqual(
+      leaked.map((t) => `${t.name} (${JSON.stringify(capabilities(t))})`),
+      [],
+      "these can change the place, persist user data, or send bytes out",
+    );
+    for (const t of ALL_TOOLS) {
+      const cap = capabilities(t);
+      if (cap.write || cap.writesDisk || cap.network === "write") {
+        assert.equal(cap.inspectorSafe, false, `${t.name}: inspectorSafe disagrees with its effects`);
+      }
+    }
   });
 
   test("capabilities() fails closed on anything that is not a known opt-out", async () => {

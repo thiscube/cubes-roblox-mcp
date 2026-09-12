@@ -19,7 +19,7 @@ export const SESSION_TOOLS: ToolEntry[] = [
       subcategories: ["connection", "window", "place"],
       keywords: ["instance", "window", "studio", "connected", "place", "which", "multi", "session", "target"],
       description:
-        "List the Studio windows connected to this server: id, place, role, transport and whether writes are on for each. Use to find the id to target, or to check why a call went somewhere unexpected.",
+        "List the Studio windows connected to this server: id, place, role, transport and whether writes are on for each. Tools cannot yet be pointed at a specific window; with more than one open, calls go to whichever answers first.",
       inputSchema: { type: "object", properties: {} },
       outputSchema: objectResult({
         instances: { type: "array" },
@@ -41,16 +41,21 @@ export const SESSION_TOOLS: ToolEntry[] = [
           ? { hint: "No Studio window is connected. Open Studio with the Cubes MCP plugin active." }
           : {}),
         ...(instances.length > 1
-          ? { note: "Several windows are connected. Commands with no target go to whichever polls first." }
+          ? {
+              note:
+                "Several windows are connected and no tool accepts a target yet, so every call goes to " +
+                "whichever window answers first. The bridge can route by instance id; the seam does not " +
+                "expose it. Close the windows you do not want touched.",
+            }
           : {}),
       };
     },
   ),
   localTool(
     {
-      // Writes ~/.cubesmcp/profiles/{placeId}.json. "Local" is not "harmless",
-      // and the read-only build filters on this.
-      writesDisk: true,
+      // Writes ~/.cubesmcp/profiles/{placeId}.json. "Local" only ever meant the
+      // computation is here, never that the effect is.
+      effects: { state: true },
       name: "profile_update",
       category: "session",
       subcategories: ["memory", "profile", "decision", "convention"],

@@ -491,6 +491,12 @@ return result
  * plugin change — only `EnableDebugging` is gated, and it is not needed to set a
  * breakpoint on a script that is already being debugged.
  *
+ * `EnableDebugging` is the one member that is NOT open — it is
+ * `LocalUserSecurity`, which a plugin does not have. So when script debugging is
+ * off in a Studio build, `debugger_unavailable` is the end of the road and
+ * nothing this server can do will change it. The descriptions say so rather than
+ * letting the agent retry.
+ *
  * `ContinueExecution` is the whole point. A breakpoint that pauses the VM during
  * a playtest is useless to an agent: nothing can answer the next tool call while
  * Studio is stopped at a line. With it set, the breakpoint records the hit and
@@ -525,8 +531,15 @@ if not inst then return { error = "not_found", target = a.target } end
 if not inst:IsA("LuaSourceContainer") then return { error = "not_a_script", class = inst.ClassName } end
 
 local manager = game:GetService("DebuggerManager")
+-- pcall'd like AddDebugger below. With script debugging disabled this throws,
+-- and an unguarded throw here means the agent gets a raw bridge error instead
+-- of the hint written for exactly this case.
+local okList, existing = pcall(function() return manager:GetDebuggers() end)
+if not okList then
+  return { error = "debugger_unavailable", message = tostring(existing), hint = "Script debugging is off in this Studio build, and a plugin cannot turn it on (EnableDebugging is LocalUserSecurity). Enable it in Studio settings." }
+end
 local debugger
-for _, d in ipairs(manager:GetDebuggers()) do
+for _, d in ipairs(existing) do
   if d.Script == inst then debugger = d break end
 end
 if not debugger then
@@ -566,45 +579,75 @@ return {
       // DebuggerBreakpoints are debugger state, not DataModel state, so they
       // are not in the undo stack to begin with.
       undo: "none",
+      // Listing only. `clear` used to live here as a boolean, which made the
+      // whole tool write-class — so a read-only build could not even LIST
+      // breakpoints. A flag that flips a tool between reading and deleting can
+      // only ever be classified as the more dangerous of the two.
+      readOnly: true,
       category: "debug",
       subcategories: ["debugger", "inspect", "trace"],
       keywords: ["breakpoint", "list", "debug", "debugger", "active", "show", "clear", "remove"],
       description:
-        "List every active breakpoint across all debugged scripts, with line, condition and whether it pauses. Pass clear: true to remove them all instead. Read-only unless clearing.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          clear: { type: "boolean", description: "Remove every breakpoint instead of listing." },
-        },
-      },
+        "List every active breakpoint across all debugged scripts, with line, condition and whether it pauses. Read-only; use breakpoint_clear to remove them.",
+      inputSchema: { type: "object", properties: {} },
     },
-    (args) => `
-local a = __MCP.decode(${luaJson(args)})
+    () => `
 local manager = game:GetService("DebuggerManager")
-local out, removed = {}, 0
+local out = {}
 
-for _, d in ipairs(manager:GetDebuggers()) do
+local okList, debuggers = pcall(function() return manager:GetDebuggers() end)
+if not okList then
+  return { error = "debugger_unavailable", message = tostring(debuggers), hint = "Script debugging is off in this Studio build." }
+end
+for _, d in ipairs(debuggers) do
   local okBp, breakpoints = pcall(function() return d:GetBreakpoints() end)
   if okBp and breakpoints then
     for _, bp in ipairs(breakpoints) do
-      if a.clear == true then
-        pcall(function() bp:Destroy() end)
-        removed += 1
-      else
-        table.insert(out, {
-          script = d.Script and d.Script:GetFullName() or "?",
-          line = bp.Line,
-          enabled = bp.IsEnabled,
-          pauses = not bp.ContinueExecution,
-          condition = bp.Condition ~= "" and bp.Condition or nil,
-        })
-      end
+      table.insert(out, {
+        script = d.Script and d.Script:GetFullName() or "?",
+        line = bp.Line,
+        enabled = bp.IsEnabled,
+        pauses = not bp.ContinueExecution,
+        condition = bp.Condition ~= "" and bp.Condition or nil,
+      })
     end
   end
 end
 
-if a.clear == true then return { ok = true, removed = removed } end
 return { breakpoints = out, count = #out }
+`,
+  ),
+
+  evalTool(
+    {
+      name: "breakpoint_clear",
+      category: "debug",
+      subcategories: ["debugger", "trace"],
+      keywords: ["breakpoint", "clear", "remove", "delete", "reset", "debugger", "stop"],
+      description:
+        "Remove every breakpoint across all debugged scripts. Separate from breakpoint_list so that listing stays read-only and survives into a read-only build.",
+      inputSchema: { type: "object", properties: {} },
+      undo: "none",
+    },
+    () => `
+local manager = game:GetService("DebuggerManager")
+local removed = 0
+
+local okList, debuggers = pcall(function() return manager:GetDebuggers() end)
+if not okList then
+  return { error = "debugger_unavailable", message = tostring(debuggers), hint = "Script debugging is off in this Studio build." }
+end
+for _, d in ipairs(debuggers) do
+  local okBp, breakpoints = pcall(function() return d:GetBreakpoints() end)
+  if okBp and breakpoints then
+    for _, bp in ipairs(breakpoints) do
+      pcall(function() bp:Destroy() end)
+      removed += 1
+    end
+  end
+end
+
+return { ok = true, removed = removed }
 `,
   ),
 ];
