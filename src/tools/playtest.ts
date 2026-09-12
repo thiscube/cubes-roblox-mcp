@@ -49,7 +49,13 @@ local dest
 local raw = tostring(a.to)
 local x, y, z = raw:match("^%s*(-?[%d%.]+)%s*,%s*(-?[%d%.]+)%s*,%s*(-?[%d%.]+)%s*$")
 if x then
-  dest = Vector3.new(tonumber(x), tonumber(y), tonumber(z))
+  -- The pattern accepts "1.2.3", which tonumber does not, and Vector3.new(nil)
+  -- would throw uncaught inside someone's running game.
+  local nx, ny, nz = tonumber(x), tonumber(y), tonumber(z)
+  if not (nx and ny and nz) then
+    return { error = "bad_destination", target = raw, hint = "Coordinates look like \"12, 4, -30\"." }
+  end
+  dest = Vector3.new(nx, ny, nz)
 else
   local inst = __MCP.resolve(raw)
   if not inst then return { error = "not_found", target = raw } end
@@ -99,6 +105,18 @@ for i = 2, #pts do
   until finished or os.clock() >= wpDeadline
   conn:Disconnect()
   if not (finished and arrivedAtWp) then break end
+  -- A death respawns the character, which leaves this loop driving a humanoid
+  -- that is no longer the player's and reporting a corpse's position as the
+  -- result. Stop and say so instead.
+  if hum.Health <= 0 or plr.Character ~= char then
+    return {
+      arrived = false,
+      status = "died",
+      remaining = (root.Position - dest).Magnitude,
+      waypoints = #pts,
+      reached = i,
+    }
+  end
   reached = i
 end
 

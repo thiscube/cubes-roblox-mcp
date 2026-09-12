@@ -101,6 +101,23 @@ describe("character_goto", () => {
     assert.match(luau, /remaining/, "a failure has to say how far short it stopped");
   });
 
+  test("it stops when the character dies instead of reporting a corpse", async () => {
+    // A death respawns the character. Without this the loop keeps driving the
+    // old humanoid and returns the dead body's distance as the answer.
+    const luau = (await sent({ to: "1,2,3" })).calls[0].payload.luau;
+    assert.match(luau, /hum\.Health <= 0/);
+    assert.match(luau, /plr\.Character ~= char/, "a respawn swaps the model, not just the health");
+    assert.match(luau, /"died"/);
+  });
+
+  test("a malformed coordinate is a structured refusal, not a thrown error", async () => {
+    // The coordinate pattern accepts "1.2.3", which tonumber does not, and
+    // Vector3.new(nil) would throw uncaught inside the running game.
+    const luau = (await sent({ to: "1.2.3, 4, 5" })).calls[0].payload.luau;
+    assert.match(luau, /bad_destination/);
+    assert.match(luau, /tonumber\(x\), tonumber\(y\), tonumber\(z\)/);
+  });
+
   test("a destination can never become source code", async () => {
     const nasty = '"] end; game:Shutdown(); --';
     const luau = (await sent({ to: nasty })).calls[0].payload.luau;
