@@ -9,7 +9,7 @@
  */
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { rm, symlink } from "node:fs/promises";
+import { open, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 import { ASSETS_TOOLS } from "../../dist/tools/assets.js";
-import { __setAssetFetchForTest, ASSET_TYPES } from "../../dist/assets.js";
+import { __setAssetFetchForTest, ASSET_TYPES, UPLOAD_ASSET_TYPES } from "../../dist/assets.js";
 import { capabilities } from "../../dist/registry.js";
 import "./_fixtures.mjs";
 
@@ -383,3 +383,126 @@ function luaUnescape(s) {
   }
   return Buffer.from(out).toString("utf8");
 }
+
+/**
+ * The widened uploader (gap #4).
+ *
+ * `asset_upload` used to accept Model, Decal and Audio, and an extension list
+ * that refused .fbx, .gltf and .glb — which is to say it refused the entire
+ * Blender-to-Roblox path, the one thing a 3D pipeline is for. Widening the type
+ * list is the easy half; the half worth testing is that widening it did not
+ * widen what a single upload will read off the disk.
+ */
+describe("asset_upload formats", () => {
+  const upload = (args, ctx = {}) => tool("asset_upload").handler(args, ctx);
+  const yes = { confirmWithUser: async () => true };
+
+  beforeEach(() => {
+    process.env.CUBES_MCP_OPEN_CLOUD_KEY = "test-key";
+  });
+  afterEach(() => {
+    delete process.env.CUBES_MCP_OPEN_CLOUD_KEY;
+    __setAssetFetchForTest(null);
+  });
+
+  /** Make a real file under the project so path confinement is exercised, not bypassed. */
+  async function fixture(name, bytes = 8) {
+    const file = join(ROOT, "test", "fixtures", name);
+    await writeFile(file, Buffer.alloc(bytes));
+    return { file, rel: `test/fixtures/${name}` };
+  }
+
+  test("every declared type is actually reachable through the tool", async () => {
+    assert.deepEqual(
+      [...tool("asset_upload").inputSchema.properties.assetType.enum].sort(),
+      [...UPLOAD_ASSET_TYPES].sort(),
+      "the schema enum and the format table must not drift apart",
+    );
+  });
+
+  test("the 3D formats that were refused before now upload, with a content type", async () => {
+    for (const [ext, expected] of [
+      [".fbx", "model/fbx"],
+      [".gltf", "model/gltf+json"],
+      [".glb", "model/gltf-binary"],
+    ]) {
+      const { rel } = await fixture(`widen${ext}`);
+      let sentType = null;
+      __setAssetFetchForTest(async (_url, init) => {
+        sentType = init.body.get("fileContent").type;
+        return { ok: true, status: 200, json: async () => ({ path: "operations/op1" }) };
+      });
+      const res = await upload({ filePath: rel, assetType: "Model", name: "m", userId: "1", confirm: true }, yes);
+      assert.equal(res.error, undefined, `${ext} should upload: ${res.message ?? ""}`);
+      // Sending the bytes untyped happened to work for .rbxm and is not
+      // something to rely on for a format Roblox has to sniff.
+      assert.equal(sentType, expected, `${ext} should be sent as ${expected}`);
+      await rm(join(ROOT, "test", "fixtures", `widen${ext}`), { force: true });
+    }
+  });
+
+  test("the extension allowlist is scoped to the declared type", async () => {
+    // A .png is a perfectly legal upload — as a Decal. Sent as a Model it is
+    // refused here rather than after the bytes have left the machine.
+    const { rel } = await fixture("scoped.png");
+    try {
+      const bad = await upload({ filePath: rel, assetType: "Model", name: "x", confirm: true }, yes);
+      assert.equal(bad.error, "path_not_allowed");
+      assert.match(bad.message, /as a Model/);
+
+      __setAssetFetchForTest(async () => ({ ok: true, status: 200, json: async () => ({}) }));
+      const good = await upload({ filePath: rel, assetType: "Decal", name: "x", userId: "1", confirm: true }, yes);
+      assert.equal(good.error, undefined, "the same file is fine as the type it actually is");
+    } finally {
+      await rm(join(ROOT, "test", "fixtures", "scoped.png"), { force: true });
+    }
+  });
+
+  test("an oversized file is refused before it is read into memory", async () => {
+    // Sparse file: this costs no disk, and the point is that `stat` decides,
+    // not `readFile`. Audio caps at 20MB, so 24MB must not make it through.
+    const file = join(ROOT, "test", "fixtures", "huge.mp3");
+    const handle = await open(file, "w");
+    try {
+      await handle.truncate(24 * 1024 * 1024);
+      await handle.close();
+      let fetched = false;
+      __setAssetFetchForTest(async () => {
+        fetched = true;
+        return { ok: true, status: 200, json: async () => ({}) };
+      });
+      const res = await upload(
+        { filePath: "test/fixtures/huge.mp3", assetType: "Audio", name: "x", userId: "1", confirm: true },
+        yes,
+      );
+      assert.equal(res.error, "upload_failed");
+      assert.match(res.message, /the limit for a Audio is/);
+      assert.equal(fetched, false, "an oversized file must never reach the network");
+    } finally {
+      await rm(file, { force: true });
+    }
+  });
+
+  test("confinement still holds for every newly allowed extension", async () => {
+    // Widening the extension list must not widen the path boundary with it.
+    for (const ext of [".fbx", ".gltf", ".glb", ".flac"]) {
+      const link = join(ROOT, "test", "fixtures", `escape2${ext}`);
+      await rm(link, { force: true });
+      await symlink("/etc/passwd", link);
+      try {
+        const res = await upload(
+          {
+            filePath: `test/fixtures/escape2${ext}`,
+            assetType: ext === ".flac" ? "Audio" : "Model",
+            name: "x",
+            confirm: true,
+          },
+          yes,
+        );
+        assert.equal(res.error, "path_not_allowed", `${ext} symlink was not refused`);
+      } finally {
+        await rm(link, { force: true });
+      }
+    }
+  });
+});

@@ -171,13 +171,66 @@ export async function assetThumbnails(
 }
 
 /**
- * Biggest file we will read to upload. A model or a decal is kilobytes; a
- * multi-megabyte read is a sign something other than an asset is being sent.
+ * What Open Cloud accepts, per asset type.
+ *
+ * Sourced from the "supported asset types and limits" table in Roblox's Assets
+ * API guide, not from guesswork. Two types on that table are deliberately absent
+ * here:
+ *
+ * - **Mesh.** There is no file to send. Roblox accepts mesh content only from
+ *   its own asset delivery API, so a mesh reaches a place inside a Model upload
+ *   (.fbx / .glb), which the engine splits into MeshParts. "Upload a mesh" is
+ *   "upload a Model" and there is nothing else to expose.
+ * - **Video.** Roblox allows 3.75 GB, and this code path reads the whole file
+ *   into memory before posting it. Supporting that would mean streaming uploads
+ *   for the one asset type almost nobody publishes from an agent, so the cap
+ *   below is the honest boundary rather than a silent 20 MB failure.
+ *
+ * The per-type byte caps are ours, not Roblox's: a model can legitimately be
+ * tens of megabytes, an image or a sound effect cannot, and the cap is the last
+ * thing standing between `readFile` and whatever the model decided to point at.
+ */
+export const UPLOAD_FORMATS = {
+  Model: { exts: [".fbx", ".gltf", ".glb", ".rbxm", ".rbxmx"], maxBytes: 100 * 1024 * 1024 },
+  Animation: { exts: [".rbxm", ".rbxmx"], maxBytes: 20 * 1024 * 1024 },
+  Decal: { exts: [".png", ".jpg", ".jpeg", ".bmp", ".tga"], maxBytes: 20 * 1024 * 1024 },
+  Image: { exts: [".png", ".jpg", ".jpeg", ".bmp", ".tga"], maxBytes: 20 * 1024 * 1024 },
+  Audio: { exts: [".mp3", ".ogg", ".wav", ".flac"], maxBytes: 20 * 1024 * 1024 },
+} as const satisfies Record<string, { exts: readonly string[]; maxBytes: number }>;
+
+export type UploadAssetType = keyof typeof UPLOAD_FORMATS;
+
+export const UPLOAD_ASSET_TYPES = Object.keys(UPLOAD_FORMATS) as UploadAssetType[];
+
+/**
+ * The media type Open Cloud expects in the form part. Sending the bytes without
+ * one worked for .rbxm by luck and is not something to rely on for .fbx or .glb.
+ */
+const CONTENT_TYPES: Record<string, string> = {
+  ".fbx": "model/fbx",
+  ".gltf": "model/gltf+json",
+  ".glb": "model/gltf-binary",
+  ".rbxm": "model/x-rbxm",
+  ".rbxmx": "model/x-rbxm",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".bmp": "image/bmp",
+  ".tga": "image/tga",
+  ".mp3": "audio/mpeg",
+  ".ogg": "audio/ogg",
+  ".wav": "audio/wav",
+  ".flac": "audio/flac",
+};
+
+/** Every extension any type accepts. The floor when no type is declared. */
+const UPLOAD_EXTENSIONS = new Set<string>(Object.values(UPLOAD_FORMATS).flatMap((f) => [...f.exts]));
+
+/**
+ * Biggest file we will read for a type we were not told about. Types that
+ * legitimately run larger raise it through `UPLOAD_FORMATS`.
  */
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
-
-/** Extensions an asset upload can plausibly be. */
-const UPLOAD_EXTENSIONS = new Set([".rbxm", ".rbxmx", ".png", ".jpg", ".jpeg", ".bmp", ".tga", ".mp3", ".ogg", ".wav"]);
 
 /**
  * Where an upload may read from. `CUBES_MCP_UPLOAD_ROOT`, else the working
@@ -224,7 +277,7 @@ export function uploadRoot(): string {
  * `..` but knows nothing about symlinks, so a `model.rbxm` inside the project
  * pointing at `/etc/passwd` would have walked straight through.
  */
-export function resolveUploadPath(filePath: string, root?: string): string {
+export function resolveUploadPath(filePath: string, root?: string, assetType?: UploadAssetType): string {
   const base = root ? resolve(root) : uploadRoot();
   const requested = String(filePath ?? "");
   if (requested.includes("\0")) throw new Error("Refusing a path containing a null byte.");
@@ -252,10 +305,18 @@ export function resolveUploadPath(filePath: string, root?: string): string {
         `Copy it into the project first if that is really what you meant.`,
     );
   }
+  // When the caller declared a type, the allowlist is that type's, not the union.
+  // A .png sent as a Model is refused here rather than by Roblox after the bytes
+  // have already left the machine, and it keeps the widened type list from
+  // widening what any single upload will read.
+  const allowed: ReadonlySet<string> = assetType
+    ? new Set<string>(UPLOAD_FORMATS[assetType].exts)
+    : UPLOAD_EXTENSIONS;
   const ext = extname(real).toLowerCase();
-  if (!UPLOAD_EXTENSIONS.has(ext)) {
+  if (!allowed.has(ext)) {
     throw new Error(
-      `Refusing to upload ${ext || "a file with no extension"}: expected one of ${[...UPLOAD_EXTENSIONS].join(", ")}.`,
+      `Refusing to upload ${ext || "a file with no extension"}` +
+        `${assetType ? ` as a ${assetType}` : ""}: expected one of ${[...allowed].join(", ")}.`,
     );
   }
   return real;
@@ -276,7 +337,7 @@ export function openCloudKey(): string | undefined {
  */
 export async function uploadAsset(opts: {
   filePath: string;
-  assetType: "Model" | "Decal" | "Audio";
+  assetType: UploadAssetType;
   name: string;
   description: string;
   userId?: string;
@@ -286,13 +347,22 @@ export async function uploadAsset(opts: {
   if (!key) throw new Error("CUBES_MCP_OPEN_CLOUD_KEY is not set; uploading needs an Open Cloud API key.");
   if (!opts.userId && !opts.groupId) throw new Error("Uploading needs a userId or a groupId to own the asset.");
 
+  const format = UPLOAD_FORMATS[opts.assetType];
+  if (!format) {
+    throw new Error(`Unsupported assetType ${opts.assetType}: expected one of ${UPLOAD_ASSET_TYPES.join(", ")}.`);
+  }
+
   const { readFile, stat } = await import("node:fs/promises");
-  const full = resolveUploadPath(opts.filePath);
+  const full = resolveUploadPath(opts.filePath, undefined, opts.assetType);
   const info = await stat(full);
   if (!info.isFile()) throw new Error(`${full} is not a file.`);
-  if (info.size > MAX_UPLOAD_BYTES) {
-    throw new Error(`${full} is ${info.size} bytes; the upload limit is ${MAX_UPLOAD_BYTES}.`);
+  // Checked against the file on disk before the read, so an oversized file is
+  // never pulled into memory just to be rejected afterwards.
+  const limit = format.maxBytes ?? MAX_UPLOAD_BYTES;
+  if (info.size > limit) {
+    throw new Error(`${full} is ${info.size} bytes; the limit for a ${opts.assetType} is ${limit}.`);
   }
+  const contentType = CONTENT_TYPES[extname(full).toLowerCase()];
   const bytes = await readFile(full);
   const form = new FormData();
   form.append(
@@ -306,7 +376,7 @@ export async function uploadAsset(opts: {
       },
     }),
   );
-  form.append("fileContent", new Blob([new Uint8Array(bytes)]), opts.name);
+  form.append("fileContent", new Blob([new Uint8Array(bytes)], { type: contentType }), opts.name);
 
   return getJson(`${OPEN_CLOUD_ASSETS}/assets`, {
     method: "POST",

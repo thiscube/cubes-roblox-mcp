@@ -2,6 +2,8 @@ import { type ToolEntry, evalTool, localTool, luaJson } from "../registry.js";
 import { objectResult } from "../output-schema.js";
 import {
   ASSET_TYPES,
+  UPLOAD_ASSET_TYPES,
+  type UploadAssetType,
   assetDetails,
   assetThumbnails,
   openCloudKey,
@@ -254,12 +256,17 @@ return {
       subcategories: ["marketplace", "publish"],
       keywords: ["asset", "upload", "publish", "opencloud", "create", "share"],
       description:
-        "Publish a file from the project directory to the user's Roblox account via Open Cloud. Needs CUBES_MCP_OPEN_CLOUD_KEY. Files outside the project are refused, and the user is asked directly whenever the client can ask. Cannot be undone.",
+        "Publish a project file to the user's Roblox account via Open Cloud. Models take .fbx/.glb, so a Blender export goes straight up. Needs CUBES_MCP_OPEN_CLOUD_KEY. Files outside the project are refused; the user is asked. Cannot be undone.",
       inputSchema: {
         type: "object",
         properties: {
           filePath: { type: "string", description: "File to upload. Must be inside the project directory." },
-          assetType: { type: "string", enum: ["Model", "Decal", "Audio"], description: "Asset type." },
+          assetType: {
+            type: "string",
+            enum: UPLOAD_ASSET_TYPES,
+            description:
+              "Model (.fbx .gltf .glb .rbxm), Decal/Image (.png .jpg .bmp .tga), Audio (.mp3 .ogg .wav .flac), Animation (.rbxm).",
+          },
           name: { type: "string", description: "Display name." },
           description: { type: "string", description: "Asset description." },
           userId: { type: "string", description: "Owning user id. One of userId or groupId." },
@@ -282,7 +289,11 @@ return {
       // going to be allowed.
       let resolved: string;
       try {
-        resolved = resolveUploadPath(String(args.filePath ?? ""));
+        resolved = resolveUploadPath(
+          String(args.filePath ?? ""),
+          undefined,
+          args.assetType as UploadAssetType | undefined,
+        );
       } catch (err) {
         return {
           error: "path_not_allowed",
