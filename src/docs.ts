@@ -10,13 +10,31 @@
  *
  * WHERE THE DATA COMES FROM
  * -------------------------
- * Roblox publishes the dump for the current Studio build:
+ * Two first-party endpoints: one resolves the current Studio build, the other
+ * serves that build's dump.
  *
- *   https://setup.rbxcdn.com/versionQTStudio          -> version hash
- *   https://setup.rbxcdn.com/{hash}-API-Dump.json     -> ~4 MB of JSON
+ *   https://clientsettingscdn.roblox.com/v2/client-version/WindowsStudio64
+ *     -> { version, clientVersionUpload } ; clientVersionUpload is the hash
+ *   https://setup.rbxcdn.com/{hash}-API-Dump.json   -> ~7 MB of JSON
  *
- * That is the official first-party source, not a community mirror, and it is the
- * *Studio* dump, so it describes the surface the plugin actually has.
+ * WHY NOT versionQTStudio, WHICH THIS USED TO USE
+ * -----------------------------------------------
+ * Because it is frozen. `setup.rbxcdn.com/versionQTStudio` still answers, and it
+ * still answers with a hash whose dump parses — but that deploy predates
+ * EditableImage and carries **682 classes** where the live build carries **916**.
+ * Missing from the short one: StudioTestService, PluginConnectionService,
+ * PluginConnection, VirtualInput, StudioCaptureService. Security is not the
+ * filter; VirtualInputManager (RobloxScriptSecurity) is present in both.
+ *
+ * That silence cost real work. Reading the short dump produced two confident and
+ * wrong conclusions in PLAN.md of the form "X is absent from the API dump,
+ * therefore X does not exist" — about exactly the Studio surface this MCP is
+ * built on. A thin dump does not fail; it answers "no such class", which reads
+ * like an answer. So the version source is recorded in the cache and reported on
+ * every docs response next to the class count, and `versionQTStudio` is kept only
+ * as a fallback for when the channel endpoint is unreachable.
+ *
+ * Both are the *Studio* dump, so they describe the surface the plugin has.
  *
  * WHAT THE DUMP DOES NOT CONTAIN
  * ------------------------------
@@ -41,8 +59,13 @@ import { dirname } from "node:path";
 
 import { apiDumpFile } from "./paths.js";
 
-const VERSION_URL = "https://setup.rbxcdn.com/versionQTStudio";
+/** Resolves the live Studio build. `clientVersionUpload` is the dump's hash. */
+const CHANNEL_URL = "https://clientsettingscdn.roblox.com/v2/client-version/WindowsStudio64";
+/** The frozen resolver. Only reached when the channel endpoint fails. */
+const LEGACY_VERSION_URL = "https://setup.rbxcdn.com/versionQTStudio";
 const DUMP_URL = (version: string) => `https://setup.rbxcdn.com/${version}-API-Dump.json`;
+/** Which resolver answered. Reported to the caller so a thin dump is never silent. */
+export type VersionSource = "clientsettings" | "legacy";
 const TTL_MS = 24 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 60_000;
 /** A dump under this is truncated or an error page, not a dump. */
@@ -94,6 +117,8 @@ export interface ApiDump {
 interface CacheFile {
   fetchedAt: number;
   studioVersion: string;
+  /** Absent in caches written before the resolver moved; treated as "legacy". */
+  versionSource?: VersionSource;
   dump: ApiDump;
 }
 
@@ -111,6 +136,8 @@ export interface DocsStatus {
   stale: boolean;
   classes: number;
   enums: number;
+  /** Which resolver produced `studioVersion`. See the note at the top of this file. */
+  versionSource: VersionSource;
   /** Set when a refresh was attempted and failed, so the caller can say so. */
   refreshError?: string;
 }
@@ -152,6 +179,7 @@ export class ApiDocs {
   static fromDump(dump: ApiDump, status?: Partial<DocsStatus>): ApiDocs {
     return new ApiDocs(dump, {
       studioVersion: "test",
+      versionSource: "clientsettings",
       fetchedAt: Date.now(),
       ageHours: 0,
       stale: false,
@@ -277,11 +305,34 @@ async function writeCache(entry: CacheFile): Promise<void> {
   await rename(tmp, file);
 }
 
+/** Test seam: swap the network out without a global mock. */
+type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
+
+/**
+ * The real network, with the offline guard on IT rather than on the caller —
+ * the same shape as `src/assets.ts`, and for the same reason: a guard above the
+ * seam refuses stubs too, which is how the asset suite once failed under the
+ * `CUBES_MCP_OFFLINE=1` that CI sets. Offline means "do not reach Roblox";
+ * a stub is not Roblox.
+ */
+const realFetch: FetchLike = (url, init) => {
+  if (process.env.CUBES_MCP_OFFLINE === "1") {
+    return Promise.reject(new Error("CUBES_MCP_OFFLINE=1: refusing to reach Roblox for the API dump."));
+  }
+  return fetch(url, init);
+};
+
+let fetchImpl: FetchLike = realFetch;
+
+export function __setDocsFetchForTest(impl: FetchLike | null): void {
+  fetchImpl = impl ?? realFetch;
+}
+
 async function getText(url: string, timeoutMs: number): Promise<string> {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { signal: ctrl.signal });
+    const res = await fetchImpl(url, { signal: ctrl.signal });
     if (!res.ok) throw new Error(`${url} -> HTTP ${res.status}`);
     return await res.text();
   } finally {
@@ -289,21 +340,49 @@ async function getText(url: string, timeoutMs: number): Promise<string> {
   }
 }
 
+const VERSION_RE = /^version-[0-9a-f]+$/i;
+
+/**
+ * Resolve the hash of the Studio build whose dump we want.
+ *
+ * The channel endpoint is the live one. `versionQTStudio` is a fallback for when
+ * it is unreachable, and it is a *degraded* one — it answers with a frozen build
+ * — so which of the two answered travels with the result rather than being
+ * flattened away.
+ */
+export async function resolveStudioVersion(
+  timeoutMs = 15_000,
+): Promise<{ studioVersion: string; versionSource: VersionSource }> {
+  try {
+    const parsed = JSON.parse(await getText(CHANNEL_URL, timeoutMs)) as {
+      clientVersionUpload?: unknown;
+    };
+    const hash = String(parsed?.clientVersionUpload ?? "").trim();
+    if (VERSION_RE.test(hash)) return { studioVersion: hash, versionSource: "clientsettings" };
+    throw new Error(`clientVersionUpload was ${JSON.stringify(parsed?.clientVersionUpload)}`);
+  } catch {
+    // Fall through to the frozen resolver rather than failing the lookup: a
+    // stale class list beats no class list, and the caller is told which it got.
+  }
+  const legacy = (await getText(LEGACY_VERSION_URL, timeoutMs)).trim();
+  if (!VERSION_RE.test(legacy)) {
+    throw new Error(`unexpected Studio version string: ${legacy.slice(0, 40)}`);
+  }
+  return { studioVersion: legacy, versionSource: "legacy" };
+}
+
 /** Download the dump for the current Studio build. */
 export async function fetchDump(
   fetchTimeoutMs = FETCH_TIMEOUT_MS,
-): Promise<{ dump: ApiDump; studioVersion: string }> {
-  const studioVersion = (await getText(VERSION_URL, 15_000)).trim();
-  if (!/^version-[0-9a-f]+$/i.test(studioVersion)) {
-    throw new Error(`unexpected Studio version string: ${studioVersion.slice(0, 40)}`);
-  }
+): Promise<{ dump: ApiDump; studioVersion: string; versionSource: VersionSource }> {
+  const { studioVersion, versionSource } = await resolveStudioVersion();
   const body = await getText(DUMP_URL(studioVersion), fetchTimeoutMs);
   if (body.length < MIN_PLAUSIBLE_BYTES) {
     throw new Error(`API dump was only ${body.length} bytes — refusing to cache it`);
   }
   const dump = JSON.parse(body) as ApiDump;
   if (!isDump(dump)) throw new Error("API dump did not parse into Classes/Enums");
-  return { dump, studioVersion };
+  return { dump, studioVersion, versionSource };
 }
 
 let inFlight: Promise<ApiDocs> | null = null;
@@ -329,6 +408,7 @@ export async function getApiDocs(opts: { forceRefresh?: boolean } = {}): Promise
       const age = Date.now() - cached.fetchedAt;
       return ApiDocs.fromDump(cached.dump, {
         studioVersion: cached.studioVersion,
+        versionSource: cached.versionSource ?? "legacy",
         fetchedAt: cached.fetchedAt,
         ageHours: Math.round(age / 3_600_000),
         stale: age >= TTL_MS,
@@ -340,6 +420,7 @@ export async function getApiDocs(opts: { forceRefresh?: boolean } = {}): Promise
     if (cached && ageMs < TTL_MS && !opts.forceRefresh) {
       return ApiDocs.fromDump(cached.dump, {
         studioVersion: cached.studioVersion,
+        versionSource: cached.versionSource ?? "legacy",
         fetchedAt: cached.fetchedAt,
         ageHours: Math.round(ageMs / 3_600_000),
         stale: false,
@@ -349,13 +430,14 @@ export async function getApiDocs(opts: { forceRefresh?: boolean } = {}): Promise
     }
 
     try {
-      const { dump, studioVersion } = await fetchDump();
-      const entry: CacheFile = { fetchedAt: Date.now(), studioVersion, dump };
+      const { dump, studioVersion, versionSource } = await fetchDump();
+      const entry: CacheFile = { fetchedAt: Date.now(), studioVersion, versionSource, dump };
       await writeCache(entry).catch(() => {
         // A read-only home directory is not a reason to fail the lookup.
       });
       return ApiDocs.fromDump(dump, {
         studioVersion,
+        versionSource,
         fetchedAt: entry.fetchedAt,
         ageHours: 0,
         stale: false,
@@ -368,6 +450,7 @@ export async function getApiDocs(opts: { forceRefresh?: boolean } = {}): Promise
       // almost everything, and the response says how old it is.
       return ApiDocs.fromDump(cached.dump, {
         studioVersion: cached.studioVersion,
+        versionSource: cached.versionSource ?? "legacy",
         fetchedAt: cached.fetchedAt,
         ageHours: Math.round(ageMs / 3_600_000),
         stale: true,

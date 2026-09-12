@@ -97,7 +97,18 @@ async function docs() {
   const provenance: Record<string, unknown> = {
     studio_version: api.status.studioVersion,
     dump_age_hours: api.status.ageHours,
+    // The number that would have caught the frozen-resolver bug. A thin dump
+    // answers "no such class" rather than failing, so the size has to be visible.
+    // Named `dump_classes`, not `classes`: provenance is spread into every docs
+    // response and `docs_search` already returns a `classes` array of its own.
+    dump_classes: api.status.classes,
   };
+  if (api.status.versionSource === "legacy") {
+    provenance.version_source = "legacy";
+    provenance.hint =
+      "Resolved through the frozen versionQTStudio endpoint, which serves an old " +
+      "build with far fewer classes. A missing class here may still exist in Studio.";
+  }
   if (api.status.stale) {
     provenance.stale = true;
     provenance.refresh_error = api.status.refreshError;

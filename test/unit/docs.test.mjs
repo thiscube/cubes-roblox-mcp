@@ -7,11 +7,17 @@
  * "can I write this" derived correctly, and does a miss come back with something
  * actionable instead of "not found".
  */
-import { test, describe, before } from "node:test";
+import { test, describe, before, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
 import { createMcpServer } from "../../dist/server.js";
-import { ApiDocs, getApiDocs, __setApiDocsForTest } from "../../dist/docs.js";
+import {
+  ApiDocs,
+  getApiDocs,
+  resolveStudioVersion,
+  __setApiDocsForTest,
+  __setDocsFetchForTest,
+} from "../../dist/docs.js";
 import { DOCS_TOOLS } from "../../dist/tools/docs.js";
 import { capabilities } from "../../dist/registry.js";
 import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -394,6 +400,77 @@ describe("offline behaviour", () => {
       if (home === undefined) delete process.env.CUBES_MCP_HOME;
       else process.env.CUBES_MCP_HOME = home;
       installFakeDump();
+    }
+  });
+});
+
+/**
+ * The version resolver (PLAN #4, reopened).
+ *
+ * `setup.rbxcdn.com/versionQTStudio` still answers, and still answers with a
+ * hash whose dump parses — it is just frozen on a build with 682 classes where
+ * the live one has 916, missing StudioTestService, PluginConnectionService and
+ * VirtualInput among others. Nothing fails; lookups just say "no such class".
+ * That is what these tests are for: the live resolver is preferred, the frozen
+ * one is a labelled fallback, and which answered is never thrown away.
+ */
+describe("API dump version resolver", () => {
+  const CHANNEL = "https://clientsettingscdn.roblox.com/v2/client-version/WindowsStudio64";
+  const LEGACY = "https://setup.rbxcdn.com/versionQTStudio";
+
+  const reply = (body) => ({ ok: true, status: 200, text: async () => body });
+  const dead = { ok: false, status: 503, text: async () => "" };
+
+  afterEach(() => __setDocsFetchForTest(null));
+
+  test("prefers the live channel endpoint", async () => {
+    const seen = [];
+    __setDocsFetchForTest(async (url) => {
+      seen.push(url);
+      if (url === CHANNEL) {
+        return reply(JSON.stringify({ version: "0.738.0.7381393", clientVersionUpload: "version-93202a13414c4131" }));
+      }
+      return dead;
+    });
+    const res = await resolveStudioVersion(50);
+    assert.equal(res.studioVersion, "version-93202a13414c4131");
+    assert.equal(res.versionSource, "clientsettings");
+    assert.deepEqual(seen, [CHANNEL], "the frozen endpoint must not be touched when the live one answers");
+  });
+
+  test("falls back to the frozen endpoint when the channel is unreachable", async () => {
+    __setDocsFetchForTest(async (url) => (url === LEGACY ? reply("version-d0e8cfcd943d4ae2\n") : dead));
+    const res = await resolveStudioVersion(50);
+    assert.equal(res.studioVersion, "version-d0e8cfcd943d4ae2");
+    assert.equal(res.versionSource, "legacy", "a degraded answer has to be labelled as one");
+  });
+
+  test("falls back when the channel answers with the wrong shape", async () => {
+    // A 200 with unusable JSON is the failure mode that would otherwise poison
+    // the cache with a bad hash, so it has to route to the fallback, not throw.
+    for (const body of ["{}", '{"clientVersionUpload":null}', '{"clientVersionUpload":"not-a-version"}', "<html>"]) {
+      __setDocsFetchForTest(async (url) => (url === CHANNEL ? reply(body) : reply("version-abc123")));
+      const res = await resolveStudioVersion(50);
+      assert.equal(res.versionSource, "legacy", `body ${body} should have fallen back`);
+    }
+  });
+
+  test("refuses a junk version rather than fetching a junk dump URL", async () => {
+    __setDocsFetchForTest(async () => reply("<!DOCTYPE html><html>404</html>"));
+    await assert.rejects(() => resolveStudioVersion(50), /unexpected Studio version string/);
+  });
+
+  test("offline refuses the real network but not a stub", async () => {
+    const prev = process.env.CUBES_MCP_OFFLINE;
+    process.env.CUBES_MCP_OFFLINE = "1";
+    try {
+      __setDocsFetchForTest(null);
+      await assert.rejects(() => resolveStudioVersion(50), /CUBES_MCP_OFFLINE/);
+      __setDocsFetchForTest(async () => reply("version-abc123"));
+      assert.equal((await resolveStudioVersion(50)).versionSource, "legacy");
+    } finally {
+      if (prev === undefined) delete process.env.CUBES_MCP_OFFLINE;
+      else process.env.CUBES_MCP_OFFLINE = prev;
     }
   });
 });
