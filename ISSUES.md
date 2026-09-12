@@ -27,7 +27,7 @@
 This file is the readable index. Same numbers as the other two docs, so you can jump
 between them. It is a record of what was wrong, not a to-do list.
 
-**For what to build next, read `PLAN.md`.**
+**For what to build next, read `PLAN.md`.** Everything in it is now done, blocked with evidence, or ongoing by design — see the status box at the top of that file.
 
 Grouped by what actually goes wrong, not by severity label. Severity is still marked on
 each line so you know what to care about.

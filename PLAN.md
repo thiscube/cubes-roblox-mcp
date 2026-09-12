@@ -13,6 +13,31 @@ Sizes: **S** = an afternoon. **M** = a day or two. **L** = a week or more.
 
 ---
 
+> ## Status: done, except what the engine and the missing plugin forbid
+>
+> **Part 1 and 12 of the 15 gaps are closed.** 258 tests, 47 suites, all running
+> with no Studio, no port, no plugin and no network.
+>
+> | | |
+> |---|---|
+> | Landed whole | 3 npm packaging · 4 docs tools · 5 output schemas · 6 catalog budget · 7 assets · 13 read-only build · 14 WebSocket · 15 SECURITY + config |
+> | Landed server-side, plugin half documented | 1 Studio screenshot · 8 perf and scene analysis · 9 non-pausing breakpoints · 11 multi-instance |
+> | Blocked, with evidence | 2 plugin source (not in this repo, and not obtainable from it) · 10 input simulation (every `VirtualInputManager` method is `RobloxScriptSecurity`) |
+> | Ongoing by design | 12 test depth |
+>
+> **Two of the plan's own instructions turned out to be wrong**, and both are
+> corrected in place rather than quietly dropped: item 10 was not "needs a plugin
+> handler", it is unreachable at any security level a plugin has; and item 2 was
+> not "un-gitignore it", because the source has never been in this checkout.
+>
+> Four rounds of independent verification found 27 defects across this work,
+> every one reproduced before it was fixed. Three were in code this effort had
+> just written; two were pre-existing bugs it uncovered
+> (`script_edit` writing with the *Allow writes* toggle off, and
+> `animation_play` leaking an instance on every play).
+
+---
+
 ## Part 1 — The tool list should only ever grow
 
 ### The problem
