@@ -1,4 +1,5 @@
 import { type ToolEntry, evalTool, luaJson } from "../registry.js";
+import { beginUndo, endUndo } from "./_luau-helpers.js";
 
 /**
  * Animation playback and tweening.
@@ -42,15 +43,23 @@ elseif inst:IsA("Player") then
   if char then hum = char:FindFirstChildOfClass("Humanoid") end
 end
 if not hum then return { error = "no_humanoid", target = a.target } end
+-- Creating the Animator is the one part of this that changes the place, so it
+-- is the one part inside a waypoint. Playback itself is transient.
 local animator = hum:FindFirstChildOfClass("Animator")
-if not animator then animator = Instance.new("Animator"); animator.Parent = hum end
+if not animator then
+  ${beginUndo("Cubes MCP: add Animator")}
+  animator = Instance.new("Animator")
+  animator.Parent = hum
+  ${endUndo}
+end
 
 local animId = tostring(a.animationId or "")
 if not string.find(animId, "://") then animId = "rbxassetid://" .. animId end
 
+-- Deliberately NOT parented. LoadAnimation does not need it to be, and parenting
+-- left one dead Animation under the Animator for every single play.
 local anim = Instance.new("Animation")
 anim.AnimationId = animId
-anim.Parent = animator
 local okLoad, track = pcall(function() return animator:LoadAnimation(anim) end)
 if not okLoad then return { error = "load_failed", message = tostring(track) } end
 track.Looped = a.looped == true

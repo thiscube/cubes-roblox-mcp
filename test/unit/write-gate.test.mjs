@@ -94,7 +94,7 @@ function harness(writeEnabled) {
       // have written and the test proves nothing.
       if (tool === "eval") return { path: "Workspace.S", ref: "s1", source: "local a = 1" };
       if (tool === "snapshot") return { instances: [{ path: "Workspace.P", className: "Part", props: {} }] };
-      return { ok: true, applied: 1, results: [] };
+      return { ok: true, applied: 1, changes: [] };
     },
   };
   const server = createMcpServer(transport);

@@ -11,6 +11,10 @@ export const DEBUG_TOOLS: ToolEntry[] = [
   evalTool(
     {
       name: "debug_highlight",
+      // Scaffolding under Workspace._CubesMCPDebug, cleared by debug_clear.
+      // A waypoint here would make Ctrl+Z remove an overlay instead of the
+      // edit the user was looking at.
+      undo: "none",
       category: "debug",
       subcategories: ["visualize", "overlay"],
       keywords: ["highlight", "outline", "color", "overlay", "mark", "see", "find", "show", "debug"],
@@ -75,6 +79,10 @@ return { highlighted = marked, count = #marked }
   evalTool(
     {
       name: "debug_bounds",
+      // Scaffolding under Workspace._CubesMCPDebug, cleared by debug_clear.
+      // A waypoint here would make Ctrl+Z remove an overlay instead of the
+      // edit the user was looking at.
+      undo: "none",
       category: "debug",
       subcategories: ["visualize", "bbox"],
       keywords: ["bounds", "box", "bbox", "selection", "wireframe", "outline", "extent", "debug"],
@@ -134,6 +142,10 @@ return { bounded = boxed, count = #boxed }
   evalTool(
     {
       name: "debug_label",
+      // Scaffolding under Workspace._CubesMCPDebug, cleared by debug_clear.
+      // A waypoint here would make Ctrl+Z remove an overlay instead of the
+      // edit the user was looking at.
+      undo: "none",
       category: "debug",
       subcategories: ["visualize", "text"],
       keywords: ["label", "text", "name", "tag", "annotate", "billboard", "debug"],
@@ -230,6 +242,10 @@ return { placed = placed }
   evalTool(
     {
       name: "debug_axes",
+      // Scaffolding under Workspace._CubesMCPDebug, cleared by debug_clear.
+      // A waypoint here would make Ctrl+Z remove an overlay instead of the
+      // edit the user was looking at.
+      undo: "none",
       category: "debug",
       subcategories: ["visualize", "orientation"],
       keywords: ["axes", "axis", "xyz", "orientation", "direction", "arrow", "gizmo", "debug"],
@@ -310,6 +326,10 @@ return { at = { origin.X, origin.Y, origin.Z }, length = length }
   evalTool(
     {
       name: "debug_clear",
+      // Scaffolding under Workspace._CubesMCPDebug, cleared by debug_clear.
+      // A waypoint here would make Ctrl+Z remove an overlay instead of the
+      // edit the user was looking at.
+      undo: "none",
       category: "debug",
       subcategories: ["visualize", "cleanup"],
       keywords: ["clear", "wipe", "reset", "remove", "cleanup", "debug"],
@@ -543,6 +563,9 @@ return {
   evalTool(
     {
       name: "breakpoint_list",
+      // DebuggerBreakpoints are debugger state, not DataModel state, so they
+      // are not in the undo stack to begin with.
+      undo: "none",
       category: "debug",
       subcategories: ["debugger", "inspect", "trace"],
       keywords: ["breakpoint", "list", "debug", "debugger", "active", "show", "clear", "remove"],

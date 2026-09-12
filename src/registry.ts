@@ -95,6 +95,20 @@ export interface ToolEntry {
    */
   writesDisk?: true;
   /**
+   * Undo policy, for a tool whose Luau changes the DataModel.
+   *
+   * The default is a ChangeHistory waypoint, and a test fails the build when
+   * mutating Luau has none — a change the user cannot undo is the most
+   * user-hostile thing a Studio tool can do.
+   *
+   * `"none"` is the deliberate exception, and it exists for scaffolding: the
+   * debug overlays live under `Workspace._CubesMCPDebug` and are cleared by
+   * their own tool, so putting them in the undo stack would mean Ctrl+Z removes
+   * a highlight instead of the edit the user was actually looking at. Say why
+   * at the declaration, or don't use it.
+   */
+  undo?: "none";
+  /**
    * Explicit opt-out of write-class. Two honest levels, and no third:
    *
    *   true          the generated Luau provably only reads.
@@ -349,6 +363,8 @@ interface ToolMeta {
   outputSchema?: JsonSchema;
   /** See ToolEntry.writesDisk. Declare it on any local tool that persists anything. */
   writesDisk?: true;
+  /** See ToolEntry.undo. Only for mutating Luau that deliberately stays out of the undo stack. */
+  undo?: "none";
 }
 
 /**

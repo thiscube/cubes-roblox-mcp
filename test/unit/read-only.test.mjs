@@ -34,7 +34,7 @@ function harness(readOnly) {
     async send(tool, args) {
       sent.push({ tool, args });
       if (tool === "eval") return { path: "Workspace.S", ref: "s1", source: "local a = 1" };
-      return { ok: true, applied: 1, results: [] };
+      return { ok: true, applied: 1, changes: [] };
     },
   };
   const server = createMcpServer(transport, { readOnly });

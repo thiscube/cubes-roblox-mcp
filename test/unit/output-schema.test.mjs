@@ -89,7 +89,9 @@ class FakeTransport {
   async send(tool, args) {
     this.sent.push({ tool, args });
     // Shaped like a real plugin answer so payloads are not trivially empty.
-    return { ok: true, tool, applied: 1, results: [] };
+    // The shape DESIGN.md documents for mutate. A fixture that invents its own
+    // becomes the oracle, which is how `results` ended up in the schema.
+    return { ok: true, tool, applied: 1, changes: [] };
   }
 }
 

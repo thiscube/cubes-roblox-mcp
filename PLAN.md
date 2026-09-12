@@ -119,7 +119,7 @@ guaranteed API, so the OS fallback is not optional.
 
 **Done when:** a capture taken with another window covering Studio still shows Studio.
 
-#### 2. The plugin needs to live in this repo (**M**)
+#### 2. The plugin needs to live in this repo — BLOCKED, and not by a decision
 
 **Now:** `roblox/` is gitignored and has never been tracked. Distributed separately.
 Nobody can audit it, fork it, or check that it matches the server version. The whole
@@ -127,7 +127,21 @@ audit had to leave every plugin-side finding unverified.
 
 **They:** `studio-plugin/` is in the repo. roblox-ts source, handler modules, UI, client.
 
-**Do:** un-gitignore it, commit it, add a build step, version it with the server.
+**"Un-gitignore it and commit it" assumes the source is here. It is not.**
+`git log --all -- roblox/` is empty, the repository has exactly two branches and
+no releases, and nothing on GitHub carries the plugin. You cannot commit files
+you do not have. The real item is "get the plugin source from wherever it is
+distributed", which is outside this repository entirely.
+
+**What has been done instead**, so that nothing is waiting on it that does not
+have to be:
+
+- `docs/PLUGIN-PROTOCOL.md` writes down the whole contract — every command, the
+  auth rules, the WebSocket frames, the instance identity — taken from the code.
+- `--install-plugin` is built and tested; it looks for `plugin/CubesMCP.rbxm`.
+  Drop the built model there and it works with no other change.
+- Everything that could be done on the server side of items 1, 8, 9, 11 and 14
+  is done, with `FakeTransport` tests on the exact command shape sent.
 
 **Done when:** `git clone` plus one build command produces both halves.
 
@@ -277,16 +291,31 @@ is what makes protocol 5 additive.
 
 ### Tier 4: polish that makes it look finished
 
-#### 12. Test depth (**L, ongoing**)
+#### 12. Test depth — ONGOING, and the count is the least interesting part
 
-**Now:** 105 tests across 23 suites, all runnable without Studio. They cover the audit
-findings and the PLAN items landed so far, but not the breadth of the surface.
+**Now:** 258 tests across 33 suites, all runnable with no Studio, no port, no
+plugin and no network.
 
-**They:** 487 test cases across 36 files, including dedicated suites for HTTP security,
-body limits, transport, response delivery, script-source safety and asset security.
+**They:** 487 test cases across 36 files.
 
-**Do:** stop treating this as a milestone. Every new tool ships with a test. The number
-goes up on its own.
+**What got added, and why it was the right thing rather than more of the same.**
+Thirteen tool files had no test at all. A bespoke suite per file would have taken
+a long time and still missed the bugs that actually appear, so instead
+`tools-conformance.test.mjs` generates arguments from each tool's own inputSchema
+and runs all 77 through the real server: none throws, none is rejected by its own
+schema, every one is findable by searching its own name, and every write-class
+tool whose Luau changes the DataModel takes an undo waypoint or declares
+`undo: "none"` with a reason. That last check found two real bugs on its first
+run — `animation_play` was leaking an Animation instance under the Animator on
+every single play, and creating an Animator with no waypoint.
+
+**The count is not the goal, and chasing 487 would be the wrong instinct.** The
+suite's job is to be the thing that catches the next bug, and it has twice been
+the thing that encoded a premise instead. Both times the fixture was the oracle:
+the fake plugin returned `{applied, results}`, the schemas were written from the
+fixture, and the protocol doc was written from the schemas — while DESIGN.md has
+said `{applied, changes}` all along, which is what the server's own code reads.
+Test against the contract, not against the fake.
 
 #### 13. A read-only edition (**M**)
 

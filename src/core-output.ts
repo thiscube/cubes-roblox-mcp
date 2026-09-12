@@ -80,6 +80,12 @@ export const CORE_OUTPUT_SCHEMAS: Record<string, JsonSchema> = {
    */
   mutate: objectResult({
     applied: {},
+    // `changes` is the documented contract (DESIGN.md "Diff response") and the
+    // field `suggestNext`, `applyAutoUnlock` and the history summary all read.
+    // `results` is listed because the earlier schema named it and a plugin may
+    // still send it — but it came from this repo's own test fixture, not from the
+    // design, which is how a fixture becomes the oracle for a wire format.
+    changes: {},
     results: {},
     // Always set by handleMutate on the success path, so they can be typed.
     lint: { type: "array" },

@@ -29,7 +29,7 @@ user's "Allow writes" toggle and the server gates every write-class tool on it.
 | command | protocol | answer |
 |---|---|---|
 | `eval` | 1 | whatever the Luau returned, JSON-safe |
-| `mutate` | 1 | `{ applied, results }` |
+| `mutate` | 1 | `{ applied, changes: [{ ref, added, modified, removed }] }` |
 | `read` | 1 | `{ instances \| children, cursor?, snapshot? }` |
 | `snapshot` | 1 | `{ instances: [{ path, className, props }] }` |
 | `diagnostics` | 1 | recent errors/warnings, run mode, totals |

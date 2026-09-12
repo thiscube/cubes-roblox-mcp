@@ -77,6 +77,12 @@ export const EVAL_RESULT: JsonSchema = objectResult({ result: {} });
  */
 export const MUTATE_RESULT: JsonSchema = objectResult({
   applied: {},
+  // `changes` is the documented contract (DESIGN.md "Diff response") and the
+  // field `suggestNext`, `applyAutoUnlock` and the history summary all read.
+  // `results` is listed because the earlier schema named it and a plugin may
+  // still send it — but it came from this repo's own test fixture, not from the
+  // design, which is how a fixture becomes the oracle for a wire format.
+  changes: {},
   results: {},
   lint: { type: "array" },
   appliedLevel: { type: "string", enum: ["none", "soft", "hard", "nuclear"] },
