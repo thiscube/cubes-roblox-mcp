@@ -6,6 +6,18 @@ import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
 
 import http from "node:http";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { StudioBridge } from "../../dist/bridge.js";
 import { MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, protocolSupported } from "../../dist/protocol.js";
 import { rpcReadOnlyCommands } from "../../dist/rpc-policy.js";
@@ -467,6 +479,104 @@ describe("/health tiers", () => {
       }
     } finally {
       await bridge.stop();
+    }
+  });
+});
+
+/**
+ * The persisted token.
+ *
+ * The protocol has no token handoff and plugins cannot read files, so the human
+ * was the courier — re-copying a fresh 48-character string out of stderr on
+ * every restart. Persisting it makes that a one-time act. The file is a new
+ * secret at rest, so most of this is about refusing to trust one we cannot
+ * vouch for rather than about the happy path.
+ */
+describe("bridge token persistence", () => {
+  const mkHome = () => mkdtempSync(join(tmpdir(), "cubes-token-"));
+  const withHome = async (home, fn) => {
+    const prev = process.env.CUBES_MCP_HOME;
+    const prevTok = process.env.CUBES_MCP_TOKEN;
+    process.env.CUBES_MCP_HOME = home;
+    delete process.env.CUBES_MCP_TOKEN;
+    try {
+      return await fn();
+    } finally {
+      if (prev === undefined) delete process.env.CUBES_MCP_HOME;
+      else process.env.CUBES_MCP_HOME = prev;
+      if (prevTok !== undefined) process.env.CUBES_MCP_TOKEN = prevTok;
+    }
+  };
+
+  test("the token survives a restart", async () => {
+    const home = mkHome();
+    await withHome(home, async () => {
+      const a = new StudioBridge(0, {});
+      const b = new StudioBridge(0, {});
+      assert.equal(a.tokenPersisted, true);
+      assert.equal(a.token, b.token, "a restart must not invalidate the panel's token");
+      assert.equal(a.tokenGenerated, true, "the first run creates it");
+      assert.equal(b.tokenGenerated, false, "the second run loads it");
+    });
+  });
+
+  test("the file is 0600, even if it already existed with looser bits", async () => {
+    if (process.platform === "win32") return;
+    const home = mkHome();
+    await withHome(home, async () => {
+      new StudioBridge(0, {});
+      const mode = statSync(join(home, "token")).mode & 0o777;
+      assert.equal(mode, 0o600, `token file is ${mode.toString(8)}`);
+    });
+  });
+
+  test("a world-readable token file is refused, not trusted", async () => {
+    // Trusting it would let anyone who can write that file pin a token they know.
+    if (process.platform === "win32") return;
+    const home = mkHome();
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(home, "token"), "attacker-chosen\n", { mode: 0o644 });
+    chmodSync(join(home, "token"), 0o644);
+    await withHome(home, async () => {
+      const bridge = new StudioBridge(0, {});
+      assert.notEqual(bridge.token, "attacker-chosen");
+      assert.equal(bridge.tokenPersisted, false);
+      assert.match(bridge.tokenWarning, /readable by other users/);
+    });
+  });
+
+  test("a symlinked token file is refused rather than followed", async () => {
+    // Following it turns "persist a token" into an arbitrary file write.
+    if (process.platform === "win32") return;
+    const home = mkHome();
+    mkdirSync(home, { recursive: true });
+    const victim = join(home, "victim");
+    writeFileSync(victim, "important\n");
+    symlinkSync(victim, join(home, "token"));
+    await withHome(home, async () => {
+      const bridge = new StudioBridge(0, {});
+      assert.equal(bridge.tokenPersisted, false);
+      assert.match(bridge.tokenWarning, /symlink/);
+      assert.equal(readFileSync(victim, "utf8"), "important\n", "the symlink target was written through");
+    });
+  });
+
+  test("CUBES_MCP_TOKEN still wins and is never written to disk", async () => {
+    const home = mkHome();
+    const prev = process.env.CUBES_MCP_TOKEN;
+    process.env.CUBES_MCP_TOKEN = "pinned-by-env";
+    const prevHome = process.env.CUBES_MCP_HOME;
+    process.env.CUBES_MCP_HOME = home;
+    try {
+      const bridge = new StudioBridge(0, {});
+      assert.equal(bridge.token, "pinned-by-env");
+      assert.equal(bridge.tokenPersisted, false);
+      assert.equal(existsSync(join(home, "token")), false, "an env token must not be persisted");
+    } finally {
+      if (prev === undefined) delete process.env.CUBES_MCP_TOKEN;
+      else process.env.CUBES_MCP_TOKEN = prev;
+      if (prevHome === undefined) delete process.env.CUBES_MCP_HOME;
+      else process.env.CUBES_MCP_HOME = prevHome;
     }
   });
 });

@@ -6,6 +6,7 @@ import { rpcReadOnlyCommands } from "./rpc-policy.js";
 import { lintAvailable } from "./lint.js";
 import { installPlugin, pluginsDir, PLUGIN_FILENAME } from "./install-plugin.js";
 import { MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION } from "./protocol.js";
+import { tokenFile } from "./paths.js";
 
 /**
  * Entry point. Two faces:
@@ -132,11 +133,24 @@ async function main(): Promise<void> {
         "absent from this process, and /rpc refuses writes whatever the Studio panel says.",
     );
   }
-  if (bridge.tokenGenerated) {
+  if (bridge.tokenWarning) {
+    console.error(`[cubes-mcp] ${bridge.tokenWarning}`);
+  }
+  if (bridge.tokenPersisted) {
+    // Printed once, on the run that created it. On later runs the value is
+    // unchanged, so re-echoing a live secret into the client's log every start
+    // buys nothing -- the panel already has it.
     console.error(
-      `[cubes-mcp] bridge token: ${bridge.token}\n` +
-        `[cubes-mcp] the Studio plugin must send this as 'Authorization: Bearer <token>'.\n` +
-        `[cubes-mcp] set CUBES_MCP_TOKEN to pin it across restarts.`,
+      bridge.tokenGenerated
+        ? `[cubes-mcp] bridge token: ${bridge.token}\n` +
+            `[cubes-mcp] paste this into the Cubes MCP panel in Studio. It is saved to\n` +
+            `[cubes-mcp] ${tokenFile()} and will not change on restart.`
+        : `[cubes-mcp] bridge token loaded from ${tokenFile()} (unchanged since first run).`,
+    );
+  } else if (bridge.tokenGenerated) {
+    console.error(
+      `[cubes-mcp] bridge token (this run only): ${bridge.token}\n` +
+        `[cubes-mcp] it could not be saved, so it changes every restart. Set CUBES_MCP_TOKEN to pin it.`,
     );
   } else {
     console.error("[cubes-mcp] bridge token loaded from CUBES_MCP_TOKEN.");

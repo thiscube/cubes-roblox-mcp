@@ -28,3 +28,13 @@ export function profileDir(): string {
 export function apiDumpFile(): string {
   return join(stateDir(), "api-dump.json");
 }
+
+/**
+ * The persisted bridge token.
+ *
+ * Kept next to the other state rather than in the repo: it is per-machine, not
+ * per-project, and a token inside a working tree gets committed eventually.
+ */
+export function tokenFile(): string {
+  return join(stateDir(), "token");
+}

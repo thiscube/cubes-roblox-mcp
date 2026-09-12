@@ -22,7 +22,7 @@
     "ci": "npx tsc --noEmit && npm run build && CUBES_MCP_OFFLINE=1 node test/run.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@modelcontextprotocol/sdk": "^1.24.0",
     "minisearch": "^7.1.2",
     "ws": "^8.21.3"
   },

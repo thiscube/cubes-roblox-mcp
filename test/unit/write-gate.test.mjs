@@ -18,6 +18,8 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createMcpServer } from "../../dist/server.js";
+import { StudioBridge } from "../../dist/bridge.js";
+import { MAX_PROTOCOL_VERSION } from "../../dist/protocol.js";
 import { ALL_TOOLS } from "../../dist/tools/index.js";
 import { capabilities } from "../../dist/registry.js";
 import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -515,5 +517,97 @@ describe("write gate: behaviour, not labels", () => {
     } finally {
       await bridge.stop();
     }
+  });
+});
+
+/**
+ * CUBES_MCP_ALLOW_UNAUTHENTICATED exists for plugins too old to send a token.
+ * Verification reproduced the cost end to end: with it set, an unauthenticated
+ * POST to /poll carrying `writeEnabled: true` forged the user's toggle, and a
+ * following /rpc mutate passed the write gate. The toggle cannot be
+ * authenticated without authenticating the plugin, so in that mode it is not
+ * believed at all — the hatch buys reads.
+ */
+describe("unauthenticated mode cannot forge writes", () => {
+  const withFlag = async (fn) => {
+    const prev = process.env.CUBES_MCP_ALLOW_UNAUTHENTICATED;
+    process.env.CUBES_MCP_ALLOW_UNAUTHENTICATED = "1";
+    try {
+      return await fn();
+    } finally {
+      if (prev === undefined) delete process.env.CUBES_MCP_ALLOW_UNAUTHENTICATED;
+      else process.env.CUBES_MCP_ALLOW_UNAUTHENTICATED = prev;
+    }
+  };
+
+  test("a forged toggle no longer enables writes", async () => {
+    await withFlag(async () => {
+      const bridge = new StudioBridge(0, {});
+      await bridge.start();
+      try {
+        const port = bridge.boundPort;
+        const ctrl = new AbortController();
+        const inflight = fetch(`http://127.0.0.1:${port}/poll`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ protocol: MAX_PROTOCOL_VERSION, writeEnabled: true }),
+          signal: ctrl.signal,
+        }).catch(() => {});
+        for (let i = 0; i < 100 && !bridge.connected; i++) {
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        ctrl.abort();
+        await inflight;
+        assert.equal(bridge.connected, true, "the poll should still register a plugin");
+        assert.equal(bridge.writeEnabled, false, "but its write toggle must not be believed");
+      } finally {
+        await bridge.stop();
+      }
+    });
+  });
+
+  test("the mode is entered only by an exact '1', never by a truthy-looking value", async () => {
+    // A disconnected bridge reports writeEnabled false regardless, so the flag
+    // itself is what gets asserted, read back off /health where it is public.
+    for (const value of ["true", "TRUE", "yes", "0", " 1", "1 ", ""]) {
+      const prev = process.env.CUBES_MCP_ALLOW_UNAUTHENTICATED;
+      process.env.CUBES_MCP_ALLOW_UNAUTHENTICATED = value;
+      const bridge = new StudioBridge(0, {});
+      await bridge.start();
+      try {
+        const body = await fetch(`http://127.0.0.1:${bridge.boundPort}/health`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+        }).then((r) => r.json());
+        assert.equal(
+          body.unauthenticatedMode,
+          undefined,
+          `${JSON.stringify(value)} must not enter unauthenticated mode`,
+        );
+        assert.equal(body.authRequired, true);
+      } finally {
+        await bridge.stop();
+        if (prev === undefined) delete process.env.CUBES_MCP_ALLOW_UNAUTHENTICATED;
+        else process.env.CUBES_MCP_ALLOW_UNAUTHENTICATED = prev;
+      }
+    }
+  });
+
+  test("the mode announces itself without needing the credential it disabled", async () => {
+    await withFlag(async () => {
+      const bridge = new StudioBridge(0, {});
+      await bridge.start();
+      try {
+        const body = await fetch(`http://127.0.0.1:${bridge.boundPort}/health`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+        }).then((r) => r.json());
+        assert.equal(body.unauthenticatedMode, true);
+        assert.equal(body.writesForcedOff, true);
+        assert.equal(body.authRequired, false);
+      } finally {
+        await bridge.stop();
+      }
+    });
   });
 });

@@ -2,6 +2,9 @@ import { createServer, type IncomingMessage, type ServerResponse, type Server } 
 import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
 import { randomUUID, randomBytes, timingSafeEqual } from "node:crypto";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { tokenFile } from "./paths.js";
 import { MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, protocolSupported } from "./protocol.js";
 import { BridgeError, type StudioInstance, type StudioTransport } from "./transport.js";
 
@@ -103,11 +106,102 @@ const MAX_QUEUE = 256;
 /** Bound on remembered timed-out command ids (AUDIT.md #18). */
 const CANCELLED_MAX = 1000;
 
-/** Build the bearer token for this process. Explicit env wins; otherwise random per run. */
-function resolveToken(): { token: string; generated: boolean } {
+/**
+ * Build the bearer token for this process.
+ *
+ * WHY THIS IS PERSISTED
+ * ---------------------
+ * It used to be `randomBytes(24)` per run, which meant the Studio plugin could
+ * never hold a matching one: the protocol has no token handoff, plugins cannot
+ * read files, and so the human was the courier -- re-copying a new 48-character
+ * string out of stderr every single restart, or discovering CUBES_MCP_TOKEN and
+ * pinning it by hand. A token that changes when nothing else did is not a
+ * security property, it is a setup step that fails silently as a 401 the old
+ * error message then blamed on a missing plugin.
+ *
+ * Persisting it makes the pairing a one-time act. It does NOT make the token
+ * reachable by the plugin -- that still needs a plugin-side change -- but the
+ * value the user types into the Studio panel now stays true across restarts.
+ *
+ * Resolution order: env, then the file, then a fresh one written to the file.
+ * The file is 0600 and never followed through a symlink; if any of that cannot
+ * be guaranteed the token stays in memory for this run rather than being
+ * written somewhere another user could read or pre-seed.
+ */
+function resolveToken(): { token: string; generated: boolean; persisted: boolean; warning?: string } {
   const fromEnv = process.env.CUBES_MCP_TOKEN ?? process.env.CUBES_MCP_RPC_TOKEN;
-  if (fromEnv && fromEnv.length > 0) return { token: fromEnv, generated: false };
-  return { token: randomBytes(24).toString("hex"), generated: true };
+  if (fromEnv && fromEnv.length > 0) return { token: fromEnv, generated: false, persisted: false };
+
+  const file = tokenFile();
+  try {
+    const found = readTokenFile(file);
+    if (found) return { token: found, generated: false, persisted: true };
+  } catch (err) {
+    return {
+      token: randomBytes(24).toString("hex"),
+      generated: true,
+      persisted: false,
+      warning: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  const fresh = randomBytes(24).toString("hex");
+  try {
+    writeTokenFile(file, fresh);
+    return { token: fresh, generated: true, persisted: true };
+  } catch (err) {
+    return {
+      token: fresh,
+      generated: true,
+      persisted: false,
+      warning: `could not persist the bridge token (${err instanceof Error ? err.message : String(err)})`,
+    };
+  }
+}
+
+/** POSIX-ish platforms only; Windows has no mode bits worth checking. */
+const CHECKS_MODE = process.platform !== "win32";
+
+/**
+ * Read an existing token, refusing anything we cannot vouch for.
+ *
+ * `lstat`, not `stat`: a planted symlink here would be followed on write, which
+ * turns "persist a token" into an arbitrary-file-write with attacker-chosen
+ * content. And a group- or world-readable file is refused rather than repaired,
+ * because by the time we notice, whatever could read it already has.
+ */
+function readTokenFile(file: string): string | null {
+  let info;
+  try {
+    info = lstatSync(file);
+  } catch {
+    return null;
+  }
+  if (info.isSymbolicLink()) {
+    throw new Error(`${file} is a symlink; refusing to read or overwrite it.`);
+  }
+  if (!info.isFile()) {
+    throw new Error(`${file} is not a regular file.`);
+  }
+  if (CHECKS_MODE && (info.mode & 0o077) !== 0) {
+    throw new Error(
+      `${file} is readable by other users (mode ${(info.mode & 0o777).toString(8)}). ` +
+        `Delete it and restart, or set CUBES_MCP_TOKEN.`,
+    );
+  }
+  const value = readFileSync(file, "utf8").trim();
+  return value.length > 0 ? value : null;
+}
+
+/** Write-then-rename so a crash cannot leave a half-written token behind. */
+function writeTokenFile(file: string, token: string): void {
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, token + "\n", { encoding: "utf8", mode: 0o600 });
+  // writeFileSync's mode is ignored when the path already exists, and rename
+  // keeps the source inode, so set it explicitly on the file we actually made.
+  if (CHECKS_MODE) chmodSync(tmp, 0o600);
+  renameSync(tmp, file);
 }
 
 /** Constant-time compare that does not leak length through early return. */
@@ -168,6 +262,10 @@ export class StudioBridge implements StudioTransport {
   private httpServer?: Server;
   readonly token: string;
   readonly tokenGenerated: boolean;
+  /** True when the token came from, or was written to, the token file. */
+  readonly tokenPersisted: boolean;
+  /** Set when persistence was refused, so startup can say why. Never the token. */
+  readonly tokenWarning?: string;
   private readonly allowUnauthenticated: boolean;
 
   /**
@@ -199,15 +297,19 @@ export class StudioBridge implements StudioTransport {
     // Empty by default. Fails closed: a bridge built without the derived set
     // (src/rpc-policy.ts) refuses every /rpc call rather than guessing.
     this.readOnlyCommands = new Set(opts.readOnlyCommands ?? []);
-    const { token, generated } = resolveToken();
+    const { token, generated, persisted, warning } = resolveToken();
     this.token = token;
     this.tokenGenerated = generated;
+    this.tokenPersisted = persisted;
+    if (warning) this.tokenWarning = warning;
     this.allowUnauthenticated = process.env.CUBES_MCP_ALLOW_UNAUTHENTICATED === "1";
     if (this.allowUnauthenticated) {
       process.stderr.write(
-        "[cubes-mcp] WARNING: CUBES_MCP_ALLOW_UNAUTHENTICATED=1 — the bridge will accept " +
-          "unauthenticated local requests. Any process on this machine can drive Studio and " +
-          "can forge the 'Allow writes' toggle. Unset it as soon as your plugin supports tokens.\n",
+        "[cubes-mcp] WARNING: CUBES_MCP_ALLOW_UNAUTHENTICATED=1 — the bridge accepts " +
+          "unauthenticated local requests, so any process on this machine can drive Studio.\n" +
+          "[cubes-mcp] Writes are therefore FORCED OFF: an unauthenticated caller can forge the " +
+          "'Allow writes' toggle, so the toggle is not believed in this mode.\n" +
+          "[cubes-mcp] Unset it as soon as your plugin can send a token.\n",
       );
     }
   }
@@ -234,6 +336,12 @@ export class StudioBridge implements StudioTransport {
    * until the user opts in through the client UI.
    */
   get writeEnabled(): boolean {
+    // With the token off, the "Allow writes" toggle is whatever the last caller
+    // said it was, and any local process can be that caller -- the write-toggle
+    // forgery AUDIT.md #27 describes, reproduced end to end during verification.
+    // There is no way to authenticate the toggle without authenticating the
+    // plugin, so the honest resolution is that the escape hatch buys reads only.
+    if (this.allowUnauthenticated) return false;
     return this.connected && this._writeEnabled;
   }
 
@@ -821,6 +929,10 @@ export class StudioBridge implements StudioTransport {
           protocolRange: [MIN_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION],
           handshake: this.lastHandshake,
           authRequired: !this.allowUnauthenticated,
+          // Deliberately public. An operator checking whether their bridge is
+          // exposed should not need the credential the mode has disabled.
+          unauthenticatedMode: this.allowUnauthenticated || undefined,
+          writesForcedOff: this.allowUnauthenticated || undefined,
           // The block to paste when asking for help: every maintainer in this
           // ecosystem closes connection issues asking for exactly this. Carries
           // no token material at either tier.
