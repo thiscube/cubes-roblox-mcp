@@ -19,7 +19,12 @@ npm install
 npm run build      # tsc
 npm test           # build + unit tests (no Studio needed)
 npm run test:unit  # unit tests against the existing dist/
+npm run ci         # exactly what CI runs: typecheck + build + tests, offline
+npm run bench      # tool-list churn and transport latency
 ```
+
+Run `npm run ci` before pushing. `npm test` alone once passed while CI failed,
+because CI sets `CUBES_MCP_OFFLINE=1` and a guard was in the wrong place.
 
 The server is invoked by the MCP client over stdio — don't run `node dist/index.js`
 manually unless you hold stdin open (`node dist/index.js < <(sleep 86400)`).

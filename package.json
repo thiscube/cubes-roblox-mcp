@@ -18,7 +18,8 @@
     "bench": "node test/bench/tool-churn.mjs && node test/bench/poll-latency.mjs",
     "install-plugin": "node dist/index.js --install-plugin",
     "prepublishOnly": "npm run build && node --test \"test/unit/*.test.mjs\"",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "ci": "npx tsc --noEmit && npm run build && CUBES_MCP_OFFLINE=1 node --test \"test/unit/*.test.mjs\""
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
