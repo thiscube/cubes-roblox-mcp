@@ -153,6 +153,56 @@ describe("studio instances", () => {
     }
   });
 
+  test("a window that stops polling is pruned, not remembered forever", async () => {
+    // A plugin that restarts picks a new id, so without pruning the map keeps
+    // every window the session has ever seen.
+    const { bridge, post } = await makeBridge();
+    try {
+      poll(post, { instanceId: "win-gone" });
+      await settle();
+      assert.equal(bridge.listInstances().length, 1);
+
+      // Reach past the heartbeat window without waiting 30 seconds for it.
+      const [entry] = bridge.listInstances();
+      entry.lastSeen = Date.now() - 10 * 60_000;
+      assert.deepEqual(bridge.listInstances(), []);
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  test("a new socket does not inherit the previous socket's identity", async () => {
+    // Between adopting a socket and its `hello`, it has no identity. Inheriting
+    // one would hand a command addressed to the window that just left to the
+    // window that just arrived.
+    const { bridge } = await makeBridge();
+    const WebSocket = (await import("ws")).default;
+    const url = `ws://127.0.0.1:${bridge.boundPort}/ws`;
+    const open = (u) =>
+      new Promise((resolve, reject) => {
+        const ws = new WebSocket(u, { headers: { authorization: `Bearer ${bridge.token}` } });
+        ws.once("open", () => resolve(ws));
+        ws.once("error", reject);
+      });
+    try {
+      const first = await open(url);
+      first.send(JSON.stringify({ type: "hello", protocol: MAX_PROTOCOL_VERSION, instanceId: "win-a" }));
+      await settle();
+      assert.deepEqual(bridge.listInstances().map((i) => i.id), ["win-a"]);
+
+      // A second socket, which has NOT said hello yet.
+      const second = await open(url);
+      await settle();
+      const pending = bridge.send("read", {}, 300, "win-a").catch((e) => e.code);
+      await settle(80);
+      assert.equal(bridge.queueDepth, 1, "it must wait for win-a, not go to the new socket");
+      assert.equal(await pending, "studio_timeout");
+      second.close();
+    } finally {
+      await bridge.stop();
+    }
+  });
+
   test("/health reports the connected windows", async () => {
     const { bridge, post } = await makeBridge();
     try {

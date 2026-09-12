@@ -229,12 +229,19 @@ export class StudioBridge implements StudioTransport {
     return this.queue.length;
   }
 
-  /** Every Studio window currently connected, most recently seen first. */
+  /**
+   * Every Studio window currently connected, most recently seen first.
+   *
+   * Prunes as it reads. A plugin that restarts picks a new instance id, so
+   * without this the map keeps every window the session has ever seen.
+   */
   listInstances(): StudioInstance[] {
-    const alive = [...this.instances.values()].filter(
-      (i) => Date.now() - i.lastSeen < HEARTBEAT_WINDOW_MS || i.transport === "websocket",
-    );
-    return alive.sort((a, b) => b.lastSeen - a.lastSeen);
+    const now = Date.now();
+    for (const [id, info] of this.instances) {
+      const live = info.transport === "websocket" ? this.socketInstance === id && this.socketOpen : now - info.lastSeen < HEARTBEAT_WINDOW_MS;
+      if (!live) this.instances.delete(id);
+    }
+    return [...this.instances.values()].sort((a, b) => b.lastSeen - a.lastSeen);
   }
 
   /** Record or refresh a connection. Returns the id it was filed under. */
@@ -490,6 +497,10 @@ export class StudioBridge implements StudioTransport {
       }
     }
     this.socket = ws;
+    // Until `hello` arrives this socket has no identity, so it must not inherit
+    // the previous socket's. Otherwise a command addressed to the window that
+    // just went away could be handed to the one that just arrived.
+    this.socketInstance = DEFAULT_INSTANCE;
     this.lastSeen = Date.now();
 
     ws.on("message", (raw) => this.handleSocketMessage(ws, raw.toString()));
