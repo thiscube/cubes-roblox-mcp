@@ -76,7 +76,7 @@ wins.
 
 `1`, `true`, or the `--read-only` flag. The server reports itself as
 `cubes-roblox-mcp-inspector` so the client can tell which build it got, and
-`tools/list` is `search_tools`, `read`, `screenshot` plus 27 inspector-safe specialists.
+`tools/list` is `search_tools`, `read`, `screenshot` plus 28 inspector-safe specialists.
 
 Use it when you want a model looking at a place it must not touch.
 

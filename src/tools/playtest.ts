@@ -1,4 +1,5 @@
-import { type ToolEntry, commandTool, evalTool, dispatchTool, luaJson } from "../registry.js";
+import { type ToolEntry, commandTool, evalTool, dispatchTool, luaJson, timeoutFor } from "../registry.js";
+import { objectResult } from "../output-schema.js";
 
 /**
  * Driving and observing a running playtest.
@@ -6,6 +7,110 @@ import { type ToolEntry, commandTool, evalTool, dispatchTool, luaJson } from "..
  * One file per Category value — the registry's own taxonomy names the file,
  * so there is never a question of where a new tool goes (A6).
  */
+
+
+/**
+ * Walk a character along a computed path.
+ *
+ * Runs through the `tune` plugin command, which evaluates in the RUNNING
+ * playtest's server DataModel — so this needs no plugin change, and it is why
+ * the tool is a commandTool rather than an evalTool: eval lands in the edit
+ * place, where there is no character to move.
+ *
+ * The honest limit: Humanoid:MoveTo is server-side puppeteering, so the game's
+ * own control scripts still do not run. It buys intent ("get to that door")
+ * rather than fidelity; real input needs the client DataModel, which cannot
+ * reach this bridge at all (see PLAN.md #10).
+ */
+function gotoLuau(args: Record<string, unknown>): string {
+  return `
+local a = __MCP.decode(${luaJson(args)})
+local Players = game:GetService("Players")
+local PFS = game:GetService("PathfindingService")
+
+local plr
+if a.player ~= nil and a.player ~= "" then
+  plr = Players:FindFirstChild(tostring(a.player))
+else
+  plr = Players:GetPlayers()[1]
+end
+if not plr then return { error = "no_player", hint = "Start a playtest first." } end
+local char = plr.Character
+local hum = char and char:FindFirstChildOfClass("Humanoid")
+local root = char and char:FindFirstChild("HumanoidRootPart")
+if not (hum and root) then return { error = "no_character", player = plr.Name } end
+
+-- Destination is one string so the tool keeps one argument: either three
+-- comma-separated numbers, or anything __MCP.resolve understands.
+local dest
+local raw = tostring(a.to)
+local x, y, z = raw:match("^%s*(-?[%d%.]+)%s*,%s*(-?[%d%.]+)%s*,%s*(-?[%d%.]+)%s*$")
+if x then
+  dest = Vector3.new(tonumber(x), tonumber(y), tonumber(z))
+else
+  local inst = __MCP.resolve(raw)
+  if not inst then return { error = "not_found", target = raw } end
+  if inst:IsA("BasePart") then
+    dest = inst.Position
+  elseif inst:IsA("Model") then
+    local pp = inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart", true)
+    if not pp then return { error = "no_position", target = raw } end
+    dest = pp.Position
+  else
+    return { error = "no_position", target = raw, hint = "Point at a BasePart, a Model, or x,y,z." }
+  end
+end
+
+local budget = math.clamp(tonumber(a.timeout) or 20, 1, 60)
+local tolerance = math.max(0.5, tonumber(a.tolerance) or 4)
+local deadline = os.clock() + budget
+
+local path = PFS:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true })
+local okc, errc = pcall(function() path:ComputeAsync(root.Position, dest) end)
+if not okc then return { error = "path_error", message = tostring(errc) } end
+if path.Status ~= Enum.PathStatus.Success then
+  return {
+    status = "blocked",
+    arrived = false,
+    pathStatus = tostring(path.Status),
+    remaining = (root.Position - dest).Magnitude,
+  }
+end
+
+local pts = path:GetWaypoints()
+local reached = 0
+for i = 2, #pts do
+  if os.clock() >= deadline then break end
+  local wp = pts[i]
+  if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
+  hum:MoveTo(wp.Position)
+  local finished, arrivedAtWp = false, false
+  local conn = hum.MoveToFinished:Connect(function(ok)
+    finished, arrivedAtWp = true, ok
+  end)
+  -- MoveToFinished also fires false on the engine's own 8s timeout, so the wait
+  -- is bounded by the caller's budget rather than by trusting the signal alone.
+  local wpDeadline = os.clock() + math.min(8, math.max(0.1, deadline - os.clock()))
+  repeat
+    task.wait(0.05)
+  until finished or os.clock() >= wpDeadline
+  conn:Disconnect()
+  if not (finished and arrivedAtWp) then break end
+  reached = i
+end
+
+local remaining = (root.Position - dest).Magnitude
+local arrived = remaining <= tolerance
+return {
+  arrived = arrived,
+  status = arrived and "arrived" or (os.clock() >= deadline and "timeout" or "blocked"),
+  remaining = remaining,
+  waypoints = #pts,
+  reached = reached,
+  position = { root.Position.X, root.Position.Y, root.Position.Z },
+}
+`;
+}
 
 export const PLAYTEST_TOOLS: ToolEntry[] = [
   evalTool(
@@ -210,6 +315,43 @@ return {
         return { error: "bad_args", hint: "tune requires a non-empty 'luau' string." };
       }
       const result = await ctx.bridge.send("tune", { luau });
+      return { result };
+    },
+  ),
+  commandTool(
+    {
+      name: "character_goto",
+      category: "playtest",
+      subcategories: ["move", "navigate", "path"],
+      keywords: ["goto", "walk", "path", "pathfinding", "navigate", "moveto", "route", "travel"],
+      description:
+        "Walk the character somewhere with PathfindingService, jumping where the path says to. Returns arrived/blocked/timeout and the distance left. YIELDS. Needs a playtest.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          to: { type: "string", description: "A ref, a dotted path, or \"x,y,z\" world coordinates." },
+          player: { type: "string", description: "Player name. Defaults to the first player." },
+          timeout: { type: "number", minimum: 1, maximum: 60, description: "Seconds to keep walking (default 20)." },
+          tolerance: { type: "number", description: "Studs from target that counts as arrived (default 4)." },
+        },
+        required: ["to"],
+      },
+      yieldBudgetMs: (args) => (Math.min(60, Math.max(1, Number((args as any)?.timeout) || 20)) + 10) * 1000,
+      outputSchema: objectResult({
+        arrived: { type: "boolean" },
+        status: { type: "string" },
+        remaining: { type: "number" },
+      }),
+    },
+    "tune",
+    async (args, ctx) => {
+      const to = String((args ?? {}).to ?? "").trim();
+      if (!to) return { error: "bad_args", hint: "character_goto needs a destination in 'to'." };
+      const result = await ctx.bridge.send(
+        "tune",
+        { luau: gotoLuau(args ?? {}) },
+        timeoutFor({ yieldBudgetMs: (a: any) => (Math.min(60, Math.max(1, Number(a?.timeout) || 20)) + 10) * 1000 }, args),
+      );
       return { result };
     },
   ),

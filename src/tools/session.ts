@@ -96,7 +96,7 @@ export const SESSION_TOOLS: ToolEntry[] = [
           },
           decision: {
             type: "object",
-            description: "Append to decisions log. { topic, choice }.",
+            description: "Append to the decisions log.",
             properties: {
               topic: { type: "string" },
               choice: { type: "string" },
@@ -107,7 +107,7 @@ export const SESSION_TOOLS: ToolEntry[] = [
           sessionSummary: {
             type: "object",
             description:
-              "Append to sessionLog. { session, summary }. Use at the end of a session to leave breadcrumbs for next time.",
+              "Append to sessionLog. Breadcrumbs for the next session.",
             properties: {
               session: { type: "string" },
               summary: { type: "string" },
@@ -210,7 +210,7 @@ export const SESSION_TOOLS: ToolEntry[] = [
           confirm: {
             type: "boolean",
             description:
-              "Required when the macro deletes anything or overwrites script Source. Forwarded to the mutate pipeline.",
+              "Required when the macro deletes anything or overwrites script Source.",
           },
         },
         required: ["name"],
@@ -288,7 +288,7 @@ return { undone = undone, requested = n }
           path: {
             type: "string",
             description:
-              "Subtree root: a ref or dotted path. Required, because capturing the whole DataModel is too heavy to default to.",
+              "Subtree root: a ref or dotted path.",
           },
         },
         required: ["name", "path"],

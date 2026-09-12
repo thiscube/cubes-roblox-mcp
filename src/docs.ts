@@ -179,7 +179,9 @@ export class ApiDocs {
   static fromDump(dump: ApiDump, status?: Partial<DocsStatus>): ApiDocs {
     return new ApiDocs(dump, {
       studioVersion: "test",
-      versionSource: "clientsettings",
+      // Fail closed: in a file whose whole point is that a thin dump lies
+      // quietly, the provenance field must not default to the trustworthy value.
+      versionSource: "legacy",
       fetchedAt: Date.now(),
       ageHours: 0,
       stale: false,
@@ -340,7 +342,8 @@ async function getText(url: string, timeoutMs: number): Promise<string> {
   }
 }
 
-const VERSION_RE = /^version-[0-9a-f]+$/i;
+/** Bounded: an unbounded hex run would be spliced into a URL and echoed on every docs response. */
+const VERSION_RE = /^version-[0-9a-f]{8,64}$/i;
 
 /**
  * Resolve the hash of the Studio build whose dump we want.
@@ -371,18 +374,41 @@ export async function resolveStudioVersion(
   return { studioVersion: legacy, versionSource: "legacy" };
 }
 
-/** Download the dump for the current Studio build. */
-export async function fetchDump(
-  fetchTimeoutMs = FETCH_TIMEOUT_MS,
-): Promise<{ dump: ApiDump; studioVersion: string; versionSource: VersionSource }> {
-  const { studioVersion, versionSource } = await resolveStudioVersion();
-  const body = await getText(DUMP_URL(studioVersion), fetchTimeoutMs);
+async function downloadDump(version: string, fetchTimeoutMs: number): Promise<ApiDump> {
+  const body = await getText(DUMP_URL(version), fetchTimeoutMs);
   if (body.length < MIN_PLAUSIBLE_BYTES) {
     throw new Error(`API dump was only ${body.length} bytes — refusing to cache it`);
   }
   const dump = JSON.parse(body) as ApiDump;
   if (!isDump(dump)) throw new Error("API dump did not parse into Classes/Enums");
-  return { dump, studioVersion, versionSource };
+  return dump;
+}
+
+/**
+ * Download the dump for the current Studio build.
+ *
+ * The fallback covers the whole operation, not just resolution. During a deploy
+ * there is a window where the channel endpoint advertises a build whose dump has
+ * not been published to setup.rbxcdn.com yet; resolving cleanly and then 404ing
+ * on the dump would turn a cold cache into a hard failure, where the frozen
+ * resolver would still have produced a usable — if thin, and labelled — answer.
+ */
+export async function fetchDump(
+  fetchTimeoutMs = FETCH_TIMEOUT_MS,
+): Promise<{ dump: ApiDump; studioVersion: string; versionSource: VersionSource }> {
+  const { studioVersion, versionSource } = await resolveStudioVersion();
+  try {
+    return { dump: await downloadDump(studioVersion, fetchTimeoutMs), studioVersion, versionSource };
+  } catch (err) {
+    if (versionSource === "legacy") throw err;
+    const legacy = (await getText(LEGACY_VERSION_URL, 15_000)).trim();
+    if (!VERSION_RE.test(legacy) || legacy === studioVersion) throw err;
+    return {
+      dump: await downloadDump(legacy, fetchTimeoutMs),
+      studioVersion: legacy,
+      versionSource: "legacy",
+    };
+  }
 }
 
 let inFlight: Promise<ApiDocs> | null = null;

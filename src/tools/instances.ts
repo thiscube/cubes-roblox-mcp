@@ -11,6 +11,83 @@ import { beginUndo, endUndo, parseColorLua } from "./_luau-helpers.js";
 export const INSTANCES_TOOLS: ToolEntry[] = [
   evalTool(
     {
+      name: "tags_find",
+      category: "instances",
+      subcategories: ["tags", "query", "introspect"],
+      keywords: ["tag", "tags", "collectionservice", "tagged", "find", "group", "label"],
+      readOnly: true,
+      description:
+        "CollectionService tags. Give `tag` to list every instance carrying it, or `target` to list one instance's tags. How most places mark doors, spawners and interactables.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          tag: { type: "string", description: "Find every instance carrying this tag." },
+          target: { type: "string", description: "Ref or path whose own tags to list. Use instead of `tag`." },
+          limit: { type: "number", minimum: 1, maximum: 500, description: "Max instances returned (default 100)." },
+        },
+      },
+    },
+    (args) => `
+local a = __MCP.decode(${luaJson(args)})
+local CS = game:GetService("CollectionService")
+if a.target ~= nil and a.target ~= "" then
+  local inst = __MCP.resolve(a.target)
+  if not inst then return { error = "not_found", target = a.target } end
+  return { target = inst:GetFullName(), tags = CS:GetTags(inst) }
+end
+if a.tag == nil or a.tag == "" then
+  return { error = "bad_args", hint = "Pass a tag to search for, or a target whose tags you want." }
+end
+local limit = math.clamp(math.floor(tonumber(a.limit) or 100), 1, 500)
+local out, n = {}, 0
+-- Count every match but only carry \`limit\` of them back, so the caller learns
+-- a tag has 4000 instances without being sent 4000 rows to find that out.
+for _, inst in ipairs(CS:GetTagged(a.tag)) do
+  n = n + 1
+  if n <= limit then
+    out[#out + 1] = { ref = __MCP.refFor(inst), path = inst:GetFullName(), class = inst.ClassName }
+  end
+end
+return { tag = a.tag, total = n, truncated = n > limit, instances = out }
+`,
+  ),
+  evalTool(
+    {
+      name: "tags_set",
+      category: "instances",
+      subcategories: ["tags", "edit"],
+      keywords: ["tag", "untag", "addtag", "removetag", "collectionservice", "mark"],
+      description:
+        "Add or remove CollectionService tags on one instance. Returns the resulting tag list. One undo waypoint.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          target: { type: "string", description: "Ref or path of the instance to tag." },
+          add: { type: "array", items: { type: "string" }, description: "Tags to add." },
+          remove: { type: "array", items: { type: "string" }, description: "Tags to remove." },
+        },
+        required: ["target"],
+      },
+    },
+    (args) => `
+local a = __MCP.decode(${luaJson(args)})
+local CS = game:GetService("CollectionService")
+local inst = __MCP.resolve(a.target)
+if not inst then return { error = "not_found", target = a.target } end
+${beginUndo("Cubes MCP: tags_set")}
+local ok, err = pcall(function()
+  for _, t in ipairs(a.add or {}) do CS:AddTag(inst, tostring(t)) end
+  for _, t in ipairs(a.remove or {}) do CS:RemoveTag(inst, tostring(t)) end
+end)
+if __rec then
+  CHS:FinishRecording(__rec, ok and Enum.FinishRecordingOperation.Commit or Enum.FinishRecordingOperation.Cancel)
+end
+if not ok then return { error = "tag_failed", message = tostring(err) } end
+return { target = inst:GetFullName(), tags = CS:GetTags(inst) }
+`,
+  ),
+  evalTool(
+    {
       name: "instance_duplicate",
       category: "instances",
       subcategories: ["clone", "copy"],

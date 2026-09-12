@@ -449,7 +449,7 @@ describe("API dump version resolver", () => {
     // A 200 with unusable JSON is the failure mode that would otherwise poison
     // the cache with a bad hash, so it has to route to the fallback, not throw.
     for (const body of ["{}", '{"clientVersionUpload":null}', '{"clientVersionUpload":"not-a-version"}', "<html>"]) {
-      __setDocsFetchForTest(async (url) => (url === CHANNEL ? reply(body) : reply("version-abc123")));
+      __setDocsFetchForTest(async (url) => (url === CHANNEL ? reply(body) : reply("version-abc12345")));
       const res = await resolveStudioVersion(50);
       assert.equal(res.versionSource, "legacy", `body ${body} should have fallen back`);
     }
@@ -466,11 +466,91 @@ describe("API dump version resolver", () => {
     try {
       __setDocsFetchForTest(null);
       await assert.rejects(() => resolveStudioVersion(50), /CUBES_MCP_OFFLINE/);
-      __setDocsFetchForTest(async () => reply("version-abc123"));
+      __setDocsFetchForTest(async () => reply("version-abc12345"));
       assert.equal((await resolveStudioVersion(50)).versionSource, "legacy");
     } finally {
       if (prev === undefined) delete process.env.CUBES_MCP_OFFLINE;
       else process.env.CUBES_MCP_OFFLINE = prev;
     }
+  });
+});
+
+/**
+ * Provenance must never overwrite a tool's own answer.
+ *
+ * Every docs response spreads `provenance` LAST, so any key it adds wins over
+ * the same key set by the tool. That has now bitten twice: `classes` clobbered
+ * `docs_search`'s result array, and `hint` clobbered the guidance in
+ * `docs_class`'s unknown_class branch and `docs_search`'s bad_args branch —
+ * the latter telling a model that passed an empty query about the dump's age
+ * and never telling it to pass a query.
+ *
+ * The pairing is not hypothetical: "legacy" is precisely the state in which
+ * classes go missing, so unknown_class + legacy is the likeliest combination in
+ * the system. So this asserts the property, not the two known keys.
+ */
+describe("docs provenance never clobbers a tool's own keys", () => {
+  const legacyDump = () =>
+    __setApiDocsForTest(
+      ApiDocs.fromDump(FAKE_DUMP, { studioVersion: "version-test", ageHours: 0, versionSource: "legacy" }),
+    );
+  const call = (name, args) => DOCS_TOOLS.find((t) => t.name === name).handler(args, {});
+
+  afterEach(() => installFakeDump());
+
+  test("an error branch keeps its own hint when the dump is legacy", async () => {
+    legacyDump();
+    const unknown = await call("docs_class", { class: "NoSuchClassAnywhere" });
+    assert.equal(unknown.error, "unknown_class");
+    assert.match(unknown.hint, /docs_search/, "the tool's own guidance must survive provenance");
+
+    const bad = await call("docs_search", { query: "   " });
+    assert.equal(bad.error, "bad_args");
+    assert.match(bad.hint, /query/, "bad_args must still say what was wrong with the args");
+  });
+
+  test("the degraded source is still reported, just not on top of a tool key", async () => {
+    legacyDump();
+    const res = await call("docs_class", { class: "NoSuchClassAnywhere" });
+    assert.equal(res.version_source, "legacy");
+    assert.match(res.dump_hint, /frozen versionQTStudio/);
+    assert.equal(typeof res.dump_classes, "number");
+  });
+
+  test("provenance is silent about the source when it is the live one", async () => {
+    installFakeDump();
+    const res = await call("docs_class", { class: "NoSuchClassAnywhere" });
+    assert.equal(res.version_source, undefined);
+    assert.equal(res.dump_hint, undefined);
+  });
+
+  test("no provenance key collides with any key a docs tool sets", async () => {
+    // The general property. Drive every docs tool down a success and an error
+    // path with provenance OFF, collect every key each response owns, then
+    // assert the provenance key set is disjoint from it.
+    const PROVENANCE_KEYS = ["studio_version", "dump_age_hours", "dump_classes", "version_source", "dump_hint", "stale", "refresh_error"];
+    const probes = [
+      ["docs_class", { class: "Part" }],
+      ["docs_class", { class: "NoSuchClassAnywhere" }],
+      ["docs_member", { class: "Part", member: "Anchored" }],
+      ["docs_member", { class: "Part", member: "NoSuchMember" }],
+      ["docs_search", { query: "part" }],
+      ["docs_search", { query: "   " }],
+      ["docs_enum", { enum: "Material" }],
+      ["docs_enum", { enum: "NoSuchEnum" }],
+    ];
+    installFakeDump();
+    const owned = new Set();
+    for (const [name, args] of probes) {
+      const tool = DOCS_TOOLS.find((t) => t.name === name);
+      if (!tool) continue;
+      const res = await tool.handler(args, {});
+      // Provenance is off in this state except for the two always-on keys, so
+      // everything else present is a key the tool itself owns.
+      for (const k of Object.keys(res ?? {})) owned.add(k);
+    }
+    const always = new Set(["studio_version", "dump_age_hours", "dump_classes"]);
+    const collisions = PROVENANCE_KEYS.filter((k) => owned.has(k) && !always.has(k));
+    assert.deepEqual(collisions, [], `provenance would overwrite tool-owned key(s): ${collisions.join(", ")}`);
   });
 });

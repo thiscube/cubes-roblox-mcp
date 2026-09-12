@@ -14,6 +14,8 @@ import { StudioBridge } from "../../dist/bridge.js";
 import { MAX_PROTOCOL_VERSION } from "../../dist/protocol.js";
 import { rpcReadOnlyCommands } from "../../dist/rpc-policy.js";
 import { SESSION_TOOLS } from "../../dist/tools/session.js";
+import { INSTANCES_TOOLS } from "../../dist/tools/instances.js";
+import { capabilities } from "../../dist/registry.js";
 import "./_fixtures.mjs";
 
 async function makeBridge() {
@@ -257,5 +259,78 @@ describe("studio_instances tool", () => {
     const { capabilities } = await import("../../dist/registry.js");
     assert.equal(capabilities(tool).write, false);
     assert.equal(capabilities(tool).writesDisk, false);
+  });
+});
+
+/**
+ * CollectionService tags (gap #2).
+ *
+ * Tags are how most real places mark doors, spawners and interactables, and the
+ * server had no way to see them at all. The split into two tools is the point:
+ * reading tags is something the read-only build must be able to do, and it can
+ * only claim that if the Luau it generates provably never writes — so the two
+ * halves cannot share a tool with an `op` argument.
+ */
+describe("tags", () => {
+  const find = INSTANCES_TOOLS.find((t) => t.name === "tags_find");
+  const set = INSTANCES_TOOLS.find((t) => t.name === "tags_set");
+
+  /** Run a tool against a bridge that records the Luau instead of sending it. */
+  async function luauFor(tool, args) {
+    let sent = "";
+    await tool.handler(args, {
+      bridge: {
+        connected: true,
+        writeEnabled: true,
+        async send(_cmd, payload) {
+          sent = String(payload?.luau ?? "");
+          return {};
+        },
+      },
+    });
+    return sent;
+  }
+
+  test("reading is read-class and writing is not", () => {
+    assert.equal(capabilities(find).write, false, "tags_find must survive the read-only build");
+    assert.equal(capabilities(find).inspectorSafe, true);
+    assert.equal(capabilities(set).write, true, "AddTag/RemoveTag mutate the place");
+    assert.equal(capabilities(set).inspectorSafe, false);
+  });
+
+  test("the read tool generates Luau that never writes", async () => {
+    const luau = await luauFor(find, { tag: "Door" });
+    for (const forbidden of ["AddTag", "RemoveTag", "RemoveTags", ":Destroy", ".Parent ="]) {
+      assert.ok(!luau.includes(forbidden), `tags_find must not emit ${forbidden}`);
+    }
+    assert.ok(luau.includes("GetTagged"), "it should actually read tags");
+  });
+
+  test("both branches of the read tool are reachable, and neither is silent", async () => {
+    assert.match(await luauFor(find, { tag: "Door" }), /GetTagged/);
+    assert.match(await luauFor(find, { target: "Workspace.Door" }), /GetTags/);
+    // Neither argument given is a structured refusal, not an empty result that
+    // reads like "there are no tags".
+    assert.match(await luauFor(find, {}), /bad_args/);
+  });
+
+  test("the write tool takes an undo waypoint and cancels it on failure", async () => {
+    const luau = await luauFor(set, { target: "Workspace.Door", add: ["Interactable"] });
+    assert.match(luau, /TryBeginRecording/);
+    assert.match(luau, /FinishRecording/);
+    assert.match(luau, /Enum\.FinishRecordingOperation\.Cancel/, "a failed tag edit must not commit a waypoint");
+  });
+
+  test("tag arguments are embedded as data, never spliced into source", async () => {
+    // luaJson exists because a tag named `"] end; game:Shutdown(); --` used to
+    // end the string and keep going.
+    const nasty = '"] end; game:Shutdown(); --';
+    const luau = await luauFor(set, { target: "Workspace.Door", add: [nasty] });
+    // The text is expected to appear — it is data. What must never appear is an
+    // UNESCAPED closing quote, which is what would end the literal and turn the
+    // rest of the tag name into statements.
+    assert.doesNotMatch(luau, /(?<!\\)"\] end/, "the payload closed its own string literal");
+    assert.match(luau, /\\"\] end/, "the quote should be present but escaped");
+    assert.match(luau, /__MCP\.decode/, "arguments travel as decoded data, not as spliced source");
   });
 });

@@ -77,7 +77,7 @@ relays it.
 ## Running it read-only
 
 `--read-only`, or `CUBES_MCP_READ_ONLY=1`. Every write-class tool is removed from
-the process: `mutate`, `run_code` and 46 specialists are not registered, cannot
+the process: `mutate`, `run_code` and 48 specialists are not registered, cannot
 be called by name, cannot be found by `search_tools`. `/rpc` refuses writes
 whatever the Studio panel says, and `send()` refuses them at the transport too.
 

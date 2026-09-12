@@ -105,7 +105,13 @@ async function docs() {
   };
   if (api.status.versionSource === "legacy") {
     provenance.version_source = "legacy";
-    provenance.hint =
+    // `dump_hint`, not `hint`: provenance is spread LAST into every docs
+    // response, and two branches (docs_class/unknown_class, docs_search/bad_args)
+    // set a `hint` of their own first. A plain `hint` here replaced the only
+    // guidance in those payloads -- and "legacy" is exactly the state in which
+    // classes go missing, so unknown_class + legacy is the likeliest pairing
+    // in the whole system. Same lesson as `dump_classes`, one key over.
+    provenance.dump_hint =
       "Resolved through the frozen versionQTStudio endpoint, which serves an old " +
       "build with far fewer classes. A missing class here may still exist in Studio.";
   }

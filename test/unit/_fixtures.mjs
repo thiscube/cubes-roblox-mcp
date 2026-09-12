@@ -123,5 +123,13 @@ export const FAKE_DUMP = {
 
 /** Install the fixture as the process-wide dump. Call before touching a docs tool. */
 export function installFakeDump() {
-  __setApiDocsForTest(ApiDocs.fromDump(FAKE_DUMP, { studioVersion: "version-test", ageHours: 0 }));
+  // `versionSource` is stated, not defaulted: ApiDocs.fromDump defaults it to
+  // "legacy" on purpose (fail closed), so the healthy fixture has to say so.
+  __setApiDocsForTest(
+    ApiDocs.fromDump(FAKE_DUMP, {
+      studioVersion: "version-test",
+      ageHours: 0,
+      versionSource: "clientsettings",
+    }),
+  );
 }
