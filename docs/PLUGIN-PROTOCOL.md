@@ -89,6 +89,15 @@ global budget of 4 stream clients, also shared with every other plugin.
 
 Protocol 4 adds the WebSocket transport below; it carries the same commands.
 
+Every command sent while an MCP tool call is running also carries `via`, the
+call it serves: `{ "tool": "script_edit", "category": "scripts", "activity": "Scripting" }`.
+`activity` is a one-word label from `src/activity.ts`, ready to display.
+`category` is absent for core tools (`read`, `mutate`, `run_code`, `screenshot`), and
+`via` itself is absent for commands the server sends on its own. It exists so a
+panel can show what the agent is doing rather than guessing from `tool`, which
+is `mutate` for a script patch and a part grid alike. Optional to read; a plugin
+that ignores it loses nothing.
+
 ## `capture` (protocol 3)
 
 Sent as `{ region, maxEdge }`. `region` is `"viewport"` or `"studio"`; `maxEdge`

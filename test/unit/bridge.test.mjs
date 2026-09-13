@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { StudioBridge, tokenFileRefusal } from "../../dist/bridge.js";
 import { MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, protocolSupported } from "../../dist/protocol.js";
 import { rpcReadOnlyCommands } from "../../dist/rpc-policy.js";
+import { withCall } from "../../dist/call-context.js";
 // Isolates on-disk state (CUBES_MCP_HOME) and the API dump. Import for the side effect.
 import "./_fixtures.mjs";
 
@@ -715,5 +716,42 @@ describe("tokenFileRefusal", () => {
       /symlink/,
       "the shape checks still apply",
     );
+  });
+});
+
+describe("command provenance (via)", () => {
+  test("a command sent inside a tool call names that call, however deep the send", async () => {
+    const { bridge, call } = await makeBridge();
+    try {
+      const poll = call("/poll", { body: { protocol: MAX_PROTOCOL_VERSION, writeEnabled: true } });
+      await new Promise((r) => setTimeout(r, 50));
+      const helper = async () => {
+        await Promise.resolve();
+        return bridge.send("mutate", { ops: [] }, 2000);
+      };
+      const inflight = withCall({ tool: "script_edit", category: "scripts", activity: "Scripting" }, helper);
+      const cmd = await (await poll).json();
+      assert.equal(cmd.tool, "mutate");
+      assert.deepEqual(cmd.via, { tool: "script_edit", category: "scripts", activity: "Scripting" });
+      await call("/result", { body: { id: cmd.id, ok: true, result: {} } });
+      await inflight;
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  test("a command sent outside any tool call carries no via", async () => {
+    const { bridge, call } = await makeBridge();
+    try {
+      const poll = call("/poll", { body: { protocol: MAX_PROTOCOL_VERSION, writeEnabled: true } });
+      await new Promise((r) => setTimeout(r, 50));
+      const inflight = bridge.send("read", {}, 2000);
+      const cmd = await (await poll).json();
+      assert.equal("via" in cmd, false);
+      await call("/result", { body: { id: cmd.id, ok: true, result: {} } });
+      await inflight;
+    } finally {
+      await bridge.stop();
+    }
   });
 });

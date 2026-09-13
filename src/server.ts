@@ -9,6 +9,8 @@ import {
 import { randomUUID } from "node:crypto";
 
 import { BridgeError, type StudioTransport } from "./transport.js";
+import { withCall } from "./call-context.js";
+import { activityFor } from "./activity.js";
 import { Session, CORE_TOOLS, READ_ONLY_CORE_TOOLS } from "./session.js";
 import { ToolRegistry, capabilities, outputSchemaFor, type ToolEntry } from "./registry.js";
 import { CORE_OUTPUT_SCHEMAS, RESULT_ENVELOPE } from "./core-output.js";
@@ -528,7 +530,13 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
   });
 
   // ---- tools/call --------------------------------------------------------
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  // Every bridge command sent while a call runs carries that call's tool name.
+  const callOf = (tool: string, args: unknown) => ({
+    tool,
+    category: registry.get(tool)?.category,
+    activity: activityFor(tool, args),
+  });
+  server.setRequestHandler(CallToolRequestSchema, (req) => withCall(callOf(req.params.name, req.params.arguments), async () => {
     const name = req.params.name;
     const args = (req.params.arguments ?? {}) as Record<string, unknown>;
     session.turn += 1;
@@ -720,7 +728,7 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
       structuredContent: structured,
       ...(failed ? { isError: true } : {}),
     };
-  });
+  }));
 
   // ---- core tool handlers ------------------------------------------------
 

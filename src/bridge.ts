@@ -4,6 +4,7 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { randomUUID, randomBytes, timingSafeEqual } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { currentCall, type CallInfo } from "./call-context.js";
 import { tokenFile } from "./paths.js";
 import { MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, protocolSupported } from "./protocol.js";
 import { BridgeError, type StudioInstance, type StudioTransport } from "./transport.js";
@@ -68,6 +69,12 @@ export interface BridgeCommand {
    * what every command still is when only one plugin is connected.
    */
   target?: string;
+  /**
+   * The MCP tool call this command serves (see call-context.ts). Additive: a
+   * plugin that ignores it behaves as before. Lets the panel say "Scripting"
+   * for a `script_edit` instead of guessing from a bare `mutate`.
+   */
+  via?: CallInfo;
 }
 
 /**
@@ -649,7 +656,14 @@ export class StudioBridge implements StudioTransport {
       );
     }
 
-    const cmd: BridgeCommand = { id: randomUUID(), tool, args, ...(target ? { target } : {}) };
+    const via = currentCall();
+    const cmd: BridgeCommand = {
+      id: randomUUID(),
+      tool,
+      args,
+      ...(target ? { target } : {}),
+      ...(via ? { via } : {}),
+    };
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(cmd.id);
@@ -674,7 +688,7 @@ export class StudioBridge implements StudioTransport {
     if (this.socketOpen && (!cmd.target || cmd.target === this.socketInstance)) {
       try {
         this.socket?.send(
-          JSON.stringify({ type: "command", id: cmd.id, tool: cmd.tool, args: cmd.args }),
+          JSON.stringify({ type: "command", id: cmd.id, tool: cmd.tool, args: cmd.args, via: cmd.via }),
         );
         return;
       } catch {
@@ -868,7 +882,7 @@ export class StudioBridge implements StudioTransport {
       const [cmd] = this.queue.splice(idx, 1);
       if (!cmd) break;
       this.socket?.send(
-        JSON.stringify({ type: "command", id: cmd.id, tool: cmd.tool, args: cmd.args }),
+        JSON.stringify({ type: "command", id: cmd.id, tool: cmd.tool, args: cmd.args, via: cmd.via }),
       );
     }
   }
