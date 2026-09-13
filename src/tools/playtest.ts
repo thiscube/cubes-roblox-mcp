@@ -200,7 +200,7 @@ return {
       subcategories: ["lifecycle", "simulate"],
       keywords: ["playtest", "play", "solo", "start", "simulate", "player"],
       description:
-        "Start Play Solo (StudioTestService:ExecutePlayModeAsync). Plugin stays connected, so drive the player with character_* tools. Temporarily enables LoadStringEnabled so eval tools work in the play DM, restored on stop (`loadStringFlipped`).",
+        "Start Play Solo (StudioTestService:ExecutePlayModeAsync). Plugin stays connected, so drive the player with character_* tools.",
       inputSchema: {
         type: "object",
         properties: {
