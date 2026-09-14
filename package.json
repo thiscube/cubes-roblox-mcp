@@ -10,6 +10,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
+    "setup": "npm run build && node dist/index.js --install-plugin",
+    "doctor": "node dist/index.js --doctor",
     "dev": "tsx src/index.ts",
     "test": "npm run build && node test/run.mjs",
     "test:unit": "node test/run.mjs",
@@ -54,7 +56,7 @@
   ],
   "files": [
     "dist",
-    "plugin",
+    "plugin/CubesMCP.rbxmx",
     "docs",
     "README.md",
     "SECURITY.md",

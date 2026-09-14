@@ -1,8 +1,8 @@
 /**
  * Wire-protocol versioning for the MCP server <-> Studio plugin handshake.
  *
- * The two halves ship separately — the plugin is distributed outside this repo —
- * so they CANNOT be assumed to upgrade in lockstep. An exact-equality check made
+ * The two halves are installed separately (the plugin into Studio, the server into
+ * the MCP client), so they CANNOT be assumed to upgrade in lockstep. An exact-equality check made
  * every release a flag day: bump the constant and every user on the previous
  * plugin is locked out until they rebuild (ARCHITECTURE-REVIEW.md A5).
  *

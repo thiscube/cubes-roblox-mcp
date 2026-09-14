@@ -5,12 +5,16 @@ GitHub: https://github.com/thiscube/cubes-roblox-mcp
 
 ## What this repo is
 
-**This repo is the MCP server only.** The Studio plugin (Luau) is the other half of the
-system and is distributed separately — `.gitignore` excludes `roblox/`, and it has never
-been tracked here. Don't go looking for `roblox/src/Transport.luau`; it isn't in this
-checkout and never was.
+**Both halves live here.** The MCP server is `src/`; the Studio plugin (Luau) is
+`plugin/src`, built by Rojo into `plugin/CubesMCP.rbxmx`, which `npm run setup` installs
+into Studio with the bridge token baked in. (`roblox/` in `.gitignore` is an old path
+and holds nothing.)
 
 - `src/` — Node/TypeScript MCP server. Stdio to the MCP client, HTTP bridge to the plugin.
+- `plugin/src/` — the plugin. `init.server.luau` is the entry, `Transport.luau` the command
+  dispatch, `StatusUi.luau` the panel, `HudOverlay.luau` the activity bar, `ViewGuard.luau`
+  the camera/view revert. After editing, rebuild the model:
+  `rojo build plugin/plugin.project.json -o plugin/CubesMCP.rbxmx` (a unit test catches drift).
 - `src/tools/` — one file per tool category, matching the `Category` union in `registry.ts`.
 - `test/unit/` — the tests that run without Studio. Start here.
 

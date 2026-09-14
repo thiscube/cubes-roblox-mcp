@@ -1,19 +1,18 @@
 /**
  * Packaging and the plugin installer (PLAN.md #3).
  *
- * Getting set up is the step that loses people: clone, install, build, then go
- * and find a plugin that is not in this repository. The mechanism for that last
- * step is here and tested; the plugin artifact itself is not in this checkout
- * and never has been, so the honest behaviour is to say so precisely rather than
- * to pretend.
+ * Getting set up is the step that loses people. `npm run setup` installs the
+ * plugin model that ships in plugin/, removes older copies, and bakes the bridge
+ * token in, so the only thing left for a person is the Allow writes toggle.
  */
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile, stat, chmod } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile, stat, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { installPlugin, pluginsDir, PLUGIN_FILENAME, BUNDLED_PLUGIN_PATH } from "../../dist/install-plugin.js";
+import { installPlugin, pluginsDir, PLUGIN_FILENAME, BUNDLED_PLUGIN_PATH, TOKEN_PLACEHOLDER } from "../../dist/install-plugin.js";
+import { MIN_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION } from "../../dist/protocol.js";
 import "./_fixtures.mjs";
 
 const pkg = JSON.parse(await readFile(new URL("../../package.json", import.meta.url), "utf8"));
@@ -50,6 +49,12 @@ describe("npm package metadata", () => {
     for (const unwanted of ["src", "test", "node_modules"]) {
       assert.ok(!pkg.files.includes(unwanted), `${unwanted} should not be published`);
     }
+  });
+
+  test("setup and doctor are one command each", () => {
+    assert.match(pkg.scripts.setup, /build/);
+    assert.match(pkg.scripts.setup, /--install-plugin/);
+    assert.match(pkg.scripts.doctor, /--doctor/);
   });
 
   test("publishing runs the build and the tests first", () => {
@@ -91,7 +96,7 @@ describe("plugin installer", () => {
     const res = await installPlugin({ source: join(dir, "nope.rbxm"), targetDir: dir });
     assert.equal(res.ok, false);
     assert.equal(res.code, "no_bundled_plugin");
-    assert.match(res.message, /distributed separately/);
+    assert.match(res.message, /rojo build/);
     assert.match(res.message, /--plugin <path>/);
     assert.match(res.message, /restarted/, "Studio caches plugins at launch");
   });
@@ -138,8 +143,84 @@ describe("plugin installer", () => {
     }
   });
 
-  test("the bundled path is where a vendored plugin would go", () => {
-    assert.match(BUNDLED_PLUGIN_PATH, /plugin[\\/]CubesMCP\.rbxm$/);
-    assert.ok(pkg.files.includes("plugin"), "the tarball must carry it once it exists");
+  test("older copies of the plugin are removed, other plugins are not", async () => {
+    const src = await mkdtemp(join(tmpdir(), "cubes-src-"));
+    const model = join(src, "built.rbxmx");
+    await writeFile(model, "<roblox/>");
+    const dest = await mkdtemp(join(tmpdir(), "cubes-dest-"));
+    for (const name of ["CubesMCP.rbxm", "CubesMCP.rbxmx", "CubesMCP (1).rbxmx", "RoAnim.rbxmx", "NotCubesMCP.rbxmx"]) {
+      await writeFile(join(dest, name), "old");
+    }
+
+    const res = await installPlugin({ source: model, targetDir: dest });
+    assert.equal(res.ok, true, res.message);
+    assert.deepEqual(res.removed.sort(), ["CubesMCP (1).rbxmx", "CubesMCP.rbxm", "CubesMCP.rbxmx"]);
+    assert.deepEqual((await readdir(dest)).sort(), ["CubesMCP.rbxmx", "NotCubesMCP.rbxmx", "RoAnim.rbxmx"]);
+  });
+
+  test("the bridge token is baked into the installed copy, not the shipped one", async () => {
+    const src = await mkdtemp(join(tmpdir(), "cubes-src-"));
+    const model = join(src, "built.rbxmx");
+    await writeFile(model, `Config.BAKED_TOKEN = "${TOKEN_PLACEHOLDER}"`);
+    const dest = await mkdtemp(join(tmpdir(), "cubes-dest-"));
+    const token = "0123456789abcdef0123456789abcdef";
+
+    const res = await installPlugin({ source: model, targetDir: dest, token });
+    assert.equal(res.tokenBaked, true);
+    assert.equal(await readFile(res.installedTo, "utf8"), `Config.BAKED_TOKEN = "${token}"`);
+    assert.match(await readFile(model, "utf8"), new RegExp(TOKEN_PLACEHOLDER), "the source must keep its placeholder");
+  });
+
+  test("a token that could break out of the Luau string is not baked", async () => {
+    const src = await mkdtemp(join(tmpdir(), "cubes-src-"));
+    const model = join(src, "built.rbxmx");
+    await writeFile(model, `"${TOKEN_PLACEHOLDER}"`);
+    const dest = await mkdtemp(join(tmpdir(), "cubes-dest-"));
+
+    const res = await installPlugin({ source: model, targetDir: dest, token: 'abcdefghijklmnop" .. evil() .. "' });
+    assert.equal(res.ok, true);
+    assert.equal(res.tokenBaked, false);
+    assert.equal(await readFile(res.installedTo, "utf8"), `"${TOKEN_PLACEHOLDER}"`);
+  });
+
+  test("the bundled model ships in the repo and in the tarball", async () => {
+    assert.match(BUNDLED_PLUGIN_PATH, /plugin[\\/]CubesMCP\.rbxmx$/);
+    assert.ok((await stat(BUNDLED_PLUGIN_PATH)).isFile(), "plugin/CubesMCP.rbxmx is missing: rojo build plugin/plugin.project.json -o plugin/CubesMCP.rbxmx");
+    assert.ok(pkg.files.includes("plugin/CubesMCP.rbxmx"), "the tarball must carry the model");
+  });
+});
+
+/**
+ * The shipped model is built from plugin/src by Rojo. Nothing else keeps the two
+ * in step, so a source edit without a rebuild would install a stale plugin.
+ */
+describe("the shipped plugin model matches its source", () => {
+  const lf = (s) => s.replace(/\r\n/g, "\n");
+  const srcDir = new URL("../../plugin/src/", import.meta.url);
+
+  test("every source file is in the model, verbatim", async () => {
+    const model = lf(await readFile(BUNDLED_PLUGIN_PATH, "utf8"));
+    const files = (await readdir(srcDir)).filter((f) => f.endsWith(".luau"));
+    assert.ok(files.includes("init.server.luau"), "the entry script is missing");
+    const stale = [];
+    for (const file of files) {
+      const text = lf(await readFile(new URL(file, srcDir), "utf8"));
+      if (!model.includes(text)) stale.push(file);
+    }
+    assert.deepEqual(stale, [], `rebuild the model, these changed: ${stale.join(", ")}`);
+    const modules = (model.match(/<Item class="ModuleScript"/g) ?? []).length;
+    assert.equal(modules, files.length - 1, "one ModuleScript per file besides the entry script");
+    assert.equal((model.match(/<Item class="Script"/g) ?? []).length, 1);
+  });
+
+  test("the model still carries the token placeholder, exactly once", async () => {
+    const model = await readFile(BUNDLED_PLUGIN_PATH, "utf8");
+    assert.equal(model.split(TOKEN_PLACEHOLDER).length - 1, 1);
+  });
+
+  test("the plugin speaks a protocol this server accepts", async () => {
+    const config = await readFile(new URL("Config.luau", srcDir), "utf8");
+    const version = Number(config.match(/Config\.PROTOCOL_VERSION\s*=\s*(\d+)/)?.[1]);
+    assert.ok(version >= MIN_PROTOCOL_VERSION && version <= MAX_PROTOCOL_VERSION, `plugin protocol ${version}`);
   });
 });

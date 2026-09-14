@@ -361,6 +361,33 @@ describe("bridge connection diagnosis", () => {
     }
   });
 
+  test("a server that lost the port takes it over when the holder exits", async () => {
+    const first = new StudioBridge(0, {});
+    await first.start();
+    const port = first.boundPort;
+    const second = new StudioBridge(port, {});
+    try {
+      await assert.rejects(() => second.start());
+      second.retryListen(50);
+      assert.match(second.describeDisconnect(), /takes over/);
+      await first.stop();
+      const deadline = Date.now() + 3000;
+      while (!second.diagnosis.listening && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert.equal(second.diagnosis.listening, true, "the survivor never took the port over");
+      assert.equal(second.diagnosis.listenError, undefined);
+      const res = await fetch(`http://127.0.0.1:${port}/health`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${second.token}` },
+      });
+      assert.equal(res.status, 200);
+    } finally {
+      await first.stop();
+      await second.stop();
+    }
+  });
+
   test("a rejected token is reported as a token problem", async () => {
     const bridge = new StudioBridge(0, {});
     await bridge.start();

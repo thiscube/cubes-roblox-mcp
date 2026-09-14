@@ -1,7 +1,7 @@
 # What the Studio plugin has to implement
 
-The plugin is not in this repository (see `CLAUDE.md`), so this file is the
-contract the server expects. Everything here is what the server sends and what
+The plugin lives in `plugin/src`, but an installed plugin can be older or newer
+than the server it talks to, so this file is the contract the server expects. Everything here is what the server sends and what
 it does with the answer, taken from the code rather than from memory.
 
 Protocol version is a **range**: the server accepts
@@ -86,12 +86,16 @@ global budget of 4 stream clients, also shared with every other plugin.
 | `tune` | 1 | eval, but in the running playtest's server DataModel |
 | playtest lifecycle | 1 | see `src/tools/playtest.ts` |
 | **`capture`** | **3** | **`{ png, width, height }`** |
+| `mesh_bake` | 2 | read-only: `{ positions, normals, colors, indices, center, size, skipped }`, see `plugin/src/MeshTools.luau` |
+| `mesh_build` | 2 | writes: `{ ref, path, vertexCount, triangleCount, size }` |
 
 Protocol 4 adds the WebSocket transport below; it carries the same commands.
 
 Every command sent while an MCP tool call is running also carries `via`, the
 call it serves: `{ "tool": "script_edit", "category": "scripts", "activity": "Scripting" }`.
-`activity` is a one-word label from `src/activity.ts`, ready to display.
+`activity` is a one-word label from `src/activity.ts`, ready to display, and
+`target` (when the call has one subject) is what it acts on: usually a ref or a
+dotted path to resolve to a name, sometimes a plain value like a player name.
 `category` is absent for core tools (`read`, `mutate`, `run_code`, `screenshot`), and
 `via` itself is absent for commands the server sends on its own. It exists so a
 panel can show what the agent is doing rather than guessing from `tool`, which

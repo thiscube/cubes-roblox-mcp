@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { StudioBridge } from "./bridge.js";
+import { StudioBridge, resolveToken } from "./bridge.js";
 import { createMcpServer, readOnlyFromEnv } from "./server.js";
 import { rpcReadOnlyCommands } from "./rpc-policy.js";
 import { lintAvailable } from "./lint.js";
-import { installPlugin, pluginsDir, PLUGIN_FILENAME } from "./install-plugin.js";
+import { installPlugin, installedPluginFiles, pluginsDir, PLUGIN_FILENAME } from "./install-plugin.js";
 import { MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION } from "./protocol.js";
 import { tokenFile } from "./paths.js";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * Entry point. Two faces:
@@ -27,10 +29,12 @@ rather than by hand. stdout is reserved for the protocol; logs go to stderr.
 
   --read-only            Remove every write tool from the process. Stronger than
                          the Studio panel's toggle: there is nothing to flip.
-  --install-plugin       Copy the Studio plugin into Studio's plugins folder and
-                         exit. Restart Studio afterwards; plugins are cached at
-                         launch.
-  --plugin <path>        Install from this .rbxm instead of the bundled one.
+  --install-plugin       Install the Studio plugin (removing any older copy, with
+                         the bridge token baked in), print how to register this
+                         server with an MCP client, and exit. (npm run setup)
+  --doctor               Check the whole chain (plugin installed, server running,
+                         Studio connected, writes) and exit. (npm run doctor)
+  --plugin <path>        Install from this .rbxmx instead of the bundled one.
   --plugins-dir <path>   Install into this directory instead of the default.
   --version              Print the version and exit.
   --help                 This.
@@ -70,20 +74,93 @@ async function runSubcommand(): Promise<boolean> {
     return true;
   }
   if (process.argv.includes("--install-plugin") || process.argv.includes("--auto-install-plugin")) {
+    // The token this server will use from now on. Only a token that will still be
+    // the server's on the next run is baked in; a one-run fallback would not be.
+    const tok = resolveToken();
+    const bakeable = !tok.generated || tok.persisted;
     const result = await installPlugin({
       source: flagValue("--plugin"),
       targetDir: flagValue("--plugins-dir"),
+      token: bakeable ? tok.token : undefined,
     });
-    process.stdout.write(`${result.message}\n`);
     if (!result.ok) {
+      process.stdout.write(`${result.message}\n`);
       const dir = pluginsDir();
       if (dir) process.stdout.write(`Studio reads plugins from: ${dir}\n`);
       process.stdout.write(`Expected file name: ${PLUGIN_FILENAME}\n`);
       process.exitCode = 1;
+      return true;
     }
+    process.stdout.write(setupReport(result, tok.warning));
+    return true;
+  }
+  if (process.argv.includes("--doctor")) {
+    process.exitCode = await doctor();
     return true;
   }
   return false;
+}
+
+/** What `npm run setup` prints after installing: what happened, then exactly what is left. */
+function setupReport(result: Awaited<ReturnType<typeof installPlugin>>, tokenWarning?: string): string {
+  const server = fileURLToPath(new URL("./index.js", import.meta.url)).replace(/\\/g, "/");
+  const lines = [
+    `OK  Studio plugin installed: ${result.installedTo}`,
+    ...(result.removed && result.removed.length > 0 ? [`OK  Removed the old plugin file(s): ${result.removed.join(", ")}`] : []),
+    result.tokenBaked
+      ? `OK  Bridge token baked into the plugin, so there is nothing to paste.`
+      : `!!  Token NOT baked${tokenWarning ? ` (${tokenWarning})` : ""}. Paste it into the Studio panel: Controls > Bridge token.`,
+    ``,
+    `Next steps:`,
+    `  1. Register this server with your MCP client (skip if already registered with this path):`,
+    `       Claude Code:  claude mcp add cubes-roblox -s user -- node "${server}"`,
+    `       JSON config:  "cubes-roblox": { "command": "node", "args": ["${server}"] }`,
+    `  2. Restart Roblox Studio (plugins load at launch), then start a new session in your MCP client.`,
+    `  3. "Allow writes" starts on, so the AI can build right away. Turn it off in the Cubes MCP panel`,
+    `     (Plugins tab > Status) when you want the AI to only look.`,
+    `  4. Check everything: npm run doctor`,
+    ``,
+  ];
+  return lines.join("\n");
+}
+
+/**
+ * `npm run doctor`: walk the chain in order and stop at the first broken link,
+ * naming the fix. Exit code 0 only when Studio is connected.
+ */
+async function doctor(): Promise<number> {
+  const say = (s: string) => process.stdout.write(`${s}\n`);
+  const dir = pluginsDir();
+  if (dir) {
+    const names = await installedPluginFiles(dir);
+    if (names.length === 0) {
+      say(`FAIL  No CubesMCP plugin in ${dir}. Run: npm run setup`);
+      return 1;
+    }
+    say(names.length === 1 ? `OK    Plugin installed: ${join(dir, names[0])}` : `WARN  ${names.length} CubesMCP plugin files in ${dir} (${names.join(", ")}). They fight over the port. Run: npm run setup`);
+  }
+
+  const { token } = resolveToken();
+  let health: any;
+  try {
+    const res = await fetch(`http://127.0.0.1:${PORT}/health`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(3000),
+    });
+    health = await res.json();
+  } catch {
+    say(`FAIL  Nothing is listening on 127.0.0.1:${PORT}. The MCP client starts this server: register it (npm run setup prints the command) and open a new session.`);
+    return 1;
+  }
+  say(`OK    Server running on port ${PORT} (plugin protocol ${health.protocolRange?.join("-") ?? "?"})`);
+  if (!health.connected) {
+    say(`FAIL  Studio is not connected. ${health.problem ?? health.detail ?? "Open a place in Roblox Studio."}`);
+    return 1;
+  }
+  say(`OK    Studio connected`);
+  say(health.writeEnabled ? `OK    Allow writes is ON` : `INFO  Allow writes is OFF: the AI can look but not change anything. Turn it on in the Studio panel when you want it to build.`);
+  return 0;
 }
 
 async function main(): Promise<void> {
@@ -111,10 +188,13 @@ async function main(): Promise<void> {
     await bridge.start();
   } catch (err) {
     bridgeStarted = false;
+    // Usually another Claude session's copy of this server. Keep trying, so this
+    // one takes over when that session closes instead of staying down.
+    bridge.retryListen();
     console.error(
       `[cubes-mcp] the Studio bridge could not start: ${err instanceof Error ? err.message : String(err)}\n` +
         `[cubes-mcp] MCP is still up and every tool is still listed; the ones that need\n` +
-        `[cubes-mcp] Studio will explain this instead of hanging. Fix the port and restart.`,
+        `[cubes-mcp] Studio will explain this instead of hanging. Retrying the port every 3s.`,
     );
   }
 
@@ -125,7 +205,7 @@ async function main(): Promise<void> {
   console.error(
     bridgeStarted
       ? `[cubes-mcp] ready — MCP on stdio, Studio bridge on http://127.0.0.1:${PORT}`
-      : `[cubes-mcp] ready — MCP on stdio, Studio bridge DOWN (port ${PORT} unavailable)`,
+      : `[cubes-mcp] ready — MCP on stdio, Studio bridge waiting for port ${PORT} to free up`,
   );
   if (READ_ONLY) {
     console.error(

@@ -126,16 +126,16 @@ const CANCELLED_MAX = 1000;
  * security property, it is a setup step that fails silently as a 401 the old
  * error message then blamed on a missing plugin.
  *
- * Persisting it makes the pairing a one-time act. It does NOT make the token
- * reachable by the plugin -- that still needs a plugin-side change -- but the
- * value the user types into the Studio panel now stays true across restarts.
+ * Persisting it makes the pairing a one-time act, and it is what lets
+ * `npm run setup` bake the token into the installed plugin: the value it writes
+ * there is the value this server will load on every later run.
  *
  * Resolution order: env, then the file, then a fresh one written to the file.
  * The file is 0600 and never followed through a symlink; if any of that cannot
  * be guaranteed the token stays in memory for this run rather than being
  * written somewhere another user could read or pre-seed.
  */
-function resolveToken(): { token: string; generated: boolean; persisted: boolean; warning?: string } {
+export function resolveToken(): { token: string; generated: boolean; persisted: boolean; warning?: string } {
   const fromEnv = process.env.CUBES_MCP_TOKEN ?? process.env.CUBES_MCP_RPC_TOKEN;
   if (fromEnv && fromEnv.length > 0) return { token: fromEnv, generated: false, persisted: false };
 
@@ -315,6 +315,8 @@ export class StudioBridge implements StudioTransport {
    * listener that did not exist) and it stays set after stop().
    */
   private listening = false;
+  /** Set while a failed start keeps retrying the port (see retryListen). */
+  private retryTimer: ReturnType<typeof setInterval> | null = null;
   readonly token: string;
   readonly tokenGenerated: boolean;
   /** True when the token came from, or was written to, the token file. */
@@ -446,9 +448,12 @@ export class StudioBridge implements StudioTransport {
     const d = this.diagnosis;
     if (d.listenError) {
       return (
-        `The bridge never started: port ${d.port} is in use (${d.listenError}). ` +
-        `Another copy of this server is probably already running. Stop it, or set ` +
-        `CUBES_MCP_PORT on both this server and the Studio panel.`
+        `The bridge is not listening: port ${d.port} is in use (${d.listenError}). ` +
+        `Another copy of this server holds it, usually another Claude session. ` +
+        (this.retryTimer
+          ? `This server keeps retrying and takes over the moment that copy exits, so ` +
+            `Studio is reaching the other copy until then.`
+          : `Stop it, or set CUBES_MCP_PORT on both this server and the Studio panel.`)
       );
     }
     if (!d.everPolled && d.authRejections > 0) {
@@ -565,7 +570,9 @@ export class StudioBridge implements StudioTransport {
         // keeps running. Without a standing listener a later emit is an uncaught
         // exception -- the old code got away with it only because a failed start
         // killed the process.
-        this.httpServer?.on("error", (later) => {
+        this.httpServer?.on("error", (later: NodeJS.ErrnoException) => {
+          // A retry finding the port still taken is the expected case, not news.
+          if (this.retryTimer && later.code === "EADDRINUSE") return;
           process.stderr.write(`[cubes-mcp] bridge server error after failed start: ${String(later)}\n`);
         });
         reject(err);
@@ -581,8 +588,46 @@ export class StudioBridge implements StudioTransport {
     });
   }
 
+  /**
+   * After a failed start, keep trying the port until it frees up.
+   *
+   * Every Claude session starts its own copy of this server and only one can
+   * hold the port. The others used to stay down for the rest of their session,
+   * so closing the session that held the port left Studio with nothing to talk
+   * to while a perfectly good server was still running. Now a survivor takes
+   * the port over within a few seconds. Never retries after a successful start.
+   */
+  retryListen(intervalMs = 3000): void {
+    if (this.listening || !this.httpServer || this.retryTimer) return;
+    const server = this.httpServer;
+    // One handler for the whole retry, not one per attempt: an attempt that
+    // hits EADDRINUSE never emits "listening", so per-attempt handlers pile up.
+    server.once("listening", () => {
+      this.listening = true;
+      this.listenError = null;
+      this.stopRetry();
+      process.stderr.write(`[cubes-mcp] Studio bridge took over http://127.0.0.1:${this.port}\n`);
+    });
+    this.retryTimer = setInterval(() => {
+      if (this.listening || server.listening) return this.stopRetry();
+      try {
+        server.listen(this.port, "127.0.0.1");
+      } catch {
+        // listen() throws synchronously only if a previous attempt is still in
+        // flight; the next tick tries again.
+      }
+    }, intervalMs);
+    this.retryTimer.unref?.();
+  }
+
+  private stopRetry(): void {
+    if (this.retryTimer) clearInterval(this.retryTimer);
+    this.retryTimer = null;
+  }
+
   /** Shut the HTTP listener down. Used by tests and by clean exit paths. */
   stop(): Promise<void> {
+    this.stopRetry();
     this.listening = false;
     return new Promise((resolve) => {
       for (const [, p] of this.pending) {
