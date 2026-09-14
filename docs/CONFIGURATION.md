@@ -17,7 +17,7 @@ second place to look is a second place to be wrong.
 | `CUBES_MCP_SOURCEMAP` | autodetect | Path to a Rojo `sourcemap.json`. |
 | `CUBES_MCP_LINT_CWD` | repo root | Directory holding your `selene.toml`. |
 | `CUBES_MCP_OPEN_CLOUD_KEY` | unset | Open Cloud API key. Only `asset_upload` needs it. |
-| `CUBES_MCP_UPLOAD_ROOT` | working directory | The only directory `asset_upload` may read from. |
+| `CUBES_MCP_UPLOAD_ROOT` | working directory | The only directory `asset_upload` reads from and `mesh_export` / `mesh_import` use. |
 | `CUBES_MCP_ALLOW_UNAUTHENTICATED` | unset | `1` disables the bridge token. Unsafe. |
 
 Plus `--read-only` on the command line, equivalent to `CUBES_MCP_READ_ONLY=1`.
@@ -142,7 +142,8 @@ that cannot prompt at all, because `confirm` is a field the model itself writes.
 
 ## `CUBES_MCP_UPLOAD_ROOT`
 
-The only directory `asset_upload` may read from. Defaults to the working
+The only directory `asset_upload` may read from, and where `mesh_export` writes
+and `mesh_import` reads `.obj` / `.glb` files. Defaults to the working
 directory, which is chosen by whoever launched the server rather than by this
 code — so set it explicitly if you care.
 

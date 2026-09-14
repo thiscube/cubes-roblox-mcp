@@ -150,7 +150,7 @@ return { bounded = boxed, count = #boxed }
       subcategories: ["visualize", "text"],
       keywords: ["label", "text", "name", "tag", "annotate", "billboard", "debug"],
       description:
-        "Floating billboard text labels above instances or at world positions. Always faces the camera. Use to annotate parts during a screenshot review ('this is the head', 'pivot here').",
+        "Camera-facing text labels above instances or at world positions, to annotate parts for a screenshot review.",
       inputSchema: {
         type: "object",
         properties: {

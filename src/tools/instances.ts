@@ -288,7 +288,7 @@ return { painted = touched }
       subcategories: ["effects", "particles", "vfx"],
       keywords: ["particle", "particles", "emitter", "vfx", "effect", "sparkle", "smoke", "fire", "magic"],
       description:
-        "Add a ParticleEmitter to a BasePart or Attachment. Tune rate/lifetime/speed/size/color/texture; for most effects a couple of params are enough. Returns the emitter ref so you can later set Enabled=false or destroy.",
+        "Add a ParticleEmitter to a BasePart or Attachment; a couple of params are usually enough. Returns the emitter ref.",
       inputSchema: {
         type: "object",
         properties: {
@@ -300,7 +300,7 @@ return { painted = touched }
           speedMax: { type: "number", description: "Max speed (default 5)." },
           size: { type: "number", description: "Particle size (default 1)." },
           color: { type: "string", description: "Color 'r,g,b' (0-255)." },
-          texture: { type: "string", description: "Texture asset ID (optional — default white sparkle)." },
+          texture: { type: "string", description: "Texture id (default sparkle)." },
           rotationSpeedMin: { type: "number", description: "Rotation speed min (default 0)." },
           rotationSpeedMax: { type: "number", description: "Rotation speed max (default 0)." },
           enabled: { type: "boolean", description: "Initially enabled (default true)." },
@@ -343,7 +343,7 @@ return { ref = __MCP.refFor(e), parent = inst:GetFullName(), enabled = e.Enabled
       subcategories: ["effects", "beam", "vfx"],
       keywords: ["beam", "laser", "ray", "line", "connection", "magic", "lightning"],
       description:
-        "Connect two BaseParts with a Beam. Creates Attachments on each part (with optional local offsets) and a Beam between them. Set width, color, transparency, segments, and an optional scrolling texture.",
+        "Connect two BaseParts with a Beam, creating the Attachments (optional offsets). Width, color, transparency, segments, scrolling texture.",
       inputSchema: {
         type: "object",
         properties: {
@@ -405,7 +405,7 @@ return { ref = __MCP.refFor(beam), attachments = { __MCP.refFor(at0), __MCP.refF
       subcategories: ["world", "game", "settings"],
       keywords: ["workspace", "gravity", "fall", "settings", "walkspeed", "jumppower", "zoom", "streaming"],
       description:
-        "Configure world-level game settings: Workspace.Gravity, FallenPartsDestroyHeight, StreamingEnabled, plus StarterPlayer defaults (WalkSpeed, JumpPower, JumpHeight, MaxZoomDistance). Set only the fields you want to change.",
+        "Set world settings: Gravity, FallenPartsDestroyHeight, StreamingEnabled, and StarterPlayer WalkSpeed/JumpPower/JumpHeight/MaxZoomDistance. Only what you pass changes.",
       inputSchema: {
         type: "object",
         properties: {

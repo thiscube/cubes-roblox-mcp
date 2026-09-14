@@ -111,6 +111,8 @@ export const TOOL_ACTIVITY: Record<string, string> = {
   asset_details: "Browsing",
   asset_insert: "Inserting",
   asset_upload: "Uploading",
+  mesh_export: "Exporting",
+  mesh_import: "Importing",
 
   // perf
   perf_stats: "Profiling",
@@ -171,6 +173,37 @@ export function runCodeActivity(luau: unknown): string {
     return "Editing";
   }
   return "Reading";
+}
+
+const TARGET_KEYS = ["target", "path", "ref", "parent", "part0", "player", "class", "query", "name"] as const;
+const TARGET_MAX = 120;
+
+/**
+ * What a call acts on, for the line next to the activity word: a ref or dotted
+ * path the plugin can resolve to a name, or a short plain value (a player, a
+ * class, a search). Undefined when the call has no single subject.
+ */
+export function targetFor(tool: string, args: unknown): string | undefined {
+  if (!args || typeof args !== "object") return undefined;
+  const a = args as Record<string, unknown>;
+  if (tool === "mutate" && Array.isArray(a.ops) && a.ops.length > 0) {
+    const first = (a.ops[0] ?? {}) as Record<string, unknown>;
+    const subject = first.target ?? first.parent;
+    if (typeof subject !== "string" || subject === "") return undefined;
+    return clip(a.ops.length > 1 ? `${subject} +${a.ops.length - 1}` : subject);
+  }
+  if (Array.isArray(a.targets) && typeof a.targets[0] === "string") {
+    return clip(a.targets.length > 1 ? `${a.targets[0]} +${a.targets.length - 1}` : a.targets[0]);
+  }
+  for (const key of TARGET_KEYS) {
+    const value = a[key];
+    if (typeof value === "string" && value.trim() !== "") return clip(value.trim());
+  }
+  return undefined;
+}
+
+function clip(s: string): string {
+  return s.length > TARGET_MAX ? s.slice(0, TARGET_MAX) : s;
 }
 
 /** The label for one MCP tool call. */

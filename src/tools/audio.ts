@@ -16,7 +16,7 @@ export const AUDIO_TOOLS: ToolEntry[] = [
       subcategories: ["sound", "music", "sfx"],
       keywords: ["sound", "audio", "play", "music", "sfx", "noise", "song"],
       description:
-        "Create and play a Sound. Parent to a BasePart for 3D positional audio (auto rolloff), or omit target for ambient (parented to SoundService). One-shot sounds auto-destroy on Ended; set looped=true to keep them around.",
+        "Create and play a Sound: on a BasePart for 3D audio, or without target for ambient. One-shots destroy themselves when done; looped=true keeps them.",
       inputSchema: {
         type: "object",
         properties: {

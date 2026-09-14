@@ -16,7 +16,7 @@ export const LIGHTING_TOOLS: ToolEntry[] = [
       subcategories: ["sky", "atmosphere", "environment"],
       keywords: ["sky", "skybox", "clouds", "atmosphere", "sun", "moon", "stars", "weather"],
       description:
-        "Configure the sky and clouds: skybox face textures, sun/moon size, star count, cloud cover + density + color. Creates Lighting.Sky and workspace.Terrain.Clouds if missing. Pass only the fields you want to change.",
+        "Configure sky and clouds: skybox faces, sun/moon size, stars, cloud cover/density/color. Creates Sky and Clouds if missing; pass only what changes.",
       inputSchema: {
         type: "object",
         properties: {

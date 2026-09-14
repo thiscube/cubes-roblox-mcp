@@ -16,7 +16,7 @@ export const ANIMATION_TOOLS: ToolEntry[] = [
       subcategories: ["humanoid", "playback"],
       keywords: ["animate", "animation", "play", "humanoid", "track", "walk", "run", "idle", "dance"],
       description:
-        "Load an Animation asset onto a Humanoid's Animator and play it. Returns the AnimationTrack-equivalent ref so the caller can stop/adjust it. Target can be a Humanoid, a character Model containing one, or a player ref.",
+        "Play an Animation asset on a Humanoid, character Model or player. Returns a track ref to stop or adjust it.",
       inputSchema: {
         type: "object",
         properties: {
@@ -116,7 +116,7 @@ return { stopped = count }
       subcategories: ["tween", "interpolate", "animate"],
       keywords: ["tween", "interpolate", "lerp", "animate", "ease", "transition", "smooth"],
       description:
-        "TweenService:Create + :Play. Fire-and-forget — tween runs to completion in-engine. Number-array values get coerced to Vector3/Color3/UDim2 by the target prop's existing type.",
+        "TweenService:Create + :Play, fire-and-forget. Number arrays become Vector3/Color3/UDim2 to match the property.",
       inputSchema: {
         type: "object",
         properties: {

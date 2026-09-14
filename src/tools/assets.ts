@@ -1,4 +1,4 @@
-import { type ToolEntry, evalTool, localTool, luaJson } from "../registry.js";
+import { type ToolEntry, commandTool, evalTool, localTool, luaJson, readTool } from "../registry.js";
 import { objectResult } from "../output-schema.js";
 import {
   ASSET_TYPES,
@@ -12,6 +12,22 @@ import {
   uploadAsset,
 } from "../assets.js";
 import { beginUndo, cancelUndo, endUndo } from "./_luau-helpers.js";
+import {
+  type MeshData,
+  meshBounds,
+  meshFormatOf,
+  readMeshFile,
+  resolveMeshReadPath,
+  resolveMeshWritePath,
+  writeMeshFile,
+} from "../mesh.js";
+
+/** EditableMesh refuses meshes much past this; say so before sending megabytes. */
+const MAX_IMPORT_VERTICES = 60000;
+
+function pathError(err: unknown, hint: string): Record<string, unknown> {
+  return { error: "path_not_allowed", message: err instanceof Error ? err.message : String(err), hint };
+}
 
 /**
  * Creator Store assets (PLAN.md #7).
@@ -343,6 +359,135 @@ return {
       } catch (err) {
         return { error: "upload_failed", message: err instanceof Error ? err.message : String(err) };
       }
+    },
+  ),
+
+  readTool(
+    {
+      name: "mesh_export",
+      // Reads Studio only, but writes a file: a disk write keeps it out of the
+      // read-only build even though the place is never touched.
+      effects: { state: true },
+      category: "assets",
+      subcategories: ["mesh", "export", "file"],
+      keywords: ["mesh", "export", "obj", "glb", "gltf", "blender", "bake", "model", "file", "save"],
+      description:
+        "Bake a Model or parts into one .obj or .glb in the project, colours kept. Unions and unreadable meshes are skipped and listed.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          target: { type: "string", description: "Ref/path of a Model, Folder or part." },
+          path: { type: "string", description: "Project-relative .obj or .glb." },
+          overwrite: { type: "boolean" },
+        },
+        required: ["target", "path"],
+      },
+      outputSchema: objectResult(),
+    },
+    "mesh_bake",
+    async (args, ctx) => {
+      let out: string;
+      try {
+        out = await resolveMeshWritePath(String(args.path ?? ""), { overwrite: args.overwrite === true });
+      } catch (err) {
+        return pathError(err, "Write to a .obj or .glb under the project directory; pass overwrite: true to replace.");
+      }
+      const baked = (await ctx.bridge.send("mesh_bake", { target: args.target }, 90_000)) as MeshData & {
+        name?: string;
+        vertexCount?: number;
+        triangleCount?: number;
+        partsConverted?: number;
+        skipped?: unknown[];
+        center?: number[];
+        size?: number[];
+      };
+      if (!baked?.positions?.length || !baked?.indices?.length) {
+        return { error: "nothing_to_export", message: "Nothing in the target could be turned into triangles.", skipped: baked?.skipped ?? [] };
+      }
+      const bytes = await writeMeshFile(out, baked, String(baked.name ?? "mesh"));
+      return {
+        path: out,
+        format: meshFormatOf(out),
+        vertices: baked.positions.length / 3,
+        triangles: baked.indices.length / 3,
+        bytes,
+        partsConverted: baked.partsConverted,
+        skipped: baked.skipped ?? [],
+        // Where the mesh's centre was, so mesh_import can put it back exactly there.
+        center: baked.center,
+        size: baked.size,
+      };
+    },
+  ),
+
+  commandTool(
+    {
+      name: "mesh_import",
+      category: "assets",
+      subcategories: ["mesh", "import", "file"],
+      keywords: ["mesh", "import", "obj", "glb", "gltf", "blender", "load", "meshpart", "file"],
+      description:
+        "Load a project .obj or .glb into Studio as one MeshPart, colours kept. Session-only: to keep it, asset_upload the .glb.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Project-relative .obj or .glb." },
+          name: { type: "string" },
+          parent: { type: "string", description: "Ref/path (default Workspace)." },
+          position: { type: "array", items: { type: "number" }, description: "World [x,y,z] (default: ahead of camera)." },
+          scale: { type: "number", description: "Vertex multiplier (default 1)." },
+        },
+        required: ["path"],
+      },
+      outputSchema: objectResult(),
+    },
+    "mesh_build",
+    async (args, ctx) => {
+      let file: string;
+      try {
+        file = await resolveMeshReadPath(String(args.path ?? ""));
+      } catch (err) {
+        return pathError(err, "Import a .obj or .glb that is inside the project directory.");
+      }
+      let mesh: MeshData;
+      try {
+        mesh = await readMeshFile(file);
+      } catch (err) {
+        return { error: "mesh_unreadable", message: err instanceof Error ? err.message : String(err), file };
+      }
+      const vertices = mesh.positions.length / 3;
+      if (vertices > MAX_IMPORT_VERTICES) {
+        return {
+          error: "mesh_too_large",
+          vertices,
+          limit: MAX_IMPORT_VERTICES,
+          hint: "Decimate it first (Blender: Decimate modifier), or upload the .glb with asset_upload and insert the asset.",
+        };
+      }
+      const scale = typeof args.scale === "number" && Number.isFinite(args.scale) && args.scale > 0 ? args.scale : 1;
+      // Centre the geometry: a MeshPart's origin is its bounding-box centre.
+      const { min, max } = meshBounds(mesh);
+      const mid = [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];
+      const positions = mesh.positions.map((x, i) => Math.round((x - mid[i % 3]) * scale * 10000) / 10000);
+      const name = typeof args.name === "string" && args.name ? args.name : (file.split(/[\\/]/).pop() ?? "mesh").replace(/\.[^.]+$/, "");
+      const built = (await ctx.bridge.send(
+        "mesh_build",
+        {
+          positions,
+          normals: mesh.normals,
+          colors: mesh.colors,
+          indices: mesh.indices,
+          name,
+          parent: args.parent,
+          position: args.position,
+        },
+        90_000,
+      )) as Record<string, unknown>;
+      return {
+        ...built,
+        file,
+        note: "This MeshPart is not saved with the place. To keep it, export or reuse a .glb, upload it with asset_upload, then insert the asset.",
+      };
     },
   ),
 ];

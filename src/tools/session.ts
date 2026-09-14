@@ -74,7 +74,7 @@ export const SESSION_TOOLS: ToolEntry[] = [
         "learn",
       ],
       description:
-        "Upsert the per-place profile (~/.cubesmcp/profiles/{placeId}.json). genre/placeName/style/structure shallow-merge; decision/knownIssue/sessionSummary append. Record conventions and style calls here so the next session starts with them.",
+        "Upsert the per-place profile: genre/placeName/style/structure merge, decision/knownIssue/sessionSummary append. Record conventions so the next session starts with them.",
       inputSchema: {
         type: "object",
         properties: {

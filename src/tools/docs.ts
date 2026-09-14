@@ -232,7 +232,7 @@ export const DOCS_TOOLS: ToolEntry[] = [
       subcategories: ["reference", "api", "lookup"],
       keywords: ["docs", "api", "class", "property", "properties", "method", "event", "reference", "schema", "what"],
       description:
-        "List a class's real properties, methods and events from the Roblox API dump, with value types and whether each property is writable. Use before a mutate that sets an unfamiliar property, instead of guessing the name.",
+        "List a class's real properties, methods and events from the API dump, with types and writability. Check before setting an unfamiliar property.",
       inputSchema: {
         type: "object",
         properties: {

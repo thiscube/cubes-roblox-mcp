@@ -16,7 +16,7 @@ export const PHYSICS_TOOLS: ToolEntry[] = [
       subcategories: ["collision", "groups", "rules"],
       keywords: ["collision", "collide", "group", "physicsservice", "pet", "projectile", "ignore"],
       description:
-        "Define collision groups and assign parts to them. Use to make pets not push the player, projectiles not collide with the shooter, etc. `groups` registers new groups + their collide-with rules; `assignments` puts parts/models into a group.",
+        "Define collision groups and assign parts (pets that don't push players, projectiles that skip the shooter). `groups` sets collide rules; `assignments` fills them.",
       inputSchema: {
         type: "object",
         properties: {
@@ -91,7 +91,7 @@ return { registered = registered, rules = ruleCount, partsAssigned = assigned }
       subcategories: ["constraint", "joints", "rigging"],
       keywords: ["constraint", "hinge", "spring", "rope", "align", "weld", "joint", "physics"],
       description:
-        "Add a Constraint between two BaseParts. Type is any constraint class (HingeConstraint, SpringConstraint, AlignPosition, RodConstraint...). Creates the Attachments and wires Attachment0/1. Extra props pass through.",
+        "Add any Constraint class (Hinge, Spring, AlignPosition, Rod...) between two BaseParts, creating and wiring the Attachments. Extra props pass through.",
       inputSchema: {
         type: "object",
         properties: {

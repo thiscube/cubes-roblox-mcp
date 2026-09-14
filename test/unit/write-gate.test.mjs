@@ -234,6 +234,7 @@ describe("write gate: behaviour, not labels", () => {
       "docs.ts", // the API dump fetch + cache
       "install-plugin.ts", // copies the plugin into Studio's folder
       "lint.ts", // spawns selene
+      "mesh.ts", // reads and writes .obj / .glb files under the project root
       "profile.ts", // per-place profiles
       "sourcemap.ts", // reads sourcemap.json
       "vision.ts", // spawns the capture tool, writes a temp PNG

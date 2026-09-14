@@ -5,7 +5,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 
-import { TOOL_ACTIVITY, activityFor, mutateActivity, runCodeActivity } from "../../dist/activity.js";
+import { TOOL_ACTIVITY, activityFor, mutateActivity, runCodeActivity, targetFor } from "../../dist/activity.js";
 import { ALL_TOOLS } from "../../dist/tools/index.js";
 import { CORE_TOOLS } from "../../dist/session.js";
 import "./_fixtures.mjs";
@@ -86,5 +86,25 @@ describe("run_code is labelled by its Luau", () => {
   }
   test("activityFor routes run_code through its Luau", () => {
     assert.equal(activityFor("run_code", { luau: `workspace.X:Destroy()` }), "Deleting");
+  });
+});
+
+describe("target is what the call acts on", () => {
+  const cases = [
+    ["a specialist's target", "script_edit", { target: "ServerScriptService.Main", edits: [] }, "ServerScriptService.Main"],
+    ["a path", "read", { path: "Workspace.Lobby" }, "Workspace.Lobby"],
+    ["a mutate's first op", "mutate", { ops: [{ op: "set", target: "p3", props: {} }] }, "p3"],
+    ["a mutate batch counts the rest", "mutate", { ops: [{ op: "create", class: "Part", parent: "Workspace" }, { op: "delete", target: "x" }] }, "Workspace +1"],
+    ["several targets", "selection_set", { targets: ["a", "b", "c"] }, "a +2"],
+    ["a player", "character_walk", { player: "cube", direction: [1, 0, 0] }, "cube"],
+    ["a docs class", "docs_class", { class: "Part" }, "Part"],
+    ["run_code has no subject", "run_code", { luau: "return 1" }, undefined],
+    ["no args", "playtest_stop", undefined, undefined],
+  ];
+  for (const [what, tool, args, want] of cases) {
+    test(what, () => assert.equal(targetFor(tool, args), want));
+  }
+  test("a long target is clipped", () => {
+    assert.equal(targetFor("read", { path: "x".repeat(500) }).length, 120);
   });
 });

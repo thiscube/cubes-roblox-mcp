@@ -21,6 +21,8 @@ export interface CallInfo {
   category?: string;
   /** One-word label for the Studio panel, from activity.ts. */
   activity?: string;
+  /** What the call acts on, when it has one subject (activity.ts targetFor). */
+  target?: string;
 }
 
 const storage = new AsyncLocalStorage<CallInfo>();

@@ -15,7 +15,7 @@ export const CAMERA_TOOLS: ToolEntry[] = [
       subcategories: ["vision", "orient", "control"],
       keywords: ["camera", "orient", "look", "fov", "focus", "view", "perspective"],
       description:
-        "Orient the workspace camera: set CFrame (12-number array), or position + lookAt, or just one. Optional fov and focus (position array or ref).",
+        "Orient the workspace camera: set CFrame (12-number array), or position + lookAt, or just one. Optional fov and focus (position array or ref). The user's view returns to how it was once you stop sending commands.",
       inputSchema: {
         type: "object",
         properties: {

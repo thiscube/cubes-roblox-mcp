@@ -10,7 +10,7 @@ import { randomUUID } from "node:crypto";
 
 import { BridgeError, type StudioTransport } from "./transport.js";
 import { withCall } from "./call-context.js";
-import { activityFor } from "./activity.js";
+import { activityFor, targetFor } from "./activity.js";
 import { Session, CORE_TOOLS, READ_ONLY_CORE_TOOLS } from "./session.js";
 import { ToolRegistry, capabilities, outputSchemaFor, type ToolEntry } from "./registry.js";
 import { CORE_OUTPUT_SCHEMAS, RESULT_ENVELOPE } from "./core-output.js";
@@ -535,6 +535,7 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
     tool,
     category: registry.get(tool)?.category,
     activity: activityFor(tool, args),
+    target: targetFor(tool, args),
   });
   server.setRequestHandler(CallToolRequestSchema, (req) => withCall(callOf(req.params.name, req.params.arguments), async () => {
     const name = req.params.name;
