@@ -1,10 +1,11 @@
 import { spawn } from "node:child_process";
-import { readFile, unlink, stat } from "node:fs/promises";
+import { mkdir, readFile, unlink, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 
 import type { ToolEntry, ToolContext } from "./registry.js";
+import { stateDir } from "./paths.js";
 
 /**
  * Vision / observation tools.
@@ -165,9 +166,9 @@ export function resolveInsets(region: Region, raw: unknown): Insets {
 // Platform capture backends
 // --------------------------------------------------------------------------
 
-function run(cmd: string, args: string[], timeoutMs = CAPTURE_TIMEOUT_MS): Promise<void> {
+function run(cmd: string, args: string[], timeoutMs = CAPTURE_TIMEOUT_MS, env?: Record<string, string>): Promise<void> {
   return new Promise((resolve, reject) => {
-    const proc = spawn(cmd, args, { windowsHide: true });
+    const proc = spawn(cmd, args, { windowsHide: true, ...(env ? { env: { ...process.env, ...env } } : {}) });
     let stderr = "";
     proc.stderr?.on("data", (d) => (stderr += d.toString()));
     const timer = setTimeout(() => {
@@ -186,8 +187,22 @@ function run(cmd: string, args: string[], timeoutMs = CAPTURE_TIMEOUT_MS): Promi
   });
 }
 
-/** PowerShell capture. All numeric values are pre-validated integers from `px`. */
-function windowsScript(outPath: string, region: Region, insets: Insets): string {
+/**
+ * PowerShell capture. All numeric values are pre-validated integers from `px`.
+ *
+ * Studio regions are captured with PrintWindow, not by copying the screen: the
+ * window renders itself into our bitmap, so a window sitting on top of Studio is
+ * not in the shot. Copying the screen is what made every capture taken from an
+ * MCP client's own window a picture of that client. PrintWindow with
+ * PW_RENDERFULLCONTENT (2) includes Studio's DirectX viewport; if it fails, the
+ * old screen copy is the fallback.
+ *
+ * `viewport`, when known, is the 3D view's size in pixels as the plugin reports
+ * it. Studio's viewport is its own child window of exactly that size, so the
+ * crop is found rather than guessed from insets, whatever the panel layout.
+ * Without it the insets apply, as before.
+ */
+function windowsScript(outPath: string, region: Region, insets: Insets, viewport?: { w: number; h: number }): string {
   const escaped = outPath.replace(/'/g, "''");
   if (region === "full") {
     return `Add-Type -AssemblyName System.Windows.Forms,System.Drawing
@@ -199,42 +214,117 @@ $bmp.Save('${escaped}')
 $g.Dispose(); $bmp.Dispose()`;
   }
   const { top, right, bottom, left } = insets;
+  const vw = viewport ? px(viewport.w, 0) : 0;
+  const vh = viewport ? px(viewport.h, 0) : 0;
+  const wholeWindow = region === "studio" ? "$true" : "$false";
   return `$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms,System.Drawing
 try { Add-Type @'
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
-public class _RW {
-  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out _R r);
-  public struct _R { public int L, T, Rt, B; }
+public static class CubesCap {
+  [StructLayout(LayoutKind.Sequential)] public struct R { public int L, T, Rt, B; }
+  public delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out R r);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
+  [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p, EnumProc cb, IntPtr l);
+  public static R[] Children(IntPtr p) {
+    var list = new List<R>();
+    EnumChildWindows(p, (h, l) => { R r; if (IsWindowVisible(h) && GetWindowRect(h, out r)) list.Add(r); return true; }, IntPtr.Zero);
+    return list.ToArray();
+  }
 }
 '@ } catch {}
-Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+[void][CubesCap]::SetProcessDPIAware()
 $proc = Get-Process | Where-Object { $_.ProcessName -like 'RobloxStudio*' -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-if (-not $proc) { Write-Error 'studio_window_not_found'; exit 2 }
-$rect = New-Object _RW+_R
-[void][_RW]::GetWindowRect($proc.MainWindowHandle, [ref]$rect)
-$x = $rect.L + ${left}
-$y = $rect.T + ${top}
-$w = ($rect.Rt - $rect.L) - ${left} - ${right}
-$h = ($rect.B - $rect.T) - ${top} - ${bottom}
-if ($w -lt 50 -or $h -lt 50) { Write-Error 'studio_window_too_small'; exit 3 }
-$bmp = New-Object System.Drawing.Bitmap $w, $h
-$g = [System.Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($x, $y, 0, 0, (New-Object System.Drawing.Size($w, $h)))
-$bmp.Save('${escaped}')
-$g.Dispose(); $bmp.Dispose()`;
+if (-not $proc) { [Console]::Error.WriteLine('studio_window_not_found'); exit 2 }
+$hwnd = $proc.MainWindowHandle
+if ([CubesCap]::IsIconic($hwnd)) { [Console]::Error.WriteLine('studio_minimized'); exit 4 }
+$rect = New-Object CubesCap+R
+[void][CubesCap]::GetWindowRect($hwnd, [ref]$rect)
+$W = $rect.Rt - $rect.L; $H = $rect.B - $rect.T
+if ($W -lt 50 -or $H -lt 50) { [Console]::Error.WriteLine('studio_window_too_small'); exit 3 }
+$full = New-Object System.Drawing.Bitmap $W, $H
+$g = [System.Drawing.Graphics]::FromImage($full)
+$hdc = $g.GetHdc()
+$printed = [CubesCap]::PrintWindow($hwnd, $hdc, 2)
+$g.ReleaseHdc($hdc)
+if (-not $printed) { $g.CopyFromScreen($rect.L, $rect.T, 0, 0, $full.Size) }
+$g.Dispose()
+$x = ${left}; $y = ${top}; $w = $W - ${left} - ${right}; $h = $H - ${top} - ${bottom}
+if (${wholeWindow}) { $x = 0; $y = 0; $w = $W; $h = $H }
+elseif (${vw} -gt 0 -and ${vh} -gt 0) {
+  # The viewport child window: exact size first, then the same size under display scaling.
+  $best = $null
+  foreach ($s in @(1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 3.0, 0.8, 0.6667, 0.5714, 0.5)) {
+    foreach ($c in [CubesCap]::Children($hwnd)) {
+      $cw = $c.Rt - $c.L; $ch = $c.B - $c.T
+      if ([Math]::Abs($cw - ${vw} * $s) -le 2 -and [Math]::Abs($ch - ${vh} * $s) -le 2) { $best = $c; break }
+    }
+    if ($best) { break }
+  }
+  if ($best) { $x = $best.L - $rect.L; $y = $best.T - $rect.T; $w = $best.Rt - $best.L; $h = $best.B - $best.T }
+}
+$x = [Math]::Max(0, $x); $y = [Math]::Max(0, $y)
+$w = [Math]::Min($w, $W - $x); $h = [Math]::Min($h, $H - $y)
+if ($w -lt 50 -or $h -lt 50) { [Console]::Error.WriteLine('studio_window_too_small'); exit 3 }
+$crop = $full.Clone((New-Object System.Drawing.Rectangle $x, $y, $w, $h), $full.PixelFormat)
+$crop.Save('${escaped}', [System.Drawing.Imaging.ImageFormat]::Png)
+$crop.Dispose(); $full.Dispose()`;
 }
 
-async function capture(outPath: string, region: Region, insets: Insets): Promise<void> {
+/**
+ * Where PowerShell compiles the capture helper. Add-Type writes a .cs file to
+ * TEMP, and a TEMP the process cannot write to made every Studio capture fall
+ * back to a full-screen shot of whatever was in front. The server's own state
+ * directory is always writable by the user it runs as.
+ */
+async function captureTempDir(): Promise<string | undefined> {
+  const dir = join(stateDir(), "tmp");
+  try {
+    await mkdir(dir, { recursive: true });
+    return dir;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The 3D viewport's size in pixels, read from the plugin's camera, for an exact
+ * crop. Null when there is no plugin or no answer; the insets apply then.
+ */
+async function viewportPixels(bridge: ToolContext["bridge"] | undefined): Promise<{ w: number; h: number } | null> {
+  if (!bridge?.connected) return null;
+  try {
+    const reply = (await bridge.send(
+      "read",
+      { query: "Workspace/*[ClassName=Camera]", select: ["ViewportSize"], limit: 5, prefetch: false },
+      5_000,
+    )) as { items?: Array<{ props?: { ViewportSize?: { value?: unknown } } }> };
+    for (const item of reply?.items ?? []) {
+      const raw = item?.props?.ViewportSize?.value;
+      const m = typeof raw === "string" ? /^\s*([\d.]+)\s*,\s*([\d.]+)/.exec(raw) : null;
+      if (m && Number(m[1]) >= 50 && Number(m[2]) >= 50) return { w: Math.round(Number(m[1])), h: Math.round(Number(m[2])) };
+    }
+  } catch {
+    // An older plugin or a busy bridge: the insets still work.
+  }
+  return null;
+}
+
+async function capture(outPath: string, region: Region, insets: Insets, viewport?: { w: number; h: number }): Promise<void> {
   if (process.platform === "win32") {
-    await run("powershell.exe", [
-      "-NoProfile",
-      "-NonInteractive",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-Command",
-      windowsScript(outPath, region, insets),
-    ]);
+    const tmp = await captureTempDir();
+    await run(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", windowsScript(outPath, region, insets, viewport)],
+      CAPTURE_TIMEOUT_MS,
+      tmp ? { TMP: tmp, TEMP: tmp } : undefined,
+    );
     return;
   }
   if (process.platform === "darwin") {
@@ -323,7 +413,7 @@ export const screenshotTool: ToolEntry = {
   // omission nobody noticed.
   effects: { process: true },
   description:
-    "Capture a PNG inline so the agent can see the screen. Asks Studio for the framebuffer first (immune to windows covering Studio), falls back to an OS capture. Regions: 'viewport' (default, the 3D area), 'studio', 'full' (your whole monitor).",
+    "Capture a PNG inline so the agent can see the screen. Captures the Studio window itself, so windows covering it are not in the shot. Regions: 'viewport' (default, the 3D area), 'studio', 'full' (your whole monitor).",
   inputSchema: {
     type: "object",
     properties: {
@@ -437,9 +527,23 @@ export const screenshotTool: ToolEntry = {
 
     let actualRegion: Region = requested;
     let warning: string | undefined;
+    // An exact viewport crop needs the camera's pixel size; only Windows can use it.
+    const viewport =
+      requested === "viewport" && source !== "os" && process.platform === "win32"
+        ? ((await viewportPixels(ctx?.bridge)) ?? undefined)
+        : undefined;
     try {
-      await capture(path, requested, insets);
+      await capture(path, requested, insets, viewport);
     } catch (err) {
+      // Minimized, Studio has no pixels to give, and a full-screen shot of the
+      // desktop is not what was asked for. Say so instead.
+      if (err instanceof Error && err.message.includes("studio_minimized")) {
+        await cleanup();
+        return {
+          error: "studio_minimized",
+          hint: "Roblox Studio is minimized, so there is nothing to capture. Ask the user to restore the Studio window.",
+        };
+      }
       if (requested === "full") {
         await cleanup();
         return {

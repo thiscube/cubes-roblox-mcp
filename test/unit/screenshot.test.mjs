@@ -36,6 +36,12 @@ function bridge({ connected = true, reply } = {}) {
 }
 
 const shoot = (args, b) => screenshotTool.handler(args, { bridge: b });
+// On Windows the OS path also asks the plugin for the viewport's pixel size, to
+// crop exactly. These tests are about the `capture` command, so count that.
+const captures = (b) => b.sent.filter((s) => s.tool === "capture");
+/** Any answer that can only come from the OS capture path having been tried. */
+const OS_OUTCOME = (res) =>
+  res.error === "screenshot_failed" || res.error === "studio_minimized" || res.__structured?.source === "os";
 const metaOf = (res) => res.__structured;
 
 describe("screenshot routing", () => {
@@ -69,11 +75,12 @@ describe("screenshot routing", () => {
   test("a plugin with no capture handler falls back to the OS rather than failing", async () => {
     const b = bridge(); // send() throws, like an unknown_tool reply
     const res = await shoot({ region: "viewport" }, b);
-    assert.deepEqual(b.sent.map((s) => s.tool), ["capture"], "it should have asked once");
+    assert.deepEqual(captures(b).map((s) => s.tool), ["capture"], "it should have asked once");
     // No display in CI, so the OS path fails — the point is that it was reached
-    // and that the failure is the OS's, not a refusal to try.
+    // and that the failure is the OS's, not a refusal to try. On a desktop with
+    // Studio minimized the OS path answers studio_minimized, which is also reached.
     assert.notEqual(metaOf(res)?.source, "studio");
-    assert.ok(res.error === "screenshot_failed" || metaOf(res)?.source === "os");
+    assert.ok(OS_OUTCOME(res), JSON.stringify(res).slice(0, 200));
   });
 
   test("a structured error from the plugin also falls back", async () => {
@@ -86,7 +93,7 @@ describe("screenshot routing", () => {
     const b = bridge();
     await shoot({}, b);
     await shoot({}, b);
-    assert.equal(b.sent.length, 1, "a failed capture must be remembered for a while");
+    assert.equal(captures(b).length, 1, "a failed capture must be remembered for a while");
   });
 
   test("source 'studio' never touches the OS, and says why it could not", async () => {
@@ -120,7 +127,7 @@ describe("screenshot routing", () => {
     const old = bridge();
     await shoot({}, old);
     await shoot({}, old);
-    assert.equal(old.sent.length, 1, "the same plugin is not asked twice");
+    assert.equal(captures(old).length, 1, "the same plugin is not asked twice");
 
     const fresh = bridge({ reply: () => ({ png: TINY_PNG }) });
     const res = await shoot({}, fresh);
@@ -147,7 +154,7 @@ describe("screenshot routing", () => {
 
   test("no bridge at all still works, which is how the tool used to behave", async () => {
     const res = await screenshotTool.handler({}, {});
-    assert.ok(res.error === "screenshot_failed" || res.__structured?.source === "os");
+    assert.ok(OS_OUTCOME(res), JSON.stringify(res).slice(0, 200));
   });
 
   test("an oversize Studio capture falls back rather than blowing the budget", async () => {
