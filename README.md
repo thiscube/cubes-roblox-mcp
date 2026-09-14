@@ -64,23 +64,34 @@ npm install
 npm run setup
 ```
 
-`npm run setup` builds the server, **deletes any older CubesMCP plugin file**, copies
+`npm run setup` builds the server, **deletes any older copy of the plugin** (even one
+saved under another name), copies
 the new plugin into Studio's plugins folder, and **bakes the bridge token into it**, so
 nothing has to be pasted anywhere. It ends by printing the exact command for step 2,
 with the real path filled in.
 
 ### 2. Register the server with the MCP client
 
-Use the absolute path to `dist/index.js` that `npm run setup` printed. Skip this step
-if the server is already registered with that same path.
+Use the absolute path to `dist/index.js` that `npm run setup` printed.
 
-**Claude Code:**
+**Claude Code:** check for an existing registration first.
+
+```bash
+claude mcp get cubes-roblox
+```
+
+| It shows | Do |
+|---|---|
+| `No MCP server named "cubes-roblox"` | Add it, below. |
+| `Args:` with the **same** path | Nothing. Go to step 3. |
+| `Args:` with a **different** path (an older copy) | `claude mcp remove cubes-roblox`, then add it, below. |
 
 ```bash
 claude mcp add cubes-roblox -s user -- node "/absolute/path/to/cubes-roblox-mcp/dist/index.js"
 ```
 
-**Claude Desktop, Cursor, or any client with a JSON config:**
+**Claude Desktop, Cursor, or any client with a JSON config:** add this, or replace an
+existing `cubes-roblox` entry that points somewhere else:
 
 ```json
 {
@@ -123,7 +134,7 @@ turn it back on; with it off the AI can still read the place and take screenshot
 | `npm run doctor` says | Fix |
 |---|---|
 | `No CubesMCP plugin` | `npm run setup` |
-| `N CubesMCP plugin files` | `npm run setup` (it removes the extra copies) |
+| `N copies of the Cubes MCP plugin` | `npm run setup` (it removes the extra copies) |
 | `Nothing is listening on 127.0.0.1:44820` | The client starts the server. Do step 2, then open a new client session. |
 | `Studio is not connected` | Open a place in Studio. If the plugin was just installed, restart Studio. |
 | `missing or wrong bearer token` | `npm run setup`, then restart Studio. The plugin picks up the current token by itself. |

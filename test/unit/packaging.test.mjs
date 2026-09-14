@@ -11,7 +11,15 @@ import { mkdtemp, readFile, readdir, writeFile, stat, chmod } from "node:fs/prom
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { installPlugin, pluginsDir, PLUGIN_FILENAME, BUNDLED_PLUGIN_PATH, TOKEN_PLACEHOLDER } from "../../dist/install-plugin.js";
+import {
+  installPlugin,
+  installedPluginFiles,
+  pluginsDir,
+  PLUGIN_FILENAME,
+  PLUGIN_SIGNATURE,
+  BUNDLED_PLUGIN_PATH,
+  TOKEN_PLACEHOLDER,
+} from "../../dist/install-plugin.js";
 import { MIN_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION } from "../../dist/protocol.js";
 import "./_fixtures.mjs";
 
@@ -156,6 +164,24 @@ describe("plugin installer", () => {
     assert.equal(res.ok, true, res.message);
     assert.deepEqual(res.removed.sort(), ["CubesMCP (1).rbxmx", "CubesMCP.rbxm", "CubesMCP.rbxmx"]);
     assert.deepEqual((await readdir(dest)).sort(), ["CubesMCP.rbxmx", "NotCubesMCP.rbxmx", "RoAnim.rbxmx"]);
+  });
+
+  test("a copy saved under another name is found by its contents and removed", async () => {
+    const src = await mkdtemp(join(tmpdir(), "cubes-src-"));
+    const model = join(src, "built.rbxmx");
+    await writeFile(model, "<roblox/>");
+    const dest = await mkdtemp(join(tmpdir(), "cubes-dest-"));
+    await writeFile(join(dest, "My Plugin (2).rbxmx"), `<roblox><string>${PLUGIN_SIGNATURE}</string></roblox>`);
+    await writeFile(join(dest, "SomethingElse.rbxmx"), "<roblox><string>OtherPlugin_Status</string></roblox>");
+
+    assert.deepEqual((await installedPluginFiles(dest)).sort(), ["My Plugin (2).rbxmx"]);
+    const res = await installPlugin({ source: model, targetDir: dest });
+    assert.deepEqual(res.removed, ["My Plugin (2).rbxmx"]);
+    assert.deepEqual((await readdir(dest)).sort(), ["CubesMCP.rbxmx", "SomethingElse.rbxmx"]);
+  });
+
+  test("the shipped model carries the signature a renamed copy is found by", async () => {
+    assert.ok((await readFile(BUNDLED_PLUGIN_PATH, "utf8")).includes(PLUGIN_SIGNATURE));
   });
 
   test("the bridge token is baked into the installed copy, not the shipped one", async () => {

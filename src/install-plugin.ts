@@ -5,9 +5,11 @@
  * `plugin/CubesMCP.rbxmx` (built from `plugin/src` with Rojo), into Studio's
  * plugins folder, and in doing so:
  *
- *   - removes every older CubesMCP plugin file first. Two copies both poll port
- *     44820 and fight over it, and "Save as Local Plugin" leaves a differently
- *     named file behind, so overwriting by name is not enough.
+ *   - removes every older copy of the plugin first. Two copies both poll port
+ *     44820 and fight over it, and "Save as Local Plugin" can leave a copy under
+ *     any name, so copies are recognised by name OR by the plugin's own panel id
+ *     inside the file. Binary .rbxm files compress their strings, so for those
+ *     only the name counts.
  *   - bakes the bridge token into the installed copy, so nobody pastes it. The
  *     plugin cannot read files and the protocol has no token handoff, which used
  *     to make the human the courier. The installed file lives in the same user's
@@ -32,8 +34,28 @@ export const PLUGIN_FILENAME = "CubesMCP.rbxmx";
 /** The literal the plugin's Config ships with; the installer swaps the token in. */
 export const TOKEN_PLACEHOLDER = "__CUBES_MCP_BAKED_TOKEN__";
 
-/** Any file in the plugins folder that is a copy of this plugin, old or new. */
+/** A plugin file named like this plugin, old or new. */
 const OLD_PLUGIN_FILE = /^CubesMCP([ ._-].*)?\.(rbxmx?|lua|luau)$/i;
+
+/** Text plugin files that can be checked for the signature below. */
+const TEXT_PLUGIN_FILE = /\.(rbxmx|lua|luau)$/i;
+
+/**
+ * The status panel's DockWidget id, present in every build of this plugin and in
+ * no other plugin: a copy saved under another name still carries it.
+ */
+export const PLUGIN_SIGNATURE = "CubesMCP_Status";
+
+/** Is `name` in `dir` a copy of this plugin, by name or by contents? */
+async function isCubesPluginFile(dir: string, name: string): Promise<boolean> {
+  if (OLD_PLUGIN_FILE.test(name)) return true;
+  if (!TEXT_PLUGIN_FILE.test(name)) return false;
+  try {
+    return (await readFile(join(dir, name), "utf8")).includes(PLUGIN_SIGNATURE);
+  } catch {
+    return false;
+  }
+}
 
 /** A token is only baked if it cannot break out of the Luau string or the XML. */
 const SAFE_TOKEN = /^[A-Za-z0-9._~-]{16,256}$/;
@@ -79,13 +101,17 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
-/** Every copy of this plugin in `dir`, old or new. Empty when the folder is missing. */
+/** Every copy of this plugin in `dir`, by name or by contents. Empty when the folder is missing. */
 export async function installedPluginFiles(dir: string): Promise<string[]> {
+  let names: string[];
   try {
-    return (await readdir(dir)).filter((name) => OLD_PLUGIN_FILE.test(name));
+    names = await readdir(dir);
   } catch {
     return [];
   }
+  const found: string[] = [];
+  for (const name of names) if (await isCubesPluginFile(dir, name)) found.push(name);
+  return found;
 }
 
 /**
@@ -129,13 +155,8 @@ export async function installPlugin(
     if (tokenBaked) model = model.split(TOKEN_PLACEHOLDER).join(opts.token as string);
 
     await mkdir(dir, { recursive: true });
-    const removed: string[] = [];
-    for (const name of await readdir(dir)) {
-      if (OLD_PLUGIN_FILE.test(name)) {
-        await rm(join(dir, name), { force: true });
-        removed.push(name);
-      }
-    }
+    const removed = await installedPluginFiles(dir);
+    for (const name of removed) await rm(join(dir, name), { force: true });
 
     const target = join(dir, PLUGIN_FILENAME);
     await writeFile(target, model, "utf8");

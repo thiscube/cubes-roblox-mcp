@@ -112,8 +112,11 @@ function setupReport(result: Awaited<ReturnType<typeof installPlugin>>, tokenWar
       : `!!  Token NOT baked${tokenWarning ? ` (${tokenWarning})` : ""}. Paste it into the Studio panel: Controls > Bridge token.`,
     ``,
     `Next steps:`,
-    `  1. Register this server with your MCP client (skip if already registered with this path):`,
-    `       Claude Code:  claude mcp add cubes-roblox -s user -- node "${server}"`,
+    `  1. Register this server with your MCP client.`,
+    `       Claude Code: check first with  claude mcp get cubes-roblox`,
+    `         - not found:        claude mcp add cubes-roblox -s user -- node "${server}"`,
+    `         - same path:        nothing to do`,
+    `         - different path:   claude mcp remove cubes-roblox   then the add command above`,
     `       JSON config:  "cubes-roblox": { "command": "node", "args": ["${server}"] }`,
     `  2. Restart Roblox Studio (plugins load at launch), then start a new session in your MCP client.`,
     `  3. "Allow writes" starts on, so the AI can build right away. Turn it off in the Cubes MCP panel`,
@@ -137,7 +140,11 @@ async function doctor(): Promise<number> {
       say(`FAIL  No CubesMCP plugin in ${dir}. Run: npm run setup`);
       return 1;
     }
-    say(names.length === 1 ? `OK    Plugin installed: ${join(dir, names[0])}` : `WARN  ${names.length} CubesMCP plugin files in ${dir} (${names.join(", ")}). They fight over the port. Run: npm run setup`);
+    say(
+      names.length === 1
+        ? `OK    Plugin installed: ${join(dir, names[0])}`
+        : `WARN  ${names.length} copies of the Cubes MCP plugin in ${dir} (${names.join(", ")}). They fight over the port. Run: npm run setup (it removes the extras)`,
+    );
   }
 
   const { token } = resolveToken();
