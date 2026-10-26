@@ -114,11 +114,22 @@ export class SessionMemory {
     return this.recentHistory(n).map(({ args: _args, ...rest }) => rest);
   }
 
-  /** Flatten the mutate ops from the last N history entries (for macro capture). */
+  /**
+   * Flatten the mutate ops from the last N history entries (for macro capture).
+   * Only batches that actually applied count: a failed, declined or
+   * needs_confirmation call is recorded with ok=false and is skipped, so a
+   * declined delete cannot be laundered into a replayable macro. Throws when an
+   * applied batch's args were truncated, since replaying a stub would be wrong.
+   */
   opsFromHistory(n: number): unknown[] {
     const ops: unknown[] = [];
     for (const entry of this.history.slice(-Math.max(0, n))) {
-      if (entry.tool !== "mutate") continue;
+      if (entry.tool !== "mutate" || !entry.ok) continue;
+      if (JSON.stringify(entry.args ?? null).includes('"__truncated":true')) {
+        throw new Error(
+          `macro_truncated: the mutate call at turn ${entry.turn} was too large to keep in history, so it cannot be captured. Pass the ops explicitly instead.`,
+        );
+      }
       const a = entry.args as { ops?: unknown } | null;
       if (a && Array.isArray(a.ops)) ops.push(...a.ops);
     }

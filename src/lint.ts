@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { writeFile, unlink } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, delimiter, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID, createHash } from "node:crypto";
 
@@ -31,6 +32,22 @@ const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const LINT_CWD = process.env.CUBES_MCP_LINT_CWD || PROJECT_ROOT;
 const SELENE_BIN = process.platform === "win32" ? "selene.exe" : "selene";
 const SELENE_TIMEOUT_MS = 10_000;
+
+/**
+ * selene as an absolute path: CUBES_MCP_SELENE if set, else the first absolute
+ * PATH entry that has it. Spawning the bare name lets Windows run a `selene.exe`
+ * planted in the cwd (LINT_CWD) before it ever looks at PATH.
+ */
+function resolveSelene(): string | null {
+  const explicit = process.env.CUBES_MCP_SELENE;
+  if (explicit) return isAbsolute(explicit) && existsSync(explicit) ? explicit : null;
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    if (!dir || !isAbsolute(dir)) continue;
+    const candidate = join(dir, SELENE_BIN);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
 
 export interface LintDiagnostic {
   severity: string; // "Error" | "Warning"
@@ -100,7 +117,12 @@ export async function lintLuau(source: string): Promise<LintOutcome> {
 
 function runSelene(file: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn(SELENE_BIN, [file, "--display-style", "json"], { cwd: LINT_CWD });
+    const bin = resolveSelene();
+    if (!bin) {
+      reject(new Error("selene not found: put it on PATH or set CUBES_MCP_SELENE to its absolute path"));
+      return;
+    }
+    const child = spawn(bin, [file, "--display-style", "json"], { cwd: LINT_CWD });
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {

@@ -144,11 +144,12 @@ describe("write gate: behaviour, not labels", () => {
     const ok = on.payloadOf(await on.call("script_edit", SAMPLE_ARGS.script_edit));
     assert.equal(ok.edited, true);
     assert.equal(ok.totalReplacements, 1);
+    // Read the source, save it to script history (script-history.ts), write.
     assert.deepEqual(
       on.sent.map((s) => s.tool),
-      ["eval", "mutate"],
+      ["eval", "eval", "mutate"],
     );
-    assert.deepEqual(on.sent[1].args.ops, [
+    assert.deepEqual(on.sent[2].args.ops, [
       { op: "set", target: "Workspace.S", props: { Source: "local b = 1" } },
     ]);
   });
@@ -196,8 +197,8 @@ describe("write gate: behaviour, not labels", () => {
     );
     assert.deepEqual(
       seen.map((s) => s.split(": ")[1]).sort(),
-      ["macro_run", "script_edit"],
-      "expected exactly the two tools that use the mutate pipeline",
+      ["macro_run", "script_edit", "script_restore"],
+      "expected exactly the three tools that use the mutate pipeline",
     );
   });
 
@@ -231,11 +232,13 @@ describe("write gate: behaviour, not labels", () => {
     const ALLOWED = new Set([
       "assets.ts", // Roblox HTTP + the upload read
       "bridge.ts", // the HTTP listener itself
+      "cloud.ts", // Open Cloud reads; spawns reg.exe for a key set after launch
       "docs.ts", // the API dump fetch + cache
       "install-plugin.ts", // copies the plugin into Studio's folder
       "lint.ts", // spawns selene
       "mesh.ts", // reads and writes .obj / .glb files under the project root
       "profile.ts", // per-place profiles
+      "script-history.ts", // saved script versions under CUBES_MCP_HOME/history
       "sourcemap.ts", // reads sourcemap.json
       "vision.ts", // spawns the capture tool, writes a temp PNG
     ]);

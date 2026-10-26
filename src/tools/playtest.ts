@@ -1,4 +1,5 @@
-import { type ToolEntry, commandTool, evalTool, dispatchTool, luaJson, timeoutFor } from "../registry.js";
+import { type ToolEntry, commandTool, evalTool, dispatchTool, localTool, luaJson, timeoutFor } from "../registry.js";
+import { analyzeSignals } from "../signal.js";
 import { objectResult } from "../output-schema.js";
 
 /**
@@ -200,11 +201,12 @@ return {
       subcategories: ["lifecycle", "simulate"],
       keywords: ["playtest", "play", "solo", "start", "simulate", "player"],
       description:
-        "Start Play Solo (StudioTestService:ExecutePlayModeAsync). Plugin stays connected, so drive the player with character_* tools.",
+        "Start a playtest: Play Solo, or with players 2-8 a local server and that many clients (like Clients and Servers). Drive players with character_* tools; reach one client with client_eval's player.",
       inputSchema: {
         type: "object",
         properties: {
           testArgs: { description: "Optional value passed to StudioTestService:GetTestArgs() inside the session." },
+          players: { type: "number", description: "Clients to start (1-8, default 1). 2 or more runs a local server with that many test players." },
         },
       },
     },
@@ -797,5 +799,88 @@ local startClock = os.clock()
 for _ = 1, count do RunService.Heartbeat:Wait() end
 return { ok = true, frames = count, elapsed = os.clock() - startClock }
 `,
+  ),
+  commandTool(
+    {
+      name: "client_eval",
+      category: "playtest",
+      subcategories: ["live", "eval", "client"],
+      keywords: ["client", "camera", "gui", "localscript", "render", "local"],
+      description:
+        "Run Luau in the running playtest's CLIENT DataModel: the only way to reach the camera, PlayerGui or LocalScripts, none of which exist where `tune` runs. `return <v>` comes back as JSON. Needs a playtest.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          luau: { type: "string", description: "Luau to run in the live play-DM client. Use 'return <value>' to get data back." },
+          player: { type: "string", description: "Which client in a multi-player test (e.g. 'Player2'; playtest_result lists them). Default: the first player." },
+        },
+        required: ["luau"],
+      },
+    },
+    "client_eval",
+    async (args, ctx) => {
+      const luau = (args ?? {}).luau;
+      if (typeof luau !== "string" || luau.trim() === "") {
+        return { error: "bad_args", hint: "client_eval requires a non-empty 'luau' string." };
+      }
+      const player = (args ?? {}).player;
+      return {
+        result: await ctx.bridge.send(
+          "client_eval",
+          typeof player === "string" && player !== "" ? { luau, player } : { luau },
+          30_000,
+        ),
+      };
+    },
+  ),
+  commandTool(
+    {
+      name: "signal_capture",
+      category: "playtest",
+      subcategories: ["live", "measure"],
+      keywords: ["measure", "sample", "signal", "frequency", "oscillation", "bob", "telemetry"],
+      description:
+        "Sample any numeric signal every frame in the playtest client, then report amplitude, dominant frequency, how cleanly it repeats, second-harmonic ratio, roughness and cross-channel phase. Use instead of eyeballing.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          setup: {
+            type: "string",
+            description: "Luau that RETURNS a sampler function; the sampler returns a flat table of numbers keyed by channel name.",
+          },
+          duration: { type: "number", description: "Seconds to record (default 3, max 20)." },
+          hz: { type: "number", description: "Samples per second (default 60, max 240)." },
+          raw: { type: "boolean", description: "Also return the per-sample series (large; off by default)." },
+          player: { type: "string", description: "Which client in a multi-player test (e.g. 'Player2'). Default: the first player." },
+        },
+        required: ["setup"],
+      },
+    },
+    "signal_capture",
+    async (args, ctx) => {
+      const a = (args ?? {}) as Record<string, unknown>;
+      const setup = a.setup;
+      if (typeof setup !== "string" || setup.trim() === "") {
+        return { error: "bad_args", hint: "signal_capture needs a 'setup' chunk that RETURNS a sampler function." };
+      }
+      const duration = Math.min(20, Math.max(0.1, Number(a.duration) || 3));
+      const hz = Math.min(240, Math.max(1, Number(a.hz) || 60));
+      const res = (await ctx.bridge.send(
+        "signal_capture",
+        typeof a.player === "string" && a.player !== "" ? { setup, duration, hz, player: a.player } : { setup, duration, hz },
+        Math.round((duration + 20) * 1000),
+      )) as any;
+      const channels = (res?.channels ?? {}) as Record<string, number[]>;
+      if (!Object.keys(channels).length) {
+        return { result: { ...res, warning: "no channels captured — does the sampler return a table of numbers?" } };
+      }
+      return {
+        result: {
+          context: res?.context ?? "client",
+          ...analyzeSignals(channels, res?.t),
+          ...(a.raw === true ? { t: res?.t, series: channels } : {}),
+        },
+      };
+    },
   ),
 ];

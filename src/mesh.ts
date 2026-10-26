@@ -30,12 +30,70 @@ export interface MeshData {
   indices: number[];
 }
 
+/**
+ * Compact wire encoding for mesh_bake replies (`encoding: "f32b64"`): positions,
+ * normals and colours as float32 little-endian, indices as uint32 little-endian,
+ * each base64-encoded into one string: a flat 16 bytes per vertex per attribute
+ * (48 for all three) against ~63 as 4-decimal JSON arrays, and ~22% smaller
+ * overall on a 60k-vertex bake. The server asks for it with an arg; an old
+ * plugin ignores the arg and replies with arrays, so both forms are accepted.
+ */
+export const MESH_WIRE_ENCODING = "f32b64";
+
+/** Encode one field as the plugin does (used by tests and size measurements). */
+export function encodeMeshField(values: ArrayLike<number>, kind: "f32" | "u32"): string {
+  const buf = Buffer.alloc(values.length * 4);
+  for (let i = 0; i < values.length; i++) {
+    if (kind === "f32") buf.writeFloatLE(values[i], i * 4);
+    else buf.writeUInt32LE(values[i], i * 4);
+  }
+  return buf.toString("base64");
+}
+
+/**
+ * One wire field back to number[]. Arrays pass through. Floats are re-rounded to
+ * 4 decimals, the plugin's JSON rounding, so values match the array path exactly
+ * for |x| < 1024 (float32's half-ulp is under 0.00005 there); beyond that the
+ * error is float32's own. readFloatLE avoids the alignment trap of a Float32Array
+ * view over a pooled Buffer whose byteOffset is not a multiple of 4.
+ */
+function decodeMeshField(v: unknown, kind: "f32" | "u32", field: string): number[] | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (Array.isArray(v)) return v as number[];
+  if (typeof v !== "string") throw new Error(`mesh field ${field} is neither an array nor a base64 string.`);
+  const buf = Buffer.from(v, "base64");
+  if (buf.length % 4) throw new Error(`mesh field ${field} is ${buf.length} bytes, not a multiple of 4.`);
+  const n = buf.length / 4;
+  const out = new Array<number>(n);
+  if (kind === "u32") for (let i = 0; i < n; i++) out[i] = buf.readUInt32LE(i * 4);
+  else for (let i = 0; i < n; i++) out[i] = Math.round(buf.readFloatLE(i * 4) * 10000) / 10000;
+  return out;
+}
+
+/** Normalise a mesh_bake reply, in either wire form, to MeshData arrays in place. */
+export function decodeMeshWire<T extends Record<string, unknown>>(raw: T): T & MeshData {
+  const r = raw as Record<string, unknown>;
+  r.positions = decodeMeshField(r.positions, "f32", "positions");
+  r.indices = decodeMeshField(r.indices, "u32", "indices");
+  for (const f of ["normals", "colors"]) {
+    const d = decodeMeshField(r[f], "f32", f);
+    if (d) r[f] = d; else delete r[f];
+  }
+  delete r.encoding;
+  return raw as T & MeshData;
+}
+
 export type MeshFormat = "obj" | "glb";
 
 export const MESH_FORMATS: readonly MeshFormat[] = ["obj", "glb"];
 
 /** Largest mesh file mesh_import will read. */
 export const MAX_MESH_FILE_BYTES = 64 * 1024 * 1024;
+/** Parse-time caps, checked before allocating, so a tiny GLB can't expand to gigabytes. */
+const MAX_PARSE_VERTICES = 1_000_000;
+const MAX_PARSE_INDICES = 3_000_000;
+const MAX_NODE_VISITS = 10_000;
+const MAX_NODE_DEPTH = 64;
 
 export function meshFormatOf(path: string): MeshFormat | null {
   const ext = extname(path).toLowerCase();
@@ -64,10 +122,12 @@ async function realBaseOf(root?: string): Promise<string> {
  * else the working directory), resolved through the nearest existing parent so
  * a symlinked directory cannot carry the write outside it. Refuses to replace
  * an existing file unless `overwrite`, and never writes through a symlink.
+ * Creates no directories; writeMeshFile does, once there is something to write.
  */
 export async function resolveMeshWritePath(filePath: string, opts: { overwrite?: boolean; root?: string } = {}): Promise<string> {
   const requested = String(filePath ?? "");
   if (requested.includes("\0")) throw new Error("Refusing a path containing a null byte.");
+  if (/:/.test(requested.replace(/^[A-Za-z]:/, ""))) throw new Error("Refusing a path with ':' after the drive (NTFS alternate data stream).");
   if (!meshFormatOf(requested)) throw new Error(`Export to .obj or .glb, not ${extname(requested) || "a file with no extension"}.`);
   const realBase = await realBaseOf(opts.root);
   const full = resolve(realBase, requested);
@@ -92,7 +152,6 @@ export async function resolveMeshWritePath(filePath: string, opts: { overwrite?:
   const info = await lstat(target).catch(() => null);
   if (info?.isSymbolicLink()) throw new Error(`Refusing to write through the symlink ${target}.`);
   if (info && !opts.overwrite) throw new Error(`${target} already exists. Pass overwrite: true to replace it.`);
-  await mkdir(dirname(target), { recursive: true });
   return target;
 }
 
@@ -100,6 +159,7 @@ export async function resolveMeshWritePath(filePath: string, opts: { overwrite?:
 export async function resolveMeshReadPath(filePath: string, opts: { root?: string } = {}): Promise<string> {
   const requested = String(filePath ?? "");
   if (requested.includes("\0")) throw new Error("Refusing a path containing a null byte.");
+  if (/:/.test(requested.replace(/^[A-Za-z]:/, ""))) throw new Error("Refusing a path with ':' after the drive (NTFS alternate data stream).");
   const realBase = await realBaseOf(opts.root);
   let real: string;
   try {
@@ -118,6 +178,7 @@ export async function resolveMeshReadPath(filePath: string, opts: { root?: strin
 
 export async function writeMeshFile(path: string, mesh: MeshData, name: string): Promise<number> {
   const data = meshFormatOf(path) === "glb" ? toGlb(mesh, name) : Buffer.from(toObj(mesh, name), "utf8");
+  await mkdir(dirname(path), { recursive: true });
   await writeFile(path, data);
   return data.byteLength;
 }
@@ -137,36 +198,58 @@ const f4 = (n: number) => {
 };
 
 export function toObj(mesh: MeshData, name: string): string {
-  const out: string[] = [`# exported by cubes-roblox-mcp`, `o ${name.replace(/\s+/g, "_") || "mesh"}`];
-  const n = mesh.positions.length / 3;
-  for (let i = 0; i < n; i++) {
-    const p = mesh.positions;
-    let line = `v ${f4(p[i * 3])} ${f4(p[i * 3 + 1])} ${f4(p[i * 3 + 2])}`;
-    if (mesh.colors) line += ` ${f4(mesh.colors[i * 3])} ${f4(mesh.colors[i * 3 + 1])} ${f4(mesh.colors[i * 3 + 2])}`;
-    out.push(line);
-  }
-  if (mesh.normals) {
-    for (let i = 0; i < n; i++) {
-      out.push(`vn ${f4(mesh.normals[i * 3])} ${f4(mesh.normals[i * 3 + 1])} ${f4(mesh.normals[i * 3 + 2])}`);
+  // Lines are joined in blocks so the working set is a few thousand small
+  // strings at a time, not one per line for the whole mesh.
+  const blocks: string[] = [];
+  let lines: string[] = [`# exported by cubes-roblox-mcp`, `o ${name.replace(/\s+/g, "_") || "mesh"}`];
+  const push = (line: string) => {
+    lines.push(line);
+    if (lines.length >= 4096) {
+      blocks.push(lines.join("\n"));
+      lines = [];
     }
+  };
+  const p = mesh.positions;
+  const col = mesh.colors;
+  const nor = mesh.normals;
+  const n = p.length / 3;
+  for (let i = 0; i < n; i++) {
+    const o = i * 3;
+    let line = `v ${f4(p[o])} ${f4(p[o + 1])} ${f4(p[o + 2])}`;
+    if (col) line += ` ${f4(col[o])} ${f4(col[o + 1])} ${f4(col[o + 2])}`;
+    push(line);
   }
-  for (let t = 0; t < mesh.indices.length; t += 3) {
-    const [a, b, c] = [mesh.indices[t] + 1, mesh.indices[t + 1] + 1, mesh.indices[t + 2] + 1];
-    out.push(mesh.normals ? `f ${a}//${a} ${b}//${b} ${c}//${c}` : `f ${a} ${b} ${c}`);
+  if (nor) {
+    for (let i = 0; i < n; i++) push(`vn ${f4(nor[i * 3])} ${f4(nor[i * 3 + 1])} ${f4(nor[i * 3 + 2])}`);
   }
-  return out.join("\n") + "\n";
+  const idx = mesh.indices;
+  for (let t = 0; t < idx.length; t += 3) {
+    const a = idx[t] + 1, b = idx[t + 1] + 1, c = idx[t + 2] + 1;
+    push(nor ? `f ${a}//${a} ${b}//${b} ${c}//${c}` : `f ${a} ${b} ${c}`);
+  }
+  if (lines.length) blocks.push(lines.join("\n"));
+  return blocks.join("\n") + "\n";
 }
 
 export function parseObj(text: string): MeshData {
-  const v: number[][] = [];
-  const vc: (number[] | null)[] = [];
-  const vn: number[][] = [];
+  // Flat arrays, three numbers per entry: no per-vertex objects to allocate or collect.
+  const v: number[] = [];
+  const vc: number[] = []; // NaN in the first slot means "no colour on this v line"
+  const vn: number[] = [];
   const positions: number[] = [];
   const normals: number[] = [];
   const colors: number[] = [];
   const indices: number[] = [];
+  // Corner dedup. Almost every OBJ pairs each position with one normal, so the
+  // first pairing per position lives in two flat arrays; only a position that
+  // turns up with a second normal falls back to the string-keyed map.
+  const firstNormal: number[] = [];
+  const firstId: number[] = [];
   const seen = new Map<string, number>();
   let anyColor = false;
+  const cp: number[] = [];
+  const cn: number[] = [];
+  const ids: number[] = [];
 
   const index = (raw: string, count: number) => {
     const i = parseInt(raw, 10);
@@ -179,44 +262,73 @@ export function parseObj(text: string): MeshData {
     const parts = line.split(/\s+/);
     const kind = parts[0];
     if (kind === "v") {
-      const nums = parts.slice(1).map(Number);
-      v.push([nums[0], nums[1], nums[2]]);
-      if (nums.length >= 6 && nums.slice(3, 6).every(Number.isFinite)) {
-        vc.push([nums[3], nums[4], nums[5]]);
+      v.push(Number(parts[1]), Number(parts[2]), Number(parts[3]));
+      const r = Number(parts[4]), g = Number(parts[5]), b = Number(parts[6]);
+      if (parts.length >= 7 && Number.isFinite(r) && Number.isFinite(g) && Number.isFinite(b)) {
+        vc.push(r, g, b);
         anyColor = true;
       } else {
-        vc.push(null);
+        vc.push(NaN, 0, 0);
       }
     } else if (kind === "vn") {
-      vn.push(parts.slice(1, 4).map(Number));
+      vn.push(Number(parts[1]), Number(parts[2]), Number(parts[3]));
     } else if (kind === "f") {
-      const corners = parts.slice(1).map((tok) => {
-        const [pi, , ni] = tok.split("/");
-        return { p: index(pi, v.length), n: ni ? index(ni, vn.length) : -1 };
-      });
-      if (corners.length < 3 || corners.some((c) => !v[c.p])) continue;
-      const faceNormal = (() => {
-        const [a, b, c] = [v[corners[0].p], v[corners[1].p], v[corners[2].p]];
-        const u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-        const w = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-        const cr = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
-        const len = Math.hypot(cr[0], cr[1], cr[2]) || 1;
-        return cr.map((x) => x / len);
-      })();
-      const ids = corners.map((c, k) => {
-        const hasNormal = c.n >= 0 && vn[c.n];
+      const vCount = v.length / 3;
+      const nCount = vn.length / 3;
+      cp.length = 0;
+      cn.length = 0;
+      let bad = false;
+      for (let k = 1; k < parts.length; k++) {
+        const tok = parts[k];
+        const s1 = tok.indexOf("/");
+        const pi = index(s1 < 0 ? tok : tok.slice(0, s1), vCount);
+        let ni = -1;
+        if (s1 >= 0) {
+          const s2 = tok.indexOf("/", s1 + 1);
+          if (s2 >= 0) {
+            const s3 = tok.indexOf("/", s2 + 1);
+            const nraw = tok.slice(s2 + 1, s3 < 0 ? undefined : s3);
+            if (nraw) ni = index(nraw, nCount);
+          }
+        }
+        if (!(pi >= 0 && pi < vCount)) bad = true;
+        cp.push(pi);
+        cn.push(ni);
+      }
+      if (cp.length < 3 || bad) continue;
+      const a = cp[0] * 3, b = cp[1] * 3, c = cp[2] * 3;
+      const ux = v[b] - v[a], uy = v[b + 1] - v[a + 1], uz = v[b + 2] - v[a + 2];
+      const wx = v[c] - v[a], wy = v[c + 1] - v[a + 1], wz = v[c + 2] - v[a + 2];
+      const fx = uy * wz - uz * wy, fy = uz * wx - ux * wz, fz = ux * wy - uy * wx;
+      const len = Math.hypot(fx, fy, fz) || 1;
+      ids.length = 0;
+      for (let k = 0; k < cp.length; k++) {
+        const pIdx = cp[k], nIdx = cn[k];
+        const hasNormal = nIdx >= 0 && nIdx < nCount;
         // Corners without a normal get the face's flat one, so they cannot be shared.
-        const key = hasNormal ? `${c.p}/${c.n}` : `${c.p}/f${indices.length}/${k}`;
-        let id = seen.get(key);
+        let id: number | undefined;
+        let key: string | null = null;
+        if (hasNormal) {
+          if (firstNormal[pIdx] === nIdx) id = firstId[pIdx];
+          else if (firstNormal[pIdx] !== undefined) id = seen.get((key = `${pIdx}/${nIdx}`));
+        }
         if (id === undefined) {
           id = positions.length / 3;
-          seen.set(key, id);
-          positions.push(...v[c.p]);
-          normals.push(...(hasNormal ? vn[c.n] : faceNormal));
-          colors.push(...(vc[c.p] ?? [1, 1, 1]));
+          if (hasNormal) {
+            if (key === null) {
+              firstNormal[pIdx] = nIdx;
+              firstId[pIdx] = id;
+            } else seen.set(key, id);
+          }
+          const o = pIdx * 3;
+          positions.push(v[o], v[o + 1], v[o + 2]);
+          if (hasNormal) normals.push(vn[nIdx * 3], vn[nIdx * 3 + 1], vn[nIdx * 3 + 2]);
+          else normals.push(fx / len, fy / len, fz / len);
+          if (Number.isNaN(vc[o])) colors.push(1, 1, 1);
+          else colors.push(vc[o], vc[o + 1], vc[o + 2]);
         }
-        return id;
-      });
+        ids.push(id);
+      }
       for (let k = 1; k < ids.length - 1; k++) indices.push(ids[0], ids[k], ids[k + 1]);
     }
   }
@@ -268,7 +380,9 @@ export function toGlb(mesh: MeshData, name: string): Buffer {
   attributes.POSITION = add(floats(mesh.positions), ARRAY_BUFFER, { componentType: FLOAT, count, type: "VEC3", min, max });
   if (mesh.normals) attributes.NORMAL = add(floats(mesh.normals), ARRAY_BUFFER, { componentType: FLOAT, count, type: "VEC3" });
   if (mesh.colors) {
-    attributes.COLOR_0 = add(floats(mesh.colors.map((c) => toLinear(clamp01(c)))), ARRAY_BUFFER, {
+    const lin = new Float32Array(mesh.colors.length);
+    for (let i = 0; i < lin.length; i++) lin[i] = toLinear(clamp01(mesh.colors[i]));
+    attributes.COLOR_0 = add(Buffer.from(lin.buffer), ARRAY_BUFFER, {
       componentType: FLOAT,
       count,
       type: "VEC3",
@@ -294,9 +408,8 @@ export function toGlb(mesh: MeshData, name: string): Buffer {
 
   let jsonBuf = Buffer.from(JSON.stringify(json), "utf8");
   jsonBuf = Buffer.concat([jsonBuf, Buffer.alloc((4 - (jsonBuf.byteLength % 4)) % 4, 0x20)]);
-  const bin = Buffer.concat(chunks);
   const header = Buffer.alloc(12);
-  const total = 12 + 8 + jsonBuf.byteLength + 8 + bin.byteLength;
+  const total = 12 + 8 + jsonBuf.byteLength + 8 + offset;
   header.writeUInt32LE(0x46546c67, 0);
   header.writeUInt32LE(2, 4);
   header.writeUInt32LE(total, 8);
@@ -304,9 +417,10 @@ export function toGlb(mesh: MeshData, name: string): Buffer {
   jsonHead.writeUInt32LE(jsonBuf.byteLength, 0);
   jsonHead.writeUInt32LE(0x4e4f534a, 4);
   const binHead = Buffer.alloc(8);
-  binHead.writeUInt32LE(bin.byteLength, 0);
+  binHead.writeUInt32LE(offset, 0);
   binHead.writeUInt32LE(0x004e4942, 4);
-  return Buffer.concat([header, jsonHead, jsonBuf, binHead, bin]);
+  // One copy straight into the output, not a BIN chunk built and then copied again.
+  return Buffer.concat([header, jsonHead, jsonBuf, binHead, ...chunks], total);
 }
 
 type Mat4 = number[];
@@ -349,18 +463,27 @@ export function parseGlb(buf: Buffer): MeshData {
   }
   if (!json) throw new Error("The GLB has no JSON chunk.");
 
-  const readAccessor = (i: number): { data: number[]; size: number } => {
+  const readAccessor = (i: number): { data: Float64Array; size: number } => {
     const acc = json.accessors[i];
     const view = json.bufferViews[acc.bufferView];
     if (!bin || view.buffer !== 0) throw new Error("Only self-contained GLB files are supported (no external buffers).");
     const size = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4 }[acc.type as string] ?? 1;
     const bytes = { 5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4 }[acc.componentType as number];
     if (!bytes) throw new Error(`Unsupported accessor component type ${acc.componentType}.`);
-    const stride = view.byteStride ?? size * bytes;
+    const elem = size * bytes;
+    const stride = view.byteStride ?? elem;
+    if (!Number.isInteger(stride) || stride < elem) throw new Error(`Accessor ${i} has byteStride ${view.byteStride}, smaller than its element (${elem} bytes).`);
+    const count = acc.count;
+    if (!Number.isInteger(count) || count < 0) throw new Error(`Accessor ${i} has an invalid count.`);
     const start = (view.byteOffset ?? 0) + (acc.byteOffset ?? 0);
+    const viewEnd = (view.byteOffset ?? 0) + (view.byteLength ?? bin.byteLength);
+    if (count > 0 && (start < 0 || viewEnd > bin.byteLength || start + (count - 1) * stride + elem > viewEnd)) {
+      throw new Error(`Accessor ${i} (${count} x ${stride} bytes) runs past the end of its buffer.`);
+    }
     const norm = acc.normalized === true;
-    const data: number[] = [];
-    for (let e = 0; e < acc.count; e++) {
+    const data = new Float64Array(count * size);
+    let w = 0;
+    for (let e = 0; e < count; e++) {
       for (let k = 0; k < size; k++) {
         const o = start + e * stride + k * bytes;
         let x: number;
@@ -372,7 +495,7 @@ export function parseGlb(buf: Buffer): MeshData {
           case 5121: x = bin.readUInt8(o); if (norm) x /= 255; break;
           default: x = bin.readInt8(o); if (norm) x = Math.max(x / 127, -1);
         }
-        data.push(x);
+        data[w++] = x;
       }
     }
     return { data, size };
@@ -389,60 +512,76 @@ export function parseGlb(buf: Buffer): MeshData {
     for (const prim of mesh?.primitives ?? []) {
       if ((prim.mode ?? 4) !== 4 || prim.attributes?.POSITION === undefined) continue;
       const base = positions.length / 3;
+      const posCount = json.accessors[prim.attributes.POSITION]?.count ?? 0;
+      if (base + posCount > MAX_PARSE_VERTICES) throw new Error(`The GLB has more than ${MAX_PARSE_VERTICES} vertices.`);
+      const idxCount = prim.indices !== undefined ? json.accessors[prim.indices]?.count ?? 0 : posCount;
+      if (indices.length + idxCount > MAX_PARSE_INDICES) throw new Error(`The GLB has more than ${MAX_PARSE_INDICES / 3} triangles.`);
       const pos = readAccessor(prim.attributes.POSITION).data;
       const count = pos.length / 3;
       const nor = prim.attributes.NORMAL !== undefined ? readAccessor(prim.attributes.NORMAL).data : null;
       const col = prim.attributes.COLOR_0 !== undefined ? readAccessor(prim.attributes.COLOR_0) : null;
       const factor = json.materials?.[prim.material]?.pbrMetallicRoughness?.baseColorFactor;
+      const srgb = (c: number) => clamp01(toSrgb(clamp01(c)));
+      // A material factor is the same for every vertex: convert it once.
+      const fr = Array.isArray(factor) ? srgb(factor[0]) : 1;
+      const fg = Array.isArray(factor) ? srgb(factor[1]) : 1;
+      const fb = Array.isArray(factor) ? srgb(factor[2]) : 1;
+      if (count > 0 && (col || Array.isArray(factor))) anyColor = true;
       for (let i = 0; i < count; i++) {
-        const [x, y, z] = [pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]];
+        const x = pos[i * 3], y = pos[i * 3 + 1], z = pos[i * 3 + 2];
         positions.push(m[0] * x + m[4] * y + m[8] * z + m[12], m[1] * x + m[5] * y + m[9] * z + m[13], m[2] * x + m[6] * y + m[10] * z + m[14]);
         if (nor) {
-          const [a, b, c] = [nor[i * 3], nor[i * 3 + 1], nor[i * 3 + 2]];
-          const w = [m[0] * a + m[4] * b + m[8] * c, m[1] * a + m[5] * b + m[9] * c, m[2] * a + m[6] * b + m[10] * c];
-          const len = Math.hypot(w[0], w[1], w[2]) || 1;
-          normals.push(w[0] / len, w[1] / len, w[2] / len);
+          const a = nor[i * 3], b = nor[i * 3 + 1], c = nor[i * 3 + 2];
+          const wx = m[0] * a + m[4] * b + m[8] * c, wy = m[1] * a + m[5] * b + m[9] * c, wz = m[2] * a + m[6] * b + m[10] * c;
+          const len = Math.hypot(wx, wy, wz) || 1;
+          normals.push(wx / len, wy / len, wz / len);
         } else {
           normals.push(0, 1, 0);
         }
-        let rgb = [1, 1, 1];
         if (col) {
-          rgb = [col.data[i * col.size], col.data[i * col.size + 1], col.data[i * col.size + 2]];
-          anyColor = true;
-        } else if (Array.isArray(factor)) {
-          rgb = [factor[0], factor[1], factor[2]];
-          anyColor = true;
+          const o = i * col.size;
+          colors.push(srgb(col.data[o]), srgb(col.data[o + 1]), srgb(col.data[o + 2]));
+        } else {
+          colors.push(fr, fg, fb);
         }
-        colors.push(...rgb.map((c) => clamp01(toSrgb(clamp01(c)))));
       }
-      const idx = prim.indices !== undefined ? readAccessor(prim.indices).data : Array.from({ length: count }, (_, i) => i);
-      for (const i of idx) indices.push(base + i);
+      const idx: ArrayLike<number> = prim.indices !== undefined ? readAccessor(prim.indices).data : Array.from({ length: count }, (_, i) => i);
+      for (let t = 0; t < idx.length; t++) indices.push(base + idx[t]);
       if (!nor) {
         // No normals in the file: flat ones from each triangle (shared corners take the last).
         for (let t = 0; t < idx.length; t += 3) {
-          const [a, b, c] = [base + idx[t], base + idx[t + 1], base + idx[t + 2]];
-          const p = (k: number) => [positions[k * 3], positions[k * 3 + 1], positions[k * 3 + 2]];
-          const [pa, pb, pc] = [p(a), p(b), p(c)];
-          const u = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
-          const v = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
-          const cr = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
-          const len = Math.hypot(cr[0], cr[1], cr[2]) || 1;
-          for (const k of [a, b, c]) normals.splice(k * 3, 3, cr[0] / len, cr[1] / len, cr[2] / len);
+          const a = (base + idx[t]) * 3, b = (base + idx[t + 1]) * 3, c = (base + idx[t + 2]) * 3;
+          const ux = positions[b] - positions[a], uy = positions[b + 1] - positions[a + 1], uz = positions[b + 2] - positions[a + 2];
+          const vx = positions[c] - positions[a], vy = positions[c + 1] - positions[a + 1], vz = positions[c + 2] - positions[a + 2];
+          const cx = uy * vz - uz * vy, cy = uz * vx - ux * vz, cz = ux * vy - uy * vx;
+          const len = Math.hypot(cx, cy, cz) || 1;
+          for (const k of [a, b, c]) {
+            if (!(k >= 0 && k + 2 < normals.length)) continue; // a bad index must not grow the array
+            normals[k] = cx / len;
+            normals[k + 1] = cy / len;
+            normals[k + 2] = cz / len;
+          }
         }
       }
     }
   };
 
-  const visit = (nodeIndex: number, parent: Mat4) => {
+  let visits = 0;
+  const onPath = new Set<number>();
+  const visit = (nodeIndex: number, parent: Mat4, depth: number) => {
     const node = json.nodes?.[nodeIndex];
     if (!node) return;
+    if (onPath.has(nodeIndex)) throw new Error(`The GLB node graph has a cycle at node ${nodeIndex}.`);
+    if (++visits > MAX_NODE_VISITS || depth > MAX_NODE_DEPTH) throw new Error(`The GLB node graph is too large (over ${MAX_NODE_VISITS} visits or ${MAX_NODE_DEPTH} deep).`);
+    onPath.add(nodeIndex);
     const m = mul(parent, nodeMatrix(node));
     if (node.mesh !== undefined) emit(node.mesh, m);
-    for (const child of node.children ?? []) visit(child, m);
+    for (const child of node.children ?? []) visit(child, m, depth + 1);
+    onPath.delete(nodeIndex);
   };
 
   const scene = json.scenes?.[json.scene ?? 0];
-  if (scene?.nodes?.length) for (const n of scene.nodes) visit(n, IDENTITY);
+  if (scene?.nodes?.length) for (const n of scene.nodes) visit(n, IDENTITY, 0);
   else for (let i = 0; i < (json.meshes?.length ?? 0); i++) emit(i, IDENTITY);
 
   if (indices.length === 0) throw new Error("The GLB has no triangle meshes.");

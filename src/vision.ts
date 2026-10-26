@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, readFile, unlink, stat } from "node:fs/promises";
+import { mkdir, readFile, unlink, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -188,7 +188,8 @@ function run(cmd: string, args: string[], timeoutMs = CAPTURE_TIMEOUT_MS, env?: 
 }
 
 /**
- * PowerShell capture. All numeric values are pre-validated integers from `px`.
+ * PowerShell capture. All numeric values are pre-validated integers from `px`;
+ * the output path comes in through $env:CUBES_MCP_SHOT, not the script text.
  *
  * Studio regions are captured with PrintWindow, not by copying the screen: the
  * window renders itself into our bitmap, so a window sitting on top of Studio is
@@ -202,15 +203,14 @@ function run(cmd: string, args: string[], timeoutMs = CAPTURE_TIMEOUT_MS, env?: 
  * crop is found rather than guessed from insets, whatever the panel layout.
  * Without it the insets apply, as before.
  */
-function windowsScript(outPath: string, region: Region, insets: Insets, viewport?: { w: number; h: number }): string {
-  const escaped = outPath.replace(/'/g, "''");
+function windowsScript(region: Region, insets: Insets, viewport?: { w: number; h: number }): string {
   if (region === "full") {
     return `Add-Type -AssemblyName System.Windows.Forms,System.Drawing
 $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
 $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
 $g = [System.Drawing.Graphics]::FromImage($bmp)
 $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
-$bmp.Save('${escaped}')
+$bmp.Save($env:CUBES_MCP_SHOT)
 $g.Dispose(); $bmp.Dispose()`;
   }
   const { top, right, bottom, left } = insets;
@@ -273,7 +273,7 @@ $x = [Math]::Max(0, $x); $y = [Math]::Max(0, $y)
 $w = [Math]::Min($w, $W - $x); $h = [Math]::Min($h, $H - $y)
 if ($w -lt 50 -or $h -lt 50) { [Console]::Error.WriteLine('studio_window_too_small'); exit 3 }
 $crop = $full.Clone((New-Object System.Drawing.Rectangle $x, $y, $w, $h), $full.PixelFormat)
-$crop.Save('${escaped}', [System.Drawing.Imaging.ImageFormat]::Png)
+$crop.Save($env:CUBES_MCP_SHOT, [System.Drawing.Imaging.ImageFormat]::Png)
 $crop.Dispose(); $full.Dispose()`;
 }
 
@@ -321,9 +321,10 @@ async function capture(outPath: string, region: Region, insets: Insets, viewport
     const tmp = await captureTempDir();
     await run(
       "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", windowsScript(outPath, region, insets, viewport)],
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", windowsScript(region, insets, viewport)],
       CAPTURE_TIMEOUT_MS,
-      tmp ? { TMP: tmp, TEMP: tmp } : undefined,
+      // The path travels in an env var, never in the script text, so no quote in it can break out.
+      { CUBES_MCP_SHOT: outPath, ...(tmp ? { TMP: tmp, TEMP: tmp } : {}) },
     );
     return;
   }
@@ -362,7 +363,6 @@ async function downscale(path: string): Promise<boolean> {
       return true;
     }
     if (process.platform === "win32") {
-      const escaped = path.replace(/'/g, "''");
       await run(
         "powershell.exe",
         [
@@ -372,7 +372,7 @@ async function downscale(path: string): Promise<boolean> {
           "Bypass",
           "-Command",
           `Add-Type -AssemblyName System.Drawing
-$src = [System.Drawing.Image]::FromFile('${escaped}')
+$src = [System.Drawing.Image]::FromFile($env:CUBES_MCP_SHOT)
 $max = ${DOWNSCALE_MAX_EDGE}
 $scale = [Math]::Min(1.0, $max / [Math]::Max($src.Width, $src.Height))
 $w = [int]($src.Width * $scale); $h = [int]($src.Height * $scale)
@@ -381,10 +381,11 @@ $g = [System.Drawing.Graphics]::FromImage($dst)
 $g.InterpolationMode = 'HighQualityBicubic'
 $g.DrawImage($src, 0, 0, $w, $h)
 $src.Dispose()
-$dst.Save('${escaped}')
+$dst.Save($env:CUBES_MCP_SHOT)
 $g.Dispose(); $dst.Dispose()`,
         ],
         10_000,
+        { CUBES_MCP_SHOT: path },
       );
       return true;
     }
@@ -480,7 +481,8 @@ export const screenshotTool: ToolEntry = {
       if (source === "studio" || studioCaptureWorthTrying(ctx.bridge)) {
         const shot = await studioCapture(ctx.bridge, requested);
         if (shot) {
-          const bytes = Buffer.byteLength(shot.base64, "utf8");
+          // base64 is ASCII, so length is the byte count; byteLength rescans ~8ms per 4K shot.
+          const bytes = shot.base64.length;
           if (bytes <= MAX_INLINE_BYTES) {
             const meta: Record<string, unknown> = {
               sizeBytes: bytes,
@@ -521,9 +523,9 @@ export const screenshotTool: ToolEntry = {
     const insets = resolveInsets(requested, args?.insets);
     const path = join(tmpdir(), `cubes-mcp-screenshot-${randomBytes(8).toString("hex")}.png`);
 
-    // When we hand the caller a path (the too-large case) we must NOT delete it.
-    let keepFile = false;
-    const cleanup = () => (keepFile ? Promise.resolve() : unlink(path).catch(() => undefined));
+    const cleanup = () => unlink(path).catch(() => undefined);
+    // Owner-only on POSIX; the capture tools write into the file we create.
+    if (process.platform !== "win32") await writeFile(path, "", { mode: 0o600, flag: "wx" }).catch(() => undefined);
 
     let actualRegion: Region = requested;
     let warning: string | undefined;
@@ -575,14 +577,12 @@ export const screenshotTool: ToolEntry = {
       }
       if (size > MAX_INLINE_BYTES) {
         // Refuse rather than blow up the context window with a multi-megabyte blob.
-        // Keep the file so the hint below is actionable.
-        keepFile = true;
+        // The file is deleted below like any other: a PNG left in TEMP is a leak.
         return {
           error: "screenshot_too_large",
           sizeBytes: size,
           limitBytes: MAX_INLINE_BYTES,
-          savedTo: path,
-          hint: "The capture is too big to inline. Use region 'viewport', or open the saved file directly.",
+          hint: "The capture is too big to inline. Use region 'viewport'.",
         };
       }
 

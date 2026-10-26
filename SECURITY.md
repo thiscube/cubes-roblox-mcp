@@ -33,8 +33,8 @@ Every route runs all four before doing any work (`src/bridge.ts`, `guard()`):
    CORS-"simple" and can be sent without a preflight. Requiring JSON forces a
    preflight that this server never answers.
 4. **A bearer token.** Persisted at `$CUBES_MCP_HOME/token` (0600), created on
-   first run and printed to stderr that once. Compared
-   with `timingSafeEqual`.
+   first run. Only its location and last four characters are printed to stderr,
+   because MCP clients keep stderr in their logs. Compared with `timingSafeEqual`.
 
 Check 1 is the one carrying the most weight on the WebSocket, because **a
 WebSocket is not subject to CORS at all**. Any page on any site can open one to
@@ -57,7 +57,7 @@ the value, not a prefix, not a length — and there is deliberately no breakdown
 ## What this does not protect against
 
 **Any other program running as you.** A local process can read the token from
-this server's stderr, or from `CUBES_MCP_TOKEN` in your environment, and then do
+the token file, the installed plugin file, or `CUBES_MCP_TOKEN` in your environment, and then do
 anything the plugin can do. Loopback plus a token stops web pages and other
 users; it does not stop code you have already chosen to run.
 
@@ -75,6 +75,10 @@ Write-class tools are gated behind the *Allow writes* toggle in the Studio panel
 The plugin reports it on every poll, and a poll that omits the field means OFF —
 a reconnecting plugin never inherits the previous session's toggle.
 
+The toggle is tracked **per Studio window**. A command addressed to one window
+uses that window's toggle. An unaddressed command can be picked up by whichever
+window polls first, so it needs every connected window to have writes ON.
+
 Whether a tool is write-class is **derived from how it reaches Studio**, not from
 a label someone remembered to type. See CLAUDE.md. This matters here because the
 one time it was labelled rather than derived, `script_edit` overwrote script
@@ -88,7 +92,7 @@ relays it.
 ## Running it read-only
 
 `--read-only`, or `CUBES_MCP_READ_ONLY=1`. Every write-class tool is removed from
-the process: `mutate`, `run_code` and 50 specialists are not registered, cannot
+the process: `mutate`, `run_code` and 67 specialists are not registered, cannot
 be called by name, cannot be found by `search_tools`. `/rpc` refuses writes
 whatever the Studio panel says, and `send()` refuses them at the transport too.
 
@@ -159,6 +163,29 @@ arbitrary file write), and a group- or world-readable file is refused outright
 rather than repaired — by the time we notice, whatever could read it already
 has. If it cannot be written safely the token stays in memory for that run and
 startup says so.
+
+New files are written to a random temp name opened with `wx` (exclusive create,
+so it can never follow a symlink) and renamed into place. The directory is
+checked too:
+
+| Check | POSIX | Windows |
+|---|---|---|
+| Token file is a symlink | refused | refused |
+| `CUBES_MCP_HOME` is a symlink or junction | refused | refused |
+| Token file readable by group/others | refused | **not checked** (no mode bits) |
+| Token file owned by someone else | refused | **not checked** |
+| `CUBES_MCP_HOME` writable by group/others, or owned by someone else | refused | **not checked** |
+| `CUBES_MCP_HOME` outside the user profile | — | warning on startup |
+
+On Windows the file's owner and ACL are not read: that needs a native
+dependency or a subprocess. The default `%USERPROFILE%\.cubesmcp` is private to
+your account, so this only matters if you point `CUBES_MCP_HOME` at a shared
+folder — which is what the warning is for. Don't, or use `CUBES_MCP_TOKEN`.
+
+`npm run setup` bakes the token into the installed plugin file, which is a second
+copy of the secret. It is written 0600 (Windows ignores the mode; the plugins
+folder is under your per-user `%LOCALAPPDATA%`). On macOS it lives under
+`~/Documents`, which iCloud Drive may sync, and setup warns about that.
 
 On the WebSocket upgrade only, it may also travel as `?token=` in the URL,
 because Roblox's WebSocket client cannot be relied on to set custom headers. That

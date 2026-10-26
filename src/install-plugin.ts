@@ -12,11 +12,13 @@
  *     only the name counts.
  *   - bakes the bridge token into the installed copy, so nobody pastes it. The
  *     plugin cannot read files and the protocol has no token handoff, which used
- *     to make the human the courier. The installed file lives in the same user's
- *     profile as the token file itself, so this moves the secret nowhere new.
+ *     to make the human the courier. That does copy the secret to a second
+ *     place, so the file is written 0600 (owner only; Windows ignores the mode,
+ *     and %LOCALAPPDATA% is per-user already). On macOS the plugins folder is
+ *     under ~/Documents, which iCloud Drive may sync, so setup warns about that.
  */
 
-import { mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -159,7 +161,13 @@ export async function installPlugin(
     for (const name of removed) await rm(join(dir, name), { force: true });
 
     const target = join(dir, PLUGIN_FILENAME);
-    await writeFile(target, model, "utf8");
+    // Owner-only: with the token baked in this file is as secret as the token file.
+    await writeFile(target, model, { encoding: "utf8", mode: 0o600 });
+    if ((opts.platform ?? process.platform) !== "win32") await chmod(target, 0o600);
+    const underDocuments =
+      tokenBaked &&
+      (opts.platform ?? process.platform) === "darwin" &&
+      resolve(target).startsWith(join(homedir(), "Documents") + "/");
     return {
       ok: true,
       installedTo: target,
@@ -167,7 +175,11 @@ export async function installPlugin(
       tokenBaked,
       message:
         `Installed ${PLUGIN_FILENAME} to ${target}. Restart Roblox Studio: plugins are cached ` +
-        `at launch, so a running Studio will not pick this up.`,
+        `at launch, so a running Studio will not pick this up.` +
+        (underDocuments
+          ? ` Note: this file holds the bridge token and sits under ~/Documents, which iCloud Drive ` +
+            `may sync to other devices. Turn off Desktop & Documents sync if you don't want that.`
+          : ""),
     };
   } catch (err) {
     return {

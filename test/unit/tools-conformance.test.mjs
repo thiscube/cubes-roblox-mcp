@@ -166,7 +166,9 @@ describe("every tool, on plausible arguments", () => {
   test("every write-class tool that edits the DataModel takes one undo waypoint", async () => {
     // A change without a waypoint cannot be undone, which is the single most
     // user-hostile thing a Studio tool can do.
-    const MUTATING = /:Destroy\(\)|\.Parent\s*=|Instance\.new|:PivotTo|:FillBlock|:FillBall|:FillCylinder|:WriteVoxels|:Clear\(\)/;
+    // `\.Parent\s*=(?!=)`: a comparison (`d.Parent == root`) is not an assignment.
+    const MUTATING = /:Destroy\(\)|\.Parent\s*=(?!=)|Instance\.new|:PivotTo|:FillBlock|:FillBall|:FillCylinder|:WriteVoxels|:Clear\(\)/;
+    const TRANSIENT_EVAL = new Set(["docs_defaults"]);
     const missing = [];
     for (const tool of ALL_TOOLS) {
       if (tool.channel !== "eval" || !capabilities(tool).write) continue;
@@ -175,6 +177,10 @@ describe("every tool, on plausible arguments", () => {
       // `undo: "none"` is the declared exception, for scaffolding that
       // deliberately stays out of the user's edit history.
       if (tool.undo === "none") continue;
+      // Eval tools are all write-class (the bridge gates eval), so read-class no
+      // longer exempts the ones that only read. docs_defaults builds an Instance
+      // it never parents and destroys at once: nothing lands in the DataModel.
+      if (TRANSIENT_EVAL.has(tool.name)) continue;
       if (MUTATING.test(luau) && !/ChangeHistoryService|__MCP\.waypoint/.test(luau)) {
         missing.push(tool.name);
       }

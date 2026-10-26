@@ -189,11 +189,13 @@ function byRelevance<T>(
   extra?: (a: T, b: T) => number,
 ): T[] {
   return items
-    .map((item, i) => ({ item, name: nameOf(item), i }))
+    // Rank once per item, not twice per comparison (each one lowercases the name).
+    .map((item, i) => {
+      const name = nameOf(item);
+      return { item, name, i, rank: matchRank(name, query) };
+    })
     .sort((a, b) => {
-      const ra = matchRank(a.name, query);
-      const rb = matchRank(b.name, query);
-      if (ra !== rb) return ra - rb;
+      if (a.rank !== b.rank) return a.rank - b.rank;
       if (extra) {
         const e = extra(a.item, b.item);
         if (e !== 0) return e;
@@ -526,7 +528,6 @@ export const DOCS_TOOLS: ToolEntry[] = [
       category: "docs",
       subcategories: ["reference", "api", "lookup"],
       keywords: ["docs", "default", "defaults", "initial", "value", "starting", "api", "property"],
-      readOnly: "transient",
       description:
         "Read a class's default property values off a fresh Instance.new in Studio. The API dump carries types but no defaults, so this is the only honest source. The instance is never parented and is destroyed straight away.",
       inputSchema: {

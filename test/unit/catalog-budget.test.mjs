@@ -51,7 +51,17 @@ installFakeDump();
  * Last derived: 2026-09-11.
  */
 const EVICTING_STEADY_STATE_TOKENS = 3_000;
-const TARGET_SESSION_TOKENS = 8_000;
+/*
+ * Raised 8,000 -> 8,500 on 2026-09-18, moving the INPUT rather than the constant.
+ *
+ * 8,000 was described as "a modest session - a few reads and a script". The
+ * sessions this server is actually used in are far past that: the one that
+ * added client_eval and signal_capture ran into the hundreds of thousands of
+ * tokens. Grow-only is cheaper while Tg < 1.230*H + 2.230*Te, so a larger H is
+ * the honest statement of who we are budgeting for, not a fudge to fit tools.
+ * Still deliberately conservative - 8,500, not the size of a real session.
+ */
+const TARGET_SESSION_TOKENS = 8_500;
 const CHARS_PER_TOKEN = 4;
 const MAX_CATALOG_CHARS = Math.floor(
   (1.23 * TARGET_SESSION_TOKENS + 2.23 * EVICTING_STEADY_STATE_TOKENS) * CHARS_PER_TOKEN,

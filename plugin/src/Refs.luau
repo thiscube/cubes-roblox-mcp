@@ -11,6 +11,19 @@ Refs.refs = {} -- ref string -> Instance
 Refs.byInst = {} -- Instance -> ref string
 Refs._counter = 0
 
+-- Per-load nonce, so a ref minted by an earlier plugin load can never resolve
+-- to an instance in this one (p3 from load A must not become p3 in load B).
+-- Letters only: the server's REF_TOKEN shape is /^[a-z]+\d+$/ (src/safety.ts).
+local NONCE_LEN = 4
+local nonceRng = Random.new()
+local nonceChars = table.create(NONCE_LEN)
+for i = 1, NONCE_LEN do
+	nonceChars[i] = string.char(nonceRng:NextInteger(97, 122))
+end
+Refs.nonce = table.concat(nonceChars)
+-- Shape of any ref this plugin mints, from any load: kind letter, nonce, counter.
+local REF_SHAPE = "^[pfsmx]" .. string.rep("%l", NONCE_LEN) .. "%d+$"
+
 -- Both directions of the ref map are weak so deleted instances (deleted in
 -- Studio, not via mutate) can be GC'd. With weak values on refs and weak keys
 -- on byInst, GC removes both entries together — tokens for dead instances
@@ -30,7 +43,7 @@ function Refs.refFor(inst)
 	elseif inst:IsA("Folder") then prefix = "f"
 	elseif inst:IsA("Model") then prefix = "m"
 	else prefix = "x" end
-	local ref = prefix .. tostring(Refs._counter)
+	local ref = prefix .. Refs.nonce .. tostring(Refs._counter)
 	Refs.refs[ref] = inst
 	Refs.byInst[inst] = ref
 	return ref
@@ -58,13 +71,18 @@ function Refs.resolve(token)
 	if Refs.refs[token] then
 		return Refs.refs[token]
 	end
+	-- A ref-shaped token that isn't ours is from an earlier load (or dead): refuse.
+	if string.match(token, REF_SHAPE) then
+		return nil
+	end
 	local node = game
 	for part in string.gmatch(token, "[^%.]+") do
 		if part ~= "game" and part ~= "DataModel" then
 			local nxt = node:FindFirstChild(part)
 			if not nxt and node == game then
-				local ok, svc = pcall(game.GetService, game, part)
-				if ok then
+				-- FindService, not GetService: resolving a path must never create a service.
+				local ok, svc = pcall(game.FindService, game, part)
+				if ok and svc then
 					nxt = svc
 				end
 			end
@@ -121,6 +139,9 @@ function Refs.resolveWithSuggestions(token)
 	if Refs.refs[token] then
 		return { ok = true, instance = Refs.refs[token] }
 	end
+	if string.match(token, REF_SHAPE) then
+		return { ok = false, suggestions = {}, lastFoundPath = "", failedSegment = token, refDead = true }
+	end
 
 	local node = game
 	local lastFound = node
@@ -130,8 +151,9 @@ function Refs.resolveWithSuggestions(token)
 		if part ~= "game" and part ~= "DataModel" then
 			local nxt = node:FindFirstChild(part)
 			if not nxt and node == game then
-				local ok, svc = pcall(game.GetService, game, part)
-				if ok then
+				-- FindService, not GetService: resolving a path must never create a service.
+				local ok, svc = pcall(game.FindService, game, part)
+				if ok and svc then
 					nxt = svc
 				end
 			end

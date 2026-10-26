@@ -16,7 +16,8 @@ second place to look is a second place to be wrong.
 | `CUBES_MCP_OFFLINE` | unset | `1` forbids the API-dump download. |
 | `CUBES_MCP_SOURCEMAP` | autodetect | Path to a Rojo `sourcemap.json`. |
 | `CUBES_MCP_LINT_CWD` | repo root | Directory holding your `selene.toml`. |
-| `CUBES_MCP_OPEN_CLOUD_KEY` | unset | Open Cloud API key. Only `asset_upload` needs it. |
+| `CUBES_MCP_SELENE` | first absolute `PATH` entry | Absolute path to the selene binary. |
+| `CUBES_MCP_OPEN_CLOUD_KEY` | unset | Open Cloud API key. `asset_upload`, `analytics_query` and `list_player_saves` need it. |
 | `CUBES_MCP_UPLOAD_ROOT` | working directory | The only directory `asset_upload` reads from and `mesh_export` / `mesh_import` use. |
 | `CUBES_MCP_ALLOW_UNAUTHENTICATED` | unset | `1` disables the bridge token. Unsafe. |
 
@@ -55,17 +56,21 @@ open at once — one server, one port, one Studio each.
 
 ## `CUBES_MCP_TOKEN`
 
-Without it, a token is created on first run, written to `$CUBES_MCP_HOME/token`
-at mode 0600, and printed to stderr that once:
+Without it, a token is created on first run and written to `$CUBES_MCP_HOME/token`
+at mode 0600. The token itself is never printed, because MCP clients keep stderr
+in their logs; startup shows where it is and its last four characters:
 
 ```
-[cubes-mcp] bridge token: 9f2c…
-[cubes-mcp] paste this into the Cubes MCP panel in Studio. It is saved to
-[cubes-mcp] ~/.cubesmcp/token and will not change on restart.
+[cubes-mcp] new bridge token (...9f2c) saved to ~/.cubesmcp/token.
+[cubes-mcp] npm run setup bakes it into the plugin; to paste it by hand, copy it from that file.
 ```
 
-Later runs load the same value and do not re-echo it. So you paste it into the
-Studio panel once, not once per restart. Set the variable instead if you would
+`npm run setup` bakes it into the plugin, so usually there is nothing to paste.
+If you do paste it into the Studio panel, read it from the file
+(`cat ~/.cubesmcp/token`, or `type %USERPROFILE%\.cubesmcp\token` on Windows).
+It does not change on restart, so that is a one-time step. If the token cannot be
+saved it lives in memory for that run only and is not shown at all; set
+`CUBES_MCP_TOKEN` instead. Set the variable instead if you would
 rather keep the token out of `$CUBES_MCP_HOME` entirely — an env token is never
 written to disk. Any long random string works;
 it is compared byte for byte.
@@ -80,7 +85,7 @@ wins.
 
 `1`, `true`, or the `--read-only` flag. The server reports itself as
 `cubes-roblox-mcp-inspector` so the client can tell which build it got, and
-`tools/list` is `search_tools`, `read`, `screenshot` plus 28 inspector-safe specialists.
+`tools/list` is `search_tools`, `read`, `screenshot` plus 17 inspector-safe specialists. Every eval-channel tool counts as a write, even one whose Luau only reads, because the bridge refuses `eval` with writes off.
 
 Use it when you want a model looking at a place it must not touch.
 
@@ -127,11 +132,21 @@ points at the directory holding yours.
 If selene is not installed, or no config is found, linting is off and the server
 says so once at startup. Nothing else changes.
 
+## `CUBES_MCP_SELENE`
+
+Absolute path to the selene binary. Unset, the server takes the first absolute
+`PATH` entry that has it; it never spawns the bare name, so a `selene.exe` in the
+lint directory cannot run instead. A relative or missing path turns linting off.
+
 ## `CUBES_MCP_OPEN_CLOUD_KEY`
 
-Only `asset_upload` reads it. Searching the Creator Store, reading asset details
+Of the asset tools, only `asset_upload` reads it. Searching the Creator Store, reading asset details
 and fetching thumbnails all use public endpoints and need no credentials, which
 is deliberate: the part people actually want works the moment they install.
+
+`analytics_query` (needs `universe.analytics:read`) and `list_player_saves`
+(DataStore list access) read it too. On Windows, when the server started before
+the variable was set, they fall back to the value in `HKCU\Environment`.
 
 Create a key at https://create.roblox.com/dashboard/credentials with the asset
 write scope.

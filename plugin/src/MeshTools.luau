@@ -10,11 +10,13 @@
 -- The wire format is flat arrays, one entry per vertex: positions {x,y,z,...},
 -- normals {x,y,z,...}, colors {r,g,b,...} in 0..1, and indices {a,b,c,...} (0-based)
 -- with counter-clockwise front faces. The server turns that into OBJ or GLB.
+-- mesh_bake can instead reply with base64 float32/uint32 strings (see packF32).
 
 local AssetService = game:GetService("AssetService")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 
 local Refs = require(script.Parent.Refs)
+local Serialize = require(script.Parent.Serialize)
 
 local MeshTools = {}
 
@@ -25,6 +27,68 @@ local CYLINDER_SEGMENTS = 20
 
 local function round(n)
 	return math.round(n * 10000) / 10000
+end
+
+-- Compact wire encoding (args.encoding == "f32b64"): each array becomes one
+-- base64 string of float32 (uint32 for indices) little-endian values: a flat
+-- 5.33 bytes per value, about 22% smaller than the JSON on a real bake. The 4-decimal rounding still happens first; the
+-- server re-rounds after widening, so values match the JSON path exactly for
+-- |x| < 1024 (float32's half-ulp is below 0.00005 there).
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local B64_BYTES = table.create(64)
+for i = 1, 64 do
+	B64_BYTES[i - 1] = string.byte(B64, i)
+end
+
+-- Encoded straight into an output buffer: no per-chunk strings to concat.
+local function base64Lua(src: buffer): string
+	local len = buffer.len(src)
+	local out = buffer.create(((len + 2) // 3) * 4)
+	local o = 0
+	local full = len - len % 3
+	for i = 0, full - 1, 3 do
+		local n = bit32.bor(bit32.lshift(buffer.readu8(src, i), 16), bit32.lshift(buffer.readu8(src, i + 1), 8), buffer.readu8(src, i + 2))
+		buffer.writeu8(out, o, B64_BYTES[bit32.rshift(n, 18)])
+		buffer.writeu8(out, o + 1, B64_BYTES[bit32.band(bit32.rshift(n, 12), 63)])
+		buffer.writeu8(out, o + 2, B64_BYTES[bit32.band(bit32.rshift(n, 6), 63)])
+		buffer.writeu8(out, o + 3, B64_BYTES[bit32.band(n, 63)])
+		o += 4
+	end
+	local rest = len - full
+	if rest > 0 then
+		local n = bit32.lshift(buffer.readu8(src, full), 16)
+		if rest == 2 then n = bit32.bor(n, bit32.lshift(buffer.readu8(src, full + 1), 8)) end
+		buffer.writeu8(out, o, B64_BYTES[bit32.rshift(n, 18)])
+		buffer.writeu8(out, o + 1, B64_BYTES[bit32.band(bit32.rshift(n, 12), 63)])
+		buffer.writeu8(out, o + 2, if rest == 2 then B64_BYTES[bit32.band(bit32.rshift(n, 6), 63)] else 61)
+		buffer.writeu8(out, o + 3, 61)
+	end
+	return buffer.tostring(out)
+end
+
+-- EncodingService:Base64Encode (buffer -> buffer) when this Studio has it.
+local function base64(src: buffer): string
+	local ok, res = pcall(function()
+		return buffer.tostring(game:GetService("EncodingService"):Base64Encode(src))
+	end)
+	if ok and type(res) == "string" then return res end
+	return base64Lua(src)
+end
+
+local function packF32(list): string
+	local b = buffer.create(#list * 4)
+	for i, v in list do
+		buffer.writef32(b, (i - 1) * 4, v)
+	end
+	return base64(b)
+end
+
+local function packU32(list): string
+	local b = buffer.create(#list * 4)
+	for i, v in list do
+		buffer.writeu32(b, (i - 1) * 4, v)
+	end
+	return base64(b)
 end
 
 -- Accumulates one mesh in a space given by `origin` (a CFrame).
@@ -56,19 +120,26 @@ local function newSink(origin)
 	end
 
 	-- Raw world-space vertices with per-vertex world normals.
+	-- Direct index writes: the arrays reach ~1.35M entries each, and every
+	-- table.insert is a call. Colour is per call, so it is rounded once.
 	function sink.vertices(points, normals, color)
+		local P, N, C = sink.positions, sink.normals, sink.colors
+		local cr, cg, cb = round(color.R), round(color.G), round(color.B)
 		for i, p in points do
 			local m = origin:PointToObjectSpace(p)
 			local n = origin:VectorToObjectSpace(normals[i])
-			table.insert(sink.positions, round(m.X)); table.insert(sink.positions, round(m.Y)); table.insert(sink.positions, round(m.Z))
-			table.insert(sink.normals, round(n.X)); table.insert(sink.normals, round(n.Y)); table.insert(sink.normals, round(n.Z))
-			table.insert(sink.colors, round(color.R)); table.insert(sink.colors, round(color.G)); table.insert(sink.colors, round(color.B))
+			local k = sink.count * 3
+			P[k + 1] = round(m.X); P[k + 2] = round(m.Y); P[k + 3] = round(m.Z)
+			N[k + 1] = round(n.X); N[k + 2] = round(n.Y); N[k + 3] = round(n.Z)
+			C[k + 1] = cr; C[k + 2] = cg; C[k + 3] = cb
 			sink.count += 1
 		end
 	end
 
 	function sink.triangle(i0, i1, i2)
-		table.insert(sink.indices, i0); table.insert(sink.indices, i1); table.insert(sink.indices, i2)
+		local I = sink.indices
+		local k = #I
+		I[k + 1] = i0; I[k + 2] = i1; I[k + 3] = i2
 	end
 
 	return sink
@@ -204,43 +275,49 @@ local function addMeshPart(sink, part)
 	if not ok or not em then
 		return "mesh is not readable here (only meshes you own or Roblox's can be opened)"
 	end
-	local faces = em:GetFaces()
-	local lo, hi = Vector3.new(math.huge, math.huge, math.huge), Vector3.new(-math.huge, -math.huge, -math.huge)
-	for _, v in em:GetVertices() do
-		local p = em:GetPosition(v)
-		lo = lo:Min(p); hi = hi:Max(p)
-	end
-	local meshCenter, meshSize = (lo + hi) / 2, hi - lo
-	local scale = Vector3.new(
-		meshSize.X > 1e-6 and part.Size.X / meshSize.X or 1,
-		meshSize.Y > 1e-6 and part.Size.Y / meshSize.Y or 1,
-		meshSize.Z > 1e-6 and part.Size.Z / meshSize.Z or 1
-	)
-	local cf, color = part.CFrame, part.Color
-	for _, face in faces do
-		local ids = em:GetFaceVertices(face)
-		if #ids == 3 then
-			local pts = {}
-			for i, id in ids do
-				pts[i] = cf:PointToWorldSpace((em:GetPosition(id) - meshCenter) * scale)
-			end
-			local flat = (pts[2] - pts[1]):Cross(pts[3] - pts[1])
-			if flat.Magnitude > 1e-12 then
-				local normalIds = em:GetFaceNormals(face)
-				local ns = {}
-				for i = 1, 3 do
-					local n = normalIds[i] and em:GetNormal(normalIds[i])
-					-- Non-uniform scale bends normals: n / scale, renormalised.
-					ns[i] = n and cf:VectorToWorldSpace((n / scale).Unit) or flat.Unit
-				end
-				local base = sink.count
-				sink.vertices(pts, ns, color)
-				sink.triangle(base, base + 1, base + 2)
-			end
+	-- pcall the bake so em:Destroy() runs on every path, error or not.
+	local okBake, bakeErr = pcall(function()
+		local faces = em:GetFaces()
+		local lo, hi = Vector3.new(math.huge, math.huge, math.huge), Vector3.new(-math.huge, -math.huge, -math.huge)
+		for _, v in em:GetVertices() do
+			local p = em:GetPosition(v)
+			lo = lo:Min(p); hi = hi:Max(p)
 		end
-		if sink.count > MAX_VERTICES then break end
-	end
+		local meshCenter, meshSize = (lo + hi) / 2, hi - lo
+		local scale = Vector3.new(
+			meshSize.X > 1e-6 and part.Size.X / meshSize.X or 1,
+			meshSize.Y > 1e-6 and part.Size.Y / meshSize.Y or 1,
+			meshSize.Z > 1e-6 and part.Size.Z / meshSize.Z or 1
+		)
+		local cf, color = part.CFrame, part.Color
+		for _, face in faces do
+			local ids = em:GetFaceVertices(face)
+			if #ids == 3 then
+				local pts = {}
+				for i, id in ids do
+					pts[i] = cf:PointToWorldSpace((em:GetPosition(id) - meshCenter) * scale)
+				end
+				local flat = (pts[2] - pts[1]):Cross(pts[3] - pts[1])
+				if flat.Magnitude > 1e-12 then
+					local normalIds = em:GetFaceNormals(face)
+					local ns = {}
+					for i = 1, 3 do
+						local n = normalIds[i] and em:GetNormal(normalIds[i])
+						-- Non-uniform scale bends normals: n / scale, renormalised.
+						ns[i] = n and cf:VectorToWorldSpace((n / scale).Unit) or flat.Unit
+					end
+					local base = sink.count
+					sink.vertices(pts, ns, color)
+					sink.triangle(base, base + 1, base + 2)
+				end
+			end
+			if sink.count > MAX_VERTICES then break end
+		end
+	end)
 	em:Destroy()
+	if not okBake then
+		error(bakeErr, 0)
+	end
 	return nil
 end
 
@@ -252,7 +329,7 @@ local SHAPES = {
 	[Enum.PartType.CornerWedge] = addCornerWedge,
 }
 
--- plugin command mesh_bake: { target } -> (true, mesh) | (false, error)
+-- plugin command mesh_bake: { target, encoding? } -> (true, mesh) | (false, error)
 function MeshTools.bake(args)
 	local root = Refs.resolve(args.target)
 	if not root then
@@ -317,19 +394,37 @@ function MeshTools.bake(args)
 	local center = origin.Position + mid
 	local extents = hi - lo
 
-	return true, {
+	-- The bridge rejects bodies over 8 MB, and finding that out costs a full
+	-- encode plus upload. Deliberately a low estimate (position ~8 bytes with
+	-- its comma, normal ~7, colour ~6, index ~7) so it only refuses what is
+	-- surely over; anything borderline still goes through the 413 path.
+	-- The compact form is exact: 4 bytes per value, times 4/3 for base64.
+	local compact = args.encoding == "f32b64"
+	local estimate = if compact
+		then (sink.count * 9 + #sink.indices) * 4 * 4 // 3
+		else sink.count * (3 * 8 + 3 * 7 + 3 * 6) + #sink.indices * 7
+	if estimate > 8 * 1024 * 1024 then
+		return false, {
+			code = "result_too_large",
+			message = "About " .. math.floor(estimate / 1048576) .. " MB of mesh data (" .. sink.count .. " vertices); the limit is 8 MB. Export a smaller part of it.",
+		}
+	end
+
+	-- Every field is numbers/strings already: skip Serialize.deep's copy.
+	return true, Serialize.jsonSafe({
 		name = root.Name,
-		positions = sink.positions,
-		normals = sink.normals,
-		colors = sink.colors,
-		indices = sink.indices,
+		encoding = if compact then "f32b64" else nil,
+		positions = if compact then packF32(sink.positions) else sink.positions,
+		normals = if compact then packF32(sink.normals) else sink.normals,
+		colors = if compact then packF32(sink.colors) else sink.colors,
+		indices = if compact then packU32(sink.indices) else sink.indices,
 		vertexCount = sink.count,
 		triangleCount = #sink.indices // 3,
 		partsConverted = converted,
 		skipped = skipped,
 		center = { round(center.X), round(center.Y), round(center.Z) },
 		size = { round(extents.X), round(extents.Y), round(extents.Z) },
-	}
+	})
 end
 
 -- plugin command mesh_build: { positions, normals?, colors?, indices, name?, parent?, position? }
@@ -359,17 +454,25 @@ function MeshTools.build(args)
 		end
 		if colors then
 			local r, g, b = colors[i * 3 + 1], colors[i * 3 + 2], colors[i * 3 + 3]
-			local key = string.format("%.3f,%.3f,%.3f", r, g, b)
+			-- Numeric key at 1e-3 steps for in-range colours (no string per
+			-- vertex); anything outside 0..1 keeps the old string key.
+			local key
+			if r >= 0 and r <= 1 and g >= 0 and g <= 1 and b >= 0 and b <= 1 then
+				key = (math.round(r * 1000) * 1001 + math.round(g * 1000)) * 1001 + math.round(b * 1000)
+			else
+				key = string.format("%.3f,%.3f,%.3f", r, g, b)
+			end
 			if not colorIds[key] then colorIds[key] = em:AddColor(Color3.new(r, g, b), 1) end
 			cids[i + 1] = colorIds[key]
 		end
 	end
 
 	local triangles = 0
+	local addTriangle = em.AddTriangle
 	for t = 0, #indices // 3 - 1 do
 		local a, b, c = indices[t * 3 + 1] + 1, indices[t * 3 + 2] + 1, indices[t * 3 + 3] + 1
 		if vids[a] and vids[b] and vids[c] and a ~= b and b ~= c and a ~= c then
-			local okFace, face = pcall(function() return em:AddTriangle(vids[a], vids[b], vids[c]) end)
+			local okFace, face = pcall(addTriangle, em, vids[a], vids[b], vids[c])
 			if okFace then
 				if normals then em:SetFaceNormals(face, { nids[a], nids[b], nids[c] }) end
 				if colors then em:SetFaceColors(face, { cids[a], cids[b], cids[c] }) end
@@ -386,6 +489,13 @@ function MeshTools.build(args)
 	end
 
 	local recording = ChangeHistoryService:TryBeginRecording("Cubes MCP mesh import")
+	if not recording then
+		meshPart:Destroy()
+		return false, {
+			code = "no_undo_available",
+			message = "ChangeHistoryService recording could not start; refusing to add an undoable change without undo",
+		}
+	end
 	local okParent, err = pcall(function()
 		meshPart.Name = type(args.name) == "string" and args.name ~= "" and args.name or "ImportedMesh"
 		meshPart.Anchored = true
@@ -401,9 +511,7 @@ function MeshTools.build(args)
 		end
 		meshPart.Parent = parent
 	end)
-	if recording then
-		ChangeHistoryService:FinishRecording(recording, okParent and Enum.FinishRecordingOperation.Commit or Enum.FinishRecordingOperation.Cancel)
-	end
+	ChangeHistoryService:FinishRecording(recording, okParent and Enum.FinishRecordingOperation.Commit or Enum.FinishRecordingOperation.Cancel)
 	if not okParent then
 		meshPart:Destroy()
 		return false, { code = "mesh_part_failed", message = tostring(err) }

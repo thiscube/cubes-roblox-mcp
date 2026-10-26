@@ -9,7 +9,7 @@ local Config = {}
 
 -- Human-facing version string (shown in the status panel). Bump when shipping
 -- a noticeable plugin change. Independent from PROTOCOL_VERSION below.
-Config.VERSION = "0.3.0"
+Config.VERSION = "0.3.1"
 
 Config.DEFAULT_PORT = 44820
 Config.HOST_NAME = "localhost"

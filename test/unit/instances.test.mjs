@@ -292,8 +292,10 @@ describe("tags", () => {
   }
 
   test("reading is read-class and writing is not", () => {
-    assert.equal(capabilities(find).write, false, "tags_find must survive the read-only build");
-    assert.equal(capabilities(find).inspectorSafe, true);
+    // tags_find only reads, but it runs on the eval channel, which the bridge
+    // refuses with writes off; so it is write-class and leaves the read-only build.
+    assert.equal(capabilities(find).write, true, "eval-channel tools are gated like writes");
+    assert.equal(capabilities(find).inspectorSafe, false);
     assert.equal(capabilities(set).write, true, "AddTag/RemoveTag mutate the place");
     assert.equal(capabilities(set).inspectorSafe, false);
   });

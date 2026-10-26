@@ -43,7 +43,11 @@ if _RS:IsRunning() then
 		task.spawn(function() PlaytestBus.startServerBus() end)
 		print("[Cubes MCP] play-DM Server clone; cross-DM bus active")
 	else
-		print("[Cubes MCP] play-DM Client clone; idle")
+		-- Client-side play DM. Camera, GUI and every render-time signal live
+		-- only here, so this context runs its own bus for client_eval/capture.
+		local PlaytestBus = require(script.PlaytestBus)
+		PlaytestBus.bind(plugin)
+		task.spawn(function() PlaytestBus.startClientBus() end)
 	end
 	return
 end

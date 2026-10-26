@@ -182,9 +182,18 @@ export const SESSION_TOOLS: ToolEntry[] = [
     async (args, ctx) => {
       const name = String(args.name ?? "").trim();
       if (!name) return { error: "bad_args", hint: "macro_save needs a 'name'." };
-      const ops = Array.isArray(args.ops)
-        ? (args.ops as unknown[])
-        : ctx.memory.opsFromHistory(typeof args.from_last === "number" ? args.from_last : 10);
+      let ops: unknown[];
+      try {
+        ops = Array.isArray(args.ops)
+          ? (args.ops as unknown[])
+          : ctx.memory.opsFromHistory(typeof args.from_last === "number" ? args.from_last : 10);
+      } catch (err) {
+        return {
+          error: "macro_truncated",
+          message: err instanceof Error ? err.message : String(err),
+          hint: "Nothing was saved. Pass `ops` explicitly.",
+        };
+      }
       if (ops.length === 0) {
         return {
           error: "empty_macro",
@@ -230,7 +239,16 @@ export const SESSION_TOOLS: ToolEntry[] = [
       // destructiveness gate + script-source lint as a normal mutate call.
       // Calling bridge.send("mutate", ...) directly would let a saved macro with
       // a delete op or Source overwrite execute without confirm: true.
-      const result = await ctx.handleMutate({ ops: macro.ops, confirm: args.confirm === true });
+      // handleMutate asks the human itself whenever the client can elicit, so a
+      // forwarded confirm: true only counts where elicitation is unavailable.
+      const result = (await ctx.handleMutate({ ops: macro.ops, confirm: args.confirm === true })) as
+        | Record<string, unknown>
+        | undefined;
+      // Surface an inner failure at the top level, so it reads as an error and
+      // not as a successful run that happens to carry one.
+      if (result && typeof result === "object" && "error" in result && result.error) {
+        return { error: result.error, ran: name, opCount: macro.opCount, result };
+      }
       return { ran: name, opCount: macro.opCount, result };
     },
   ),
