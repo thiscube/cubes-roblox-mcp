@@ -34,6 +34,94 @@ local _STS_lastResult = nil
 -- them (play → stop → play race; old coroutine resumes after new one started).
 local _STS_gen = 0
 
+-- Closing a session is asynchronous: playtest_stop asks the play DM to call
+-- EndTest, and Studio then takes a few seconds to tear it down. Starting the
+-- next test inside that window wedges StudioTestService ("Failed to start the
+-- test because a previous one is still in progress") until Studio restarts,
+-- so stop waits for the close, and play waits for one still in progress.
+-- The last moment a play session was seen up or closing (os.clock()).
+local _STS_lastSeenAt = nil
+-- When the last stop was asked for (os.clock()).
+local _STS_stopAskedAt = nil
+-- Set by playtest_stop until the stopped session's bus goes quiet, so a session
+-- that is only closing isn't adopted as "attached".
+local _STS_closing = false
+-- After the play DM goes quiet, Studio is still tearing it down for a moment.
+local CLOSE_SETTLE_SECONDS = 3
+-- How long stop and play wait for a session to close before giving up.
+local CLOSE_WAIT_SECONDS = 12
+-- A stop request nobody reads within this long has no session to stop (a
+-- starting session's bus comes up well inside it; see the play watchdog).
+local ORPHAN_STOP_SECONDS = 10
+-- How long play watches for StudioTestService refusing to start at all.
+local START_CHECK_SECONDS = 1.5
+
+-- Whether a play session is up or still closing; remembers when it last was.
+local function sessionBusy()
+	local busy = PlaytestBus.isAnyLive()
+	if not busy and PlaytestBus.isStopPending() then
+		if _STS_stopAskedAt and os.clock() - _STS_stopAskedAt < ORPHAN_STOP_SECONDS then
+			busy = true
+		else
+			PlaytestBus.clearStop()
+		end
+	end
+	if busy then
+		_STS_lastSeenAt = os.clock()
+	end
+	return busy
+end
+
+-- Waits until no session is up or closing and Studio has had
+-- CLOSE_SETTLE_SECONDS to finish tearing the last one down. Returns whether
+-- it's safe to start a test (false once timeoutSec runs out).
+local function waitUntilClosed(timeoutSec)
+	local deadline = os.clock() + timeoutSec
+	while true do
+		if not sessionBusy() then
+			local seenAt = _STS_lastSeenAt
+			if not seenAt or os.clock() - seenAt >= CLOSE_SETTLE_SECONDS then
+				return true
+			end
+		end
+		if os.clock() >= deadline then
+			return false
+		end
+		task.wait(0.1)
+	end
+end
+
+local PREVIOUS_TEST_CLOSING = {
+	code = "previous_test_closing",
+	message = "The last playtest is still running or closing.",
+	hint = "Wait a few seconds and start it again; playtest_stop first if one is still running.",
+}
+
+-- Watches a just-started test for START_CHECK_SECONDS: StudioTestService
+-- refuses straight away when it's wedged, and that should be the tool's
+-- answer, not "spawning" and a silent failure. Returns the error, or nil.
+local function startRefusal()
+	local checkUntil = os.clock() + START_CHECK_SECONDS
+	while os.clock() < checkUntil and _STS_lastResult == nil and not PlaytestBus.isAnyLive() do
+		task.wait(0.05)
+	end
+	local result = _STS_lastResult
+	if type(result) ~= "table" or result.error == nil then
+		return nil
+	end
+	_STS_running = false
+	_STS_mode = "edit"
+	local message = tostring(result.error)
+	if message:find("previous one is still in progress", 1, true) then
+		return {
+			code = "studio_test_stuck",
+			message = message,
+			hint = "StudioTestService is wedged and only a Studio restart clears it: ask the user to save the place and restart Studio.",
+		}
+	end
+	return { code = "start_failed", message = message }
+end
+
 -- Live status, observed by the UI. `mode` is one of:
 --   "off"                — bridge disabled, not polling
 --   "connecting"         — polling started, no successful contact yet
@@ -58,8 +146,8 @@ Transport.status = {
 	-- The user's "Allow writes" toggle. Sent in every poll body; the server gates
 	-- every write-class command on it, and dispatch() enforces it locally too so
 	-- turning it OFF takes effect immediately instead of on the next poll.
-	-- Persisted; ON until the user turns it off.
-	writeEnabled = true,
+	-- Persisted; OFF on a fresh install until the user turns it on.
+	writeEnabled = false,
 	-- Bridge bearer token (the server's ~/.cubesmcp/token). Persisted.
 	token = "",
 	-- When true, the plugin polls but rejects every command with code "paused"
@@ -377,14 +465,21 @@ end
 -- Used while _STS_running because plugin context has no live Character; the
 -- bootstrap (running inside the play DM) does the actual work and writes back
 -- a JSON-encoded result that we re-shape into (success, value|error).
-local function forwardToBus(tool, args)
-	local id = PlaytestBus.send(tool, args)
+local function forwardToBus(tool, args, ctx)
+	local id = PlaytestBus.send(tool, args, ctx)
 	-- character_walk yields up to 10s in-bootstrap (duration up to 10), plus
 	-- transport overhead. Generous timeout (20s) + a bit for slack.
 	local timeout = 20
 	if tool == "character_walk" then
 		local dur = math.min(math.max(tonumber(args and args.duration) or 1, 0), 10)
 		timeout = dur + 10
+	elseif tool == "signal_capture" then
+		-- Blocks for the full capture window by design.
+		local dur = math.min(math.max(tonumber(args and args.duration) or 3, 0), 20)
+		timeout = dur + 15
+	elseif tool == "client_eval" then
+		-- Under the server's 30s wait, so the plugin answers bus_timeout first.
+		timeout = 25
 	elseif tool == "tune" then
 		-- tune runs arbitrary Luau in the play DM; it may task.wait. Give it the
 		-- same generous budget as a long bridge eval so a deliberate sleep in the
@@ -400,6 +495,12 @@ local function forwardToBus(tool, args)
 	end
 	if res.ok then return true, res.value end
 	return false, res.error or { code = "bus_unknown_error" }
+end
+
+-- The camera the user sees is the play client's, so view commands go there;
+-- a server-only test (Run) has no client bus, so fall back to the server.
+local function viewCtx()
+	return PlaytestBus.isLive("client") and "client" or "server"
 end
 
 -- Run one command from the server. Returns (success, resultOrErrorObject).
@@ -421,6 +522,20 @@ local function dispatch(cmd)
 		}
 	end
 
+	-- A test started from Studio's own buttons (or by another session) never
+	-- went through playtest_play, so adopt it while its server bus is up, and
+	-- let it go once nothing answers.
+	if _STS_closing and not PlaytestBus.isAnyLive() then
+		_STS_closing = false
+	end
+	if not _STS_running and not _STS_closing and PlaytestBus.isLive("server") then
+		_STS_running = true
+		_STS_mode = "attached"
+	elseif _STS_running and _STS_mode == "attached" and not PlaytestBus.isAnyLive() then
+		_STS_running = false
+		_STS_mode = "edit"
+	end
+
 	if tool == "eval" then
 		-- loadstring is available in plugin context (elevated permissions).
 		if not loadstring then
@@ -432,6 +547,10 @@ local function dispatch(cmd)
 		if not fn then
 			return false, { code = "compile_error", message = tostring(compileErr) }
 		end
+		-- Writes may have been turned off while this command waited.
+		if not Transport.status.writeEnabled then
+			return false, { code = "write_mode_disabled", message = "Writes were turned off before this eval ran." }
+		end
 		local ok, ret = pcall(fn)
 		if not ok then
 			return false, { code = "runtime_error", message = tostring(ret) }
@@ -440,6 +559,46 @@ local function dispatch(cmd)
 			ret = { __void = true }
 		end
 		return true, ret
+	elseif tool == "client_eval" or tool == "signal_capture" then
+		-- Both run in the play DM's CLIENT context. Nothing else can reach it,
+		-- and it is where the camera, the GUI and every per-frame signal are.
+		-- player picks one client of a multi-player test; without it the
+		-- first player answers.
+		local clientCtx = "client"
+		if type(args.player) == "string" and args.player ~= "" then
+			clientCtx = "client:" .. args.player
+		end
+		if not PlaytestBus.isLive(clientCtx) then
+			if clientCtx ~= "client" and PlaytestBus.isLive("client") then
+				return false, {
+					code = "no_such_player",
+					message = "no client is running for player " .. args.player .. ".",
+					players = PlaytestBus.players(),
+				}
+			end
+			return false, {
+				code = "no_playtest_client",
+				message = "no play-DM client bus is running — start a playtest first.",
+				hint = "playtest_play, then retry. If a playtest IS running, the plugin predates the client bus: rebuild and restart Studio.",
+			}
+		end
+		if tool == "client_eval" then
+			if type(args.luau) ~= "string" or args.luau == "" then
+				return false, { code = "bad_args", message = "client_eval requires a non-empty 'luau' string." }
+			end
+			return forwardToBus("client_eval", { luau = args.luau }, clientCtx)
+		end
+		if type(args.setup) ~= "string" or args.setup == "" then
+			return false, {
+				code = "bad_args",
+				message = "signal_capture requires a 'setup' chunk that RETURNS a sampler function.",
+			}
+		end
+		return forwardToBus("signal_capture", {
+			setup = args.setup,
+			duration = args.duration,
+			hz = args.hz,
+		}, clientCtx)
 	elseif tool == "tune" then
 		-- tune is `eval`, but inside the RUNNING play DM instead of the edit DM.
 		-- The edit-context plugin (this code) has no live play DataModel, so we
@@ -447,7 +606,7 @@ local function dispatch(cmd)
 		-- loadstrings + runs it and writes back a structured result.
 		-- Desync guard: if the flag thinks we're running but Studio isn't, clear it
 		-- (matches the playtest_play/stop guards) so the error below is accurate.
-		if _STS_running and not RunService:IsRunning() then
+		if _STS_running and not PlaytestBus.isLive() and not RunService:IsRunning() then
 			_STS_running = false
 			_STS_mode = "edit"
 		end
@@ -512,45 +671,95 @@ local function dispatch(cmd)
 		-- Result (when EndTest fires) is captured into a module-level slot.
 		-- Desync guard: if the flag thinks we're running but Studio isn't, clear it.
 		-- Can happen when EndTest never resumed the prior spawned coroutine.
-		if _STS_running and not RunService:IsRunning() then
+		if _STS_running and not PlaytestBus.isLive() and not RunService:IsRunning() then
 			_STS_running = false
 			_STS_mode = "edit"
 		end
 		if _STS_running then
 			return false, { code = "already_running", mode = _STS_mode }
+		end
+		-- Never start inside the last session's teardown (see CLOSE_SETTLE_SECONDS);
+		-- cleanup() below would also wipe a stop it hasn't read yet.
+		if not waitUntilClosed(CLOSE_WAIT_SECONDS) then
+			return false, PREVIOUS_TEST_CLOSING
 		end
 		-- Cross-DM bus now runs natively inside the cloned plugin's Server-DM
 		-- context (see init.server.luau): when Studio clones our plugin into the
 		-- play DM's Server context, it shares the `plugin` global, so
 		-- PlaytestBus.startServerBus() can use plugin:Get/SetSetting as the
 		-- bidirectional channel. No Script injection needed.
+		-- players 2-8: a local server with that many clients, like Studio's
+		-- Test > Clients and Servers.
+		local players = math.clamp(math.floor(tonumber(args.players) or 1), 1, 8)
 		PlaytestBus.cleanup()
+		_STS_closing = false
 		_STS_running = true
-		_STS_mode = "play"
+		_STS_mode = if players > 1 then "multiplayer" else "play"
 		_STS_lastResult = nil
 		_STS_gen += 1
 		local myGen = _STS_gen
 		task.spawn(function()
 			local ok, result = pcall(function()
+				if players > 1 then
+					return StudioTestService:ExecuteMultiplayerTestAsync(players, args.testArgs or {})
+				end
 				return StudioTestService:ExecutePlayModeAsync(args.testArgs or {})
 			end)
 			-- A newer play has superseded us (play → stop → play race). Don't
 			-- clobber state belonging to the new run.
 			if myGen ~= _STS_gen then return end
-			_STS_lastResult = ok and result or { error = tostring(result) }
-			_STS_running = false
-			_STS_mode = "edit"
+			-- Deliberately does NOT clear _STS_running: this returns when the
+			-- session STARTS, not when it ends, and clearing here raced the play
+			-- DM's first heartbeat.
+			-- Not `ok and result or ...`: a successful call that returns nil
+			-- would read as an error and make startRefusal report start_failed.
+			if ok then
+				_STS_lastResult = if type(result) == "table" then result else { value = result }
+			else
+				_STS_lastResult = { error = tostring(result) }
+			end
 		end)
-		return true, { ok = true, started = "play", spawning = true }
+		-- Liveness watchdog. ExecutePlay/RunModeAsync cannot tell us when the
+		-- session ends, so the play DM's PlaytestBus heartbeat is the only
+		-- authority. Give it time to come up, then treat sustained silence as
+		-- the session being over.
+		task.spawn(function()
+			local gen = myGen
+			-- A local server with clients takes far longer to come up than Play Solo.
+			local deadline = os.clock() + (if players > 1 then 40 else 10)
+			while _STS_gen == gen do
+				task.wait(0.5)
+				if _STS_gen ~= gen then return end
+				if PlaytestBus.isLive() then
+					deadline = os.clock() + 6
+					-- So a play right after the user stops it by hand still waits out
+					-- the teardown.
+					_STS_lastSeenAt = os.clock()
+				elseif os.clock() > deadline then
+					_STS_running = false
+					_STS_mode = "edit"
+					return
+				end
+			end
+		end)
+		local refusal = startRefusal()
+		if refusal then
+			return false, refusal
+		end
+		return true, { ok = true, started = _STS_mode, players = players, spawning = true }
 	elseif tool == "playtest_run_mode" then
-		if _STS_running and not RunService:IsRunning() then
+		if _STS_running and not PlaytestBus.isLive() and not RunService:IsRunning() then
 			_STS_running = false
 			_STS_mode = "edit"
 		end
 		if _STS_running then
 			return false, { code = "already_running", mode = _STS_mode }
 		end
+		if not waitUntilClosed(CLOSE_WAIT_SECONDS) then
+			return false, PREVIOUS_TEST_CLOSING
+		end
 		PlaytestBus.cleanup()
+		_STS_closing = false
 		_STS_running = true
 		_STS_mode = "run"
 		_STS_lastResult = nil
@@ -562,13 +771,43 @@ local function dispatch(cmd)
 			end)
 			-- Newer run has superseded us; don't clobber its state.
 			if myGen ~= _STS_gen then return end
-			_STS_lastResult = ok and result or { error = tostring(result) }
-			_STS_running = false
-			_STS_mode = "edit"
+			-- Not `ok and result or ...`: a successful call that returns nil
+			-- would read as an error and make startRefusal report start_failed.
+			if ok then
+				_STS_lastResult = if type(result) == "table" then result else { value = result }
+			else
+				_STS_lastResult = { error = tostring(result) }
+			end
 		end)
+		-- Liveness watchdog. ExecutePlay/RunModeAsync cannot tell us when the
+		-- session ends, so the play DM's PlaytestBus heartbeat is the only
+		-- authority. Give it time to come up, then treat sustained silence as
+		-- the session being over.
+		task.spawn(function()
+			local gen = myGen
+			local deadline = os.clock() + 10
+			while _STS_gen == gen do
+				task.wait(0.5)
+				if _STS_gen ~= gen then return end
+				if PlaytestBus.isLive() then
+					deadline = os.clock() + 6
+					_STS_lastSeenAt = os.clock()
+				elseif os.clock() > deadline then
+					_STS_running = false
+					_STS_mode = "edit"
+					return
+				end
+			end
+		end)
+		local refusal = startRefusal()
+		if refusal then
+			return false, refusal
+		end
 		return true, { ok = true, started = "run", spawning = true }
 	elseif tool == "playtest_stop" then
-		if not _STS_running then
+		-- A live bus means a session is up even when the flag lost track of it
+		-- (the "already_stopped while clearly running" desync), so stop that too.
+		if not _STS_running and not PlaytestBus.isAnyLive() then
 			-- Fall back to RunService:Stop for legacy RunService:Run starts (or no-op).
 			if RunService:IsRunning() then
 				pcall(function() RunService:Stop() end)
@@ -582,6 +821,9 @@ local function dispatch(cmd)
 		-- the play DM (it has the captured LogService stream). Fall through to
 		-- StudioTestService:EndTest from edit context as a belt-and-suspenders
 		-- in case the bootstrap is missing or unresponsive.
+		_STS_stopAskedAt = os.clock()
+		_STS_lastSeenAt = os.clock()
+		_STS_closing = true
 		PlaytestBus.requestStop(reason)
 		pcall(function() StudioTestService:EndTest(reason) end)
 		-- Eagerly clear flags. The spawned coroutine for ExecutePlay/RunModeAsync
@@ -593,11 +835,27 @@ local function dispatch(cmd)
 		-- Bump generation so a late-resuming spawned coroutine from the stopped
 		-- play won't clobber state for any subsequent play.
 		_STS_gen += 1
-		return true, { ok = true, ended = reason, mode = prevMode }
+		-- Return once it has really closed, so the next play can't start inside
+		-- its teardown. closed = false: it outlasted CLOSE_WAIT_SECONDS (a long
+		-- command still running in it); playtest_play waits for it again.
+		local waitStarted = os.clock()
+		local closed = waitUntilClosed(CLOSE_WAIT_SECONDS)
+		if closed then
+			_STS_closing = false
+		end
+		return true, {
+			ok = true,
+			ended = reason,
+			mode = prevMode,
+			closed = closed,
+			waitedMs = math.floor((os.clock() - waitStarted) * 1000),
+		}
 	elseif tool == "playtest_result" then
 		return true, {
 			running = _STS_running,
 			mode = _STS_mode or "edit",
+			busLive = PlaytestBus.isLive(),
+			players = if PlaytestBus.isLive() then PlaytestBus.players() else nil,
 			lastResult = _STS_lastResult,
 		}
 	elseif tool == "playtest_set_players" then
@@ -783,13 +1041,13 @@ local function dispatch(cmd)
 		if not newChar then return false, { code = "respawn_timeout", error = "respawn_timeout", hint = "Character did not spawn within 5s." } end
 		return true, { ok = true, respawned = true, characterRef = Refs.refFor(newChar) }
 	elseif tool == "viewport_capture" then
-		if _STS_running then return forwardToBus(tool, args) end
+		if _STS_running then return forwardToBus(tool, args, viewCtx()) end
 		local Viewport = require(script.Parent.Viewport)
 		local ok, ret = pcall(Viewport.capture, args.limit)
 		if not ok then return false, { code = "viewport_error", error = "viewport_error", message = tostring(ret) } end
 		return true, ret
 	elseif tool == "camera_set" then
-		if _STS_running then return forwardToBus(tool, args) end
+		if _STS_running then return forwardToBus(tool, args, viewCtx()) end
 		local Workspace = game:GetService("Workspace")
 		local camera = Workspace.CurrentCamera
 		if not camera then return false, { code = "no_camera", error = "no_camera" } end
@@ -837,7 +1095,7 @@ local function dispatch(cmd)
 			},
 		}
 	elseif tool == "raycast" then
-		if _STS_running then return forwardToBus(tool, args) end
+		if _STS_running then return forwardToBus(tool, args, viewCtx()) end
 		local Workspace = game:GetService("Workspace")
 		local origin, direction
 		if args.fromCamera then
@@ -902,34 +1160,55 @@ local function dispatch(cmd)
 	end
 end
 
-local function postResult(id, success, result, errObj)
+-- Mirrors MAX_BODY_BYTES in src/bridge.ts.
+local MAX_RESULT_BYTES = 8 * 1024 * 1024
+
+-- `target` is the { url, headers } captured when the command was polled, so a
+-- port/token change mid-dispatch can't send this result to a different server.
+local function postResult(target, id, success, result, errObj)
+	local url = target and target.url or Config.RESULT_URL
+	local headers = target and target.headers or requestHeaders()
 	local ok, err = pcall(function()
-		HttpService:RequestAsync({
-			Url = Config.RESULT_URL,
-			Method = "POST",
-			Headers = requestHeaders(),
-			Body = HttpService:JSONEncode({
-				id = id,
-				ok = success,
-				result = success and Serialize.deep(result) or nil,
-				error = errObj,
-			}),
+		local body = HttpService:JSONEncode({
+			id = id,
+			ok = success,
+			result = success and Serialize.deep(result) or nil,
+			error = errObj,
 		})
+		-- The bridge refuses bodies over 8 MB with a 413; don't upload one just
+		-- to hear that. Same error the 413 branch below produces.
+		if #body > MAX_RESULT_BYTES then
+			error({ status = 413 }, 0)
+		end
+		local response = HttpService:RequestAsync({
+			Url = url,
+			Method = "POST",
+			Headers = headers,
+			Body = body,
+		})
+		if response.StatusCode < 200 or response.StatusCode >= 300 then
+			error({ status = response.StatusCode }, 0)
+		end
 	end)
 	if ok then return end
+	local code = "post_failed"
+	if type(err) == "table" then
+		if err.status == 413 then code = "result_too_large" end
+		err = "HTTP " .. tostring(err.status)
+	end
 	-- First attempt failed (likely JSONEncode threw on a non-serializable
 	-- result, or RequestAsync itself errored). Without this, the bridge's
 	-- pending entry sits until its 30s timer fires as studio_timeout.
 	-- Best-effort fallback: tell the server the command failed.
 	local fallbackOk = pcall(function()
 		HttpService:RequestAsync({
-			Url = Config.RESULT_URL,
+			Url = url,
 			Method = "POST",
-			Headers = requestHeaders(),
+			Headers = headers,
 			Body = HttpService:JSONEncode({
 				id = id,
 				ok = false,
-				error = { code = "post_failed", message = tostring(err) },
+				error = { code = code, message = tostring(err) },
 			}),
 		})
 	end)
@@ -968,11 +1247,13 @@ end
 -- error means the long-poll timed out cleanly (server alive, just idle) —
 -- re-poll immediately.
 local function pollOnce()
+	-- Where this poll's command must answer, fixed now (see postResult).
+	local target = { url = Config.RESULT_URL, headers = requestHeaders() }
 	local ok, response = pcall(function()
 		return HttpService:RequestAsync({
 			Url = Config.POLL_URL,
 			Method = "POST",
-			Headers = requestHeaders(),
+			Headers = target.headers,
 			-- Poll body carries write-mode toggle + protocol version to the server.
 			Body = HttpService:JSONEncode({
 				writeEnabled = Transport.status.writeEnabled,
@@ -1010,16 +1291,41 @@ local function pollOnce()
 	local okDecode, cmd = pcall(function()
 		return HttpService:JSONDecode(response.Body)
 	end)
-	if not okDecode then
+	if not okDecode or type(cmd) ~= "table" then
 		return nil, "decode_failed", nil
 	end
-	return cmd, nil, nil
+	return cmd, nil, nil, target
 end
 
+-- True while a loop is dispatching a command. A loop started by setPolling
+-- (port/token change) waits on it so two commands never run at once.
+local dispatching = false
+
+local loopStep
+
 local function loop(myGen)
-	local consecutiveErrors = 0
+	local state = { consecutiveErrors = 0 }
+	while dispatching and myGen == generation do
+		task.wait(0.05)
+	end
 	while Transport.status.polling and myGen == generation do
-		local cmd, err, detail = pollOnce()
+		-- pcall: nothing in one iteration may kill the loop thread, or the panel
+		-- says "polling" while nothing polls.
+		local okStep, stepErr = pcall(loopStep, myGen, state)
+		if not okStep then
+			dispatching = false
+			Transport.status.busy = false
+			warn("[Cubes MCP] poll loop error: " .. tostring(stepErr))
+			task.wait(Config.ERROR_WAIT)
+		elseif stepErr == "break" then
+			break
+		end
+	end
+end
+
+loopStep = function(myGen, state)
+	do
+		local cmd, err, detail, target = pollOnce()
 		-- Generation may have advanced WHILE pollOnce was in flight (e.g., a
 		-- plugin reload or mode transition spawned a new loop). If so, drop
 		-- whatever this stale loop picked up — the new loop owns the bridge now.
@@ -1027,12 +1333,13 @@ local function loop(myGen)
 		-- old refs, producing the OK/ERR alternation we saw during play tests.
 		if myGen ~= generation then
 			if cmd then
-				postResult(cmd.id, false, nil, { code = "loop_superseded", message = "command received by a stale plugin loop after reload; retry." })
+				postResult(target, cmd.id, false, nil, { code = "loop_superseded", message = "command received by a stale plugin loop after reload; retry." })
 			end
-			break
+			return "break"
 		end
 		if cmd then
-			consecutiveErrors = 0
+			state.consecutiveErrors = 0
+			dispatching = true
 			Transport.status.lastPollAt = os.clock()
 			setMode("online", nil)
 			-- HUD: announce the task before dispatch, settle it after. The HUD
@@ -1056,6 +1363,9 @@ local function loop(myGen)
 			if not callOk then
 				result = { code = "plugin_error", tool = cmd.tool, message = tostring(success) }
 				success = false
+			elseif success and type(result) == "table" and result.error ~= nil then
+				-- Mutate/Read/Viewport report failure as a returned { error, ... }.
+				success = false
 			end
 			-- Whatever the command was, the edit camera must still move afterwards,
 			-- and what it changed about the view is remembered for revertView.
@@ -1067,13 +1377,14 @@ local function loop(myGen)
 					result.cameraRestored = cameraFixed
 				end
 			end
-			local errCode = not success and ((type(result) == "table" and result.code) or "error") or nil
+			local errCode = not success and ((type(result) == "table" and (result.code or (type(result.error) == "string" and result.error))) or "error") or nil
 			if success then
 				pcall(HudOverlay.finishTask, hudTaskId)
 			else
 				pcall(HudOverlay.failTask, hudTaskId, errCode)
 			end
-			postResult(cmd.id, success, success and result or nil, success and nil or result)
+			postResult(target, cmd.id, success, success and result or nil, success and nil or result)
+			dispatching = false
 			Transport.status.commandsHandled += 1
 			Transport.status.busy = false
 			Transport.status.lastCommandAt = os.clock()
@@ -1081,7 +1392,7 @@ local function loop(myGen)
 			Transport.changed:Fire()
 		elseif err == nil then
 			-- 204 long-poll timeout: server is alive, just idle.
-			consecutiveErrors = 0
+			state.consecutiveErrors = 0
 			Transport.status.lastPollAt = os.clock()
 			setMode("online", nil)
 		elseif err == "version_mismatch" then
@@ -1100,15 +1411,16 @@ local function loop(myGen)
 				task.wait(Config.VERSION_MISMATCH_WAIT)
 			end
 		elseif err == "request_failed" then
-			consecutiveErrors += 1
+			state.consecutiveErrors += 1
 			setMode("server_unreachable", "Cannot reach MCP server at " .. Config.HOST)
-			task.wait(math.min(Config.RETRY_WAIT * 2 ^ math.min(consecutiveErrors - 1, 5), 30))
+			task.wait(math.min(Config.RETRY_WAIT * 2 ^ math.min(state.consecutiveErrors - 1, 5), 30))
 		else
-			consecutiveErrors += 1
+			state.consecutiveErrors += 1
 			setMode("server_unreachable", "Poll error: " .. tostring(err))
-			task.wait(math.min(Config.ERROR_WAIT * 2 ^ math.min(consecutiveErrors - 1, 5), 30))
+			task.wait(math.min(Config.ERROR_WAIT * 2 ^ math.min(state.consecutiveErrors - 1, 5), 30))
 		end
 	end
+	return nil
 end
 
 function Transport.setPolling(on)

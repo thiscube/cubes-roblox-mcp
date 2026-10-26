@@ -9,15 +9,16 @@ import {
 import { randomUUID } from "node:crypto";
 
 import { BridgeError, type StudioTransport } from "./transport.js";
-import { withCall } from "./call-context.js";
+import { currentCall, withCall } from "./call-context.js";
+import { placeKeyOf, recordVersions, type NewVersion } from "./script-history.js";
 import { activityFor, targetFor } from "./activity.js";
 import { Session, CORE_TOOLS, READ_ONLY_CORE_TOOLS } from "./session.js";
-import { ToolRegistry, capabilities, outputSchemaFor, type ToolEntry } from "./registry.js";
+import { ToolRegistry, capabilities, luaJson, outputSchemaFor, type ToolEntry } from "./registry.js";
 import { CORE_OUTPUT_SCHEMAS, RESULT_ENVELOPE } from "./core-output.js";
 import { ALL_TOOLS } from "./tools/index.js";
-import { lintLuau } from "./lint.js";
+// lint.js loads on the first mutate that writes script source, not at startup.
 import { SessionMemory } from "./memory.js";
-import { assessDestructiveness } from "./safety.js";
+import { assessDestructiveness, batchIdsOf, externalTarget } from "./safety.js";
 import { suggestNext } from "./suggest.js";
 import { SourceMap } from "./sourcemap.js";
 import { screenshotTool } from "./vision.js";
@@ -51,7 +52,7 @@ const CORE_TOOL_DEFS: Record<string, Tool> = {
   search_tools: {
     name: "search_tools",
     description:
-      "Discover specialist Roblox tools by plain-language intent. Matching tools are unlocked into the active tool set (you will receive a tools/list_changed notification). Reach for this before falling back to run_code on a specialized task.",
+      "Discover specialist Roblox tools by plain-language intent. Matching tools are unlocked into the active tool set. Reach for this before falling back to run_code on a specialized task.",
     inputSchema: {
       type: "object",
       properties: {
@@ -172,7 +173,7 @@ const CORE_TOOL_DEFS: Record<string, Tool> = {
   run_code: {
     name: "run_code",
     description:
-      "Escape hatch + code-mode workflow runner. Run arbitrary Luau inside Studio (plugin context, elevated permissions). PREFER this over many `mutate` calls when you need 3+ ops in a row — one round-trip beats N, and intermediate results stay in the Studio sandbox instead of round-tripping through the LLM context window. A preloaded `__MCP` helper table is in scope: refFor(inst), resolve(refOrPath), query(selector), read(args), mutate(args), decode(json), serialize(value), diagnostics(n), viewport(limit), waypoint(name, fn). Wrap multi-step work in `__MCP.waypoint('your-label', function() ... end)` for one atomic undo step. Use `return <value>` to get JSON back. Example multi-step build: `return __MCP.waypoint('build cat', function() local m = Instance.new('Model'); m.Parent = workspace; for i=1,5 do local p = Instance.new('Part'); p.Parent = m end; return { ref = __MCP.refFor(m), count = #m:GetChildren() } end)`.",
+      "Escape hatch + code-mode workflow runner. Run arbitrary Luau inside Studio (plugin context, elevated permissions). PREFER this over many `mutate` calls when you need 3+ ops in a row — one round-trip beats N, and intermediate results stay in the Studio sandbox instead of passing through your context. A preloaded `__MCP` helper table is in scope: refFor(inst), resolve(refOrPath), query(selector), read(args), mutate(args), decode(json), serialize(value), diagnostics(n), viewport(limit), waypoint(name, fn). Wrap multi-step work in `__MCP.waypoint('your-label', function() ... end)` for one atomic undo step. Use `return <value>` to get JSON back. Example: `return __MCP.waypoint('build', function() local m = Instance.new('Model'); m.Parent = workspace; return { ref = __MCP.refFor(m) } end)`.",
     inputSchema: {
       type: "object",
       properties: {
@@ -428,17 +429,19 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
       // something it never parents. It is not destructive either way, and
       // shipping destructiveHint on a documentation lookup made clients warn
       // users about reading a default value.
+      // Spec defaults are omitted: idempotentHint defaults to false, and
+      // destructiveHint is only meaningful when readOnlyHint is false. Each
+      // explicit default cost ~22 chars per tool in every tools/list.
       readOnlyHint: !cap.write && !cap.transient,
-      destructiveHint: cap.write,
-      idempotentHint: false,
+      ...(cap.write || cap.transient ? { destructiveHint: cap.write } : {}),
       openWorldHint: cap.touchesStudio,
     };
   }
 
   const CORE_ANNOTATIONS: Record<string, Tool["annotations"]> = {
-    search_tools: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-    read: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
-    screenshot: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
+    search_tools: { readOnlyHint: true, openWorldHint: false },
+    read: { readOnlyHint: true, openWorldHint: true },
+    screenshot: { readOnlyHint: true, openWorldHint: true },
     mutate: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     run_code: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   };
@@ -471,7 +474,7 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
   server.setRequestHandler(ReadResourceRequestSchema, async (req) => {
     const uri = req.params.uri;
     const json = (data: unknown) => ({
-      contents: [{ uri, mimeType: "application/json", text: JSON.stringify(data, null, 2) }],
+      contents: [{ uri, mimeType: "application/json", text: JSON.stringify(data) }],
     });
     /**
      * Resources reach Studio through the same `eval` channel the write gate
@@ -623,6 +626,9 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
     }
 
     const elapsedMs = Date.now() - startedAt;
+    // The payload's JSON, kept while nothing has been added to it since, so the
+    // common path stringifies once instead of twice.
+    let serialized: string | undefined;
 
     if (payload && typeof payload === "object") {
       const obj = payload as Record<string, unknown>;
@@ -641,7 +647,8 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
       const wantsMeta = args.meta === true;
       let payloadChars = 0;
       try {
-        payloadChars = (JSON.stringify(payload) ?? "").length;
+        serialized = JSON.stringify(payload) ?? "null";
+        payloadChars = serialized.length;
       } catch {
         payloadChars = 0;
       }
@@ -650,7 +657,10 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
         meta.snapshot_hit === true ||
         (typeof meta.tokens_saved === "number" && meta.tokens_saved > 0) ||
         meta.elapsed_ms > 250;
-      if (wantsMeta || hasSignal) obj.meta = meta;
+      if (wantsMeta || hasSignal) {
+        obj.meta = meta;
+        serialized = undefined;
+      }
     }
 
     // Record the call in session memory (drives studio://session/history + macros).
@@ -673,6 +683,7 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
     if (autoUnlocked.length > 0) {
       if (payload && typeof payload === "object" && !("error" in payload)) {
         (payload as Record<string, unknown>).auto_unlocked = autoUnlocked;
+        serialized = undefined;
       }
       await notifyListChanged();
     }
@@ -692,13 +703,12 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
       };
     }
 
-    // Serialize exactly once — buildMeta above reuses this string rather than
-    // stringifying the payload a second time (AUDIT.md #25). A payload that
-    // cannot be serialized becomes a structured error instead of throwing out
-    // of the request handler.
+    // Reuse the string measured for buildMeta unless meta or auto_unlocked was
+    // added after it (AUDIT.md #25). A payload that cannot be serialized
+    // becomes a structured error instead of throwing out of the request handler.
     let text: string;
     try {
-      text = JSON.stringify(payload) ?? "null";
+      text = serialized ?? JSON.stringify(payload) ?? "null";
     } catch (err) {
       return {
         content: [
@@ -807,12 +817,13 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
     // Confirm-before-destructive: hard / nuclear batches need an explicit
     // confirm: true. The structured error hands back the exact retry.
     const assessment = assessDestructiveness(args.ops);
-    if ((assessment.level === "hard" || assessment.level === "nuclear") && args.confirm !== true) {
+    if (assessment.level === "hard" || assessment.level === "nuclear") {
       // Prefer asking the human directly. Returning `needs_confirmation` and
       // hoping the model relays it is a suggestion to an LLM, not a gate — and a
       // model that wants to finish the task is the worst possible arbiter of
-      // whether it should. Falls back to the structured refusal when the client
-      // cannot elicit.
+      // whether it should. So when the client can elicit, the human is asked
+      // EVEN IF the model already sent confirm: true. Only when it cannot does
+      // the model's flag count, the documented fallback.
       const approved = await confirmWithUser(
         assessment.level === "nuclear"
           ? `This batch deletes a service or top-level node. Continue? (${assessment.summary})`
@@ -828,7 +839,7 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
           summary: assessment.summary,
           hint: "The user declined this destructive batch. Do not retry it without new instructions.",
         };
-      } else {
+      } else if (args.confirm !== true) {
         return {
           error: "needs_confirmation",
           level: assessment.level,
@@ -843,12 +854,25 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
         };
       }
     }
+    // Save every script this batch overwrites or deletes BEFORE it runs, so the
+    // old source survives even when Studio closes (script-history.ts).
+    const history = await captureScriptHistory(args.ops as unknown[]);
     const result = (await bridge.send("mutate", args)) as Record<string, unknown>;
     // Plugin-side failures (e.g. mutate_failed + rolled_back, no_undo_available)
     // come back as { error, ... }. Don't dress a rolled-back failure up with
     // lint/appliedLevel — that makes a hard failure look partially applied.
     if (result && typeof result === "object" && "error" in result) {
       return result;
+    }
+    if (history) {
+      if (history.placeKey && history.after.length > 0) {
+        try {
+          history.saved += await recordVersions(history.placeKey, history.after, currentCall()?.tool);
+        } catch (err) {
+          history.error = err instanceof Error ? err.message : String(err);
+        }
+      }
+      result.history = history.error ? { saved: history.saved, error: history.error } : { saved: history.saved };
     }
     // Inline lint: any op that writes script source gets selene'd server-side,
     // so the agent can fix issues now instead of discovering them at playtest.
@@ -858,6 +882,115 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
     result.lint = lint;
     result.appliedLevel = assessment.level;
     return result;
+  }
+
+  /**
+   * Record the current source of every script a mutate batch will overwrite or
+   * delete, and work out the paths of scripts it creates.
+   *
+   * Returns null when the batch touches no script source, so ordinary part
+   * edits pay nothing. Never throws: history is a safety net, and a failure to
+   * record it must not block the edit it was meant to protect. It reports the
+   * failure in the result instead.
+   */
+  async function captureScriptHistory(ops: unknown[]): Promise<{
+    placeKey: string | null;
+    after: NewVersion[];
+    saved: number;
+    error?: string;
+  } | null> {
+    const SCRIPT_CLASSES = new Set(["Script", "LocalScript", "ModuleScript"]);
+    const queries: Array<Record<string, unknown>> = [];
+    const byIndex = new Map<number, any>();
+    // Mutate.luau resolves `@x` to a same-batch result only when a create op in
+    // this batch registered id `x`; any other `@x` is just the path/ref `x`.
+    const batchIds = batchIdsOf(ops);
+    ops.forEach((raw, i) => {
+      const op = raw as any;
+      if (!op || typeof op !== "object") return;
+      const target = externalTarget(op.target, batchIds);
+      const parent = typeof op.parent === "string" ? externalTarget(op.parent, batchIds) : "Workspace";
+      if (op.op === "set" && target && typeof op.props?.Source === "string") {
+        queries.push({ i, kind: "set", target });
+      } else if (op.op === "delete" && target) {
+        queries.push({ i, kind: "delete", target });
+      } else if (
+        op.op === "create" &&
+        SCRIPT_CLASSES.has(op.class) &&
+        typeof op.props?.Source === "string" &&
+        parent
+      ) {
+        queries.push({
+          i,
+          kind: "create",
+          parent,
+          name: typeof op.name === "string" && op.name ? op.name : op.class,
+          class: op.class,
+        });
+      } else {
+        return;
+      }
+      byIndex.set(i, op);
+    });
+    if (queries.length === 0) return null;
+
+    const out = { placeKey: null as string | null, after: [] as NewVersion[], saved: 0, error: undefined as string | undefined };
+    try {
+      const snap = (await bridge.send("eval", {
+        luau: `
+local q = __MCP.decode(${luaJson(queries)})
+local out = { placeId = game.PlaceId, placeName = game.Name, items = {} }
+local function add(inst, i, kind)
+  out.items[#out.items + 1] = { i = i, kind = kind, path = inst:GetFullName(), class = inst.ClassName, source = inst.Source }
+end
+for _, e in ipairs(q) do
+  if e.kind == "create" then
+    local parent = __MCP.resolve(e.parent)
+    if parent then
+      out.items[#out.items + 1] = { i = e.i, kind = "create", path = parent:GetFullName() .. "." .. e.name, class = e.class }
+    end
+  else
+    local inst = __MCP.resolve(e.target)
+    if inst then
+      if inst:IsA("LuaSourceContainer") then add(inst, e.i, e.kind) end
+      if e.kind == "delete" then
+        for _, d in ipairs(inst:GetDescendants()) do
+          if d:IsA("LuaSourceContainer") then add(d, e.i, "delete") end
+        end
+      end
+    end
+  end
+end
+return out
+`,
+      })) as {
+        placeId?: number;
+        placeName?: string;
+        items?: Array<{ i: number; kind: string; path: string; class: string; source?: string }>;
+      };
+      out.placeKey = placeKeyOf(Number(snap?.placeId ?? 0) || 0, String(snap?.placeName ?? ""));
+      const before: NewVersion[] = [];
+      for (const it of snap?.items ?? []) {
+        const op = byIndex.get(it.i);
+        if (it.kind === "create") {
+          out.after.push({ path: it.path, class: it.class, action: "created", source: op.props.Source });
+          continue;
+        }
+        before.push({
+          path: it.path,
+          class: it.class,
+          action: it.kind === "delete" ? "before-delete" : "before-edit",
+          source: String(it.source ?? ""),
+        });
+        if (it.kind === "set") {
+          out.after.push({ path: it.path, class: it.class, action: "after-edit", source: op.props.Source });
+        }
+      }
+      out.saved = await recordVersions(out.placeKey, before, currentCall()?.tool);
+    } catch (err) {
+      out.error = err instanceof Error ? err.message : String(err);
+    }
+    return out;
   }
 
   /** Lint the source of every op that writes a script's Source property. */
@@ -871,7 +1004,8 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
     // Selene spawns a process per call — cap concurrency so a 50-script macro
     // doesn't fork 50 processes + tmpfiles in parallel.
     const CONCURRENCY = 4;
-    const results: Array<{ target: string } & Awaited<ReturnType<typeof lintLuau>>> = new Array(scriptOps.length);
+    const { lintLuau } = await import("./lint.js");
+    const results: Array<{ target: string } & Awaited<ReturnType<typeof import("./lint.js").lintLuau>>> = new Array(scriptOps.length);
     let cursor = 0;
     async function worker() {
       while (true) {
@@ -896,7 +1030,21 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
     if (typeof luau !== "string" || luau.trim() === "") {
       return { error: "bad_args", hint: "run_code requires a non-empty 'luau' string." };
     }
-    const result = await bridge.send("eval", { luau });
+    let result: unknown;
+    try {
+      result = await bridge.send("eval", { luau });
+    } catch (err) {
+      // A timeout does not stop the chunk: Studio may still be running it, and
+      // a blind retry would apply its effects twice.
+      if (err instanceof BridgeError && err.code === "studio_timeout") {
+        return {
+          error: "studio_timeout",
+          message: `${err.message} The chunk may STILL BE RUNNING in Studio and may yet apply its effects.`,
+          hint: "Do NOT retry this run_code blindly. Wait, then read the affected instances to see what actually happened before running anything again.",
+        };
+      }
+      throw err;
+    }
     return { result };
   }
 
@@ -989,17 +1137,26 @@ async function ensurePlaceContext(
   // session (ARCHITECTURE-REVIEW.md A4).
   return session.place.resolve(async () => {
     if (!bridge.connected) return { placeId: 0, placeName: "(plugin not connected)" };
+    // A refused or failed eval (writes off, timeout) throws, and the cache does
+    // not keep a rejection. Returning `{0,""}` here used to be cached for the
+    // TTL and silently sent every profile write to the "unsaved place" bucket.
+    let raw: { placeId?: unknown; placeName?: unknown; error?: unknown } | undefined;
     try {
-      const raw = (await bridge.send("eval", {
+      raw = (await bridge.send("eval", {
         luau: "return { placeId = game.PlaceId, placeName = game.Name }",
-      })) as { placeId?: unknown; placeName?: unknown } | undefined;
-      return {
-        placeId: Number(raw?.placeId ?? 0) || 0,
-        placeName: String(raw?.placeName ?? ""),
-      };
-    } catch {
-      return { placeId: 0, placeName: "" };
+      })) as typeof raw;
+    } catch (err) {
+      throw new Error(
+        `place_context_unavailable: could not read the open place (${err instanceof Error ? err.message : String(err)})`,
+      );
     }
+    if (raw && typeof raw === "object" && "error" in raw && raw.error) {
+      throw new Error(`place_context_unavailable: ${String(raw.error)}`);
+    }
+    return {
+      placeId: Number(raw?.placeId ?? 0) || 0,
+      placeName: String(raw?.placeName ?? ""),
+    };
   });
 }
 

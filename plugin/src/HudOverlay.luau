@@ -126,6 +126,7 @@ end
 
 local screen, island, islandScale, glow
 local spinner, spinnerGradient, dots, statusDot
+local dotFrames = {} -- Dot1..Dot3, cached so animate() doesn't FindFirstChild per frame
 local wordLabel, wordShimmer, targetLabel, timerLabel
 local heartbeat
 
@@ -277,6 +278,7 @@ local function build()
 		d.BorderSizePixel = 0
 		d.Size = UDim2.fromOffset(4, 4)
 		d.Parent = dots
+		dotFrames[i] = d
 		corner(d)
 	end
 
@@ -334,9 +336,17 @@ local function contentWidth()
 	return w + PAD_RIGHT
 end
 
+-- Width the island was last sized/tweened to. Back-to-back commands with the
+-- same word re-render at the same width; no new Tween for those. Reset
+-- whenever appear/disappear set the size behind fit's back.
+local fitGoalWidth = nil
+
 local function fit(instant)
 	wordLabel.Size = UDim2.fromOffset(textWidth(wordLabel.Text, WORD_FONT, WORD_SIZE), 20)
-	local goal = UDim2.fromOffset(contentWidth(), HEIGHT)
+	local width = contentWidth()
+	if not instant and width == fitGoalWidth then return end
+	fitGoalWidth = width
+	local goal = UDim2.fromOffset(width, HEIGHT)
 	if instant then
 		island.Size = goal
 	else
@@ -406,7 +416,7 @@ local function animate()
 	elseif state == "thinking" then
 		for i = 1, 3 do
 			local phase = math.sin((now * 5) - (i - 1) * 0.9)
-			local d = dots:FindFirstChild("Dot" .. i)
+			local d = dotFrames[i]
 			if d then
 				-- Never fully invisible, or three dots read as two.
 				d.BackgroundTransparency = 0.45 - phase * 0.3
@@ -433,6 +443,7 @@ local function appear()
 	shown = true
 	hideGen += 1
 	screen.Enabled = true
+	fitGoalWidth = nil
 	island.Size = UDim2.fromOffset(HEIGHT, HEIGHT)
 	island.GroupTransparency = 1
 	islandScale.Scale = 0.86
@@ -446,6 +457,7 @@ local function disappear()
 	shown = false
 	hideGen += 1
 	local myHide = hideGen
+	fitGoalWidth = nil
 	TweenService:Create(island, RESIZE, { Size = UDim2.fromOffset(HEIGHT, HEIGHT) }):Play()
 	TweenService:Create(island, FADE_OUT, { GroupTransparency = 1 }):Play()
 	TweenService:Create(islandScale, FADE_OUT, { Scale = 0.9 }):Play()
@@ -479,6 +491,9 @@ local function render()
 	if not enabled or not screen then return end
 	appear()
 	setGlow(state ~= "idle")
+	-- Idle has no glow pulse, spinner or dots, so animate() would do nothing
+	-- every frame; the island usually sits Idle for hours.
+	if state == "idle" then stopHeartbeat() else startHeartbeat() end
 
 	wordShimmer.Enabled = state == "thinking"
 	setTimer(nil)

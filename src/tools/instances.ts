@@ -15,7 +15,6 @@ export const INSTANCES_TOOLS: ToolEntry[] = [
       category: "instances",
       subcategories: ["tags", "query", "introspect"],
       keywords: ["tag", "tags", "collectionservice", "tagged", "find", "group", "label"],
-      readOnly: true,
       description:
         "CollectionService tags. Give `tag` to list every instance carrying it, or `target` to list one instance's tags. How most places mark doors, spawners and interactables.",
       inputSchema: {

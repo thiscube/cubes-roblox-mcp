@@ -310,16 +310,17 @@ describe("docs_search", () => {
 describe("docs_defaults", () => {
   before(installFakeDump);
 
-  test("is read-class but transient, not a pure read and not a write", () => {
-    // The dump has no defaults, so this one has to ask Studio. It constructs an
-    // Instance, which is why it is not `readOnly: true` — but it never parents
-    // it, so calling it write-class shipped destructiveHint on a docs lookup and
-    // dropped it from the read-only build, which exists to inspect things.
+  test("is write-class, because it runs on the eval channel", () => {
+    // The dump has no defaults, so this one has to ask Studio. Its Luau only
+    // constructs an unparented Instance, but it travels as arbitrary `eval`, and
+    // the bridge refuses eval with writes off: a read-class label on an eval
+    // path would let any token holder run Luau through it. So every eval tool
+    // is write-class (see evalTool in registry.ts), this one included.
     const entry = tool("docs_defaults");
     assert.equal(entry.channel, "eval");
     const cap = capabilities(entry);
-    assert.equal(cap.write, false, "it changes nothing, so no write gate");
-    assert.equal(cap.transient, true);
+    assert.equal(cap.write, true, "eval is gated, whatever the Luau does");
+    assert.equal(cap.transient, false);
     assert.equal(cap.touchesStudio, true, "it does reach Studio, and says so");
   });
 

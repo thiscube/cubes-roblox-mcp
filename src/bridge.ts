@@ -3,7 +3,8 @@ import type { Duplex } from "node:stream";
 import { WebSocketServer, type WebSocket } from "ws";
 import { randomUUID, randomBytes, timingSafeEqual } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve as resolvePath, sep } from "node:path";
+import { homedir } from "node:os";
 import { currentCall, type CallInfo } from "./call-context.js";
 import { tokenFile } from "./paths.js";
 import { MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, protocolSupported } from "./protocol.js";
@@ -18,6 +19,8 @@ export interface BridgeDiagnosis {
   msSinceLastPoll?: number;
   authRejections: number;
   protocolRejections: number;
+  /** True while another copy of this server holds the port and calls are routed through it. */
+  proxying?: boolean;
 }
 
 /**
@@ -112,6 +115,17 @@ const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_QUEUE = 256;
 /** Bound on remembered timed-out command ids (AUDIT.md #18). */
 const CANCELLED_MAX = 1000;
+/**
+ * How long a closed socket's in-flight commands wait for the plugin to come
+ * back before failing with `studio_disconnected`. `/result` accepts any id, so a
+ * plugin that reconnects (socket or long-poll) can still answer them; only when
+ * nothing has reappeared by then do we stop making the caller wait out 30s.
+ */
+const DISCONNECT_GRACE_MS = 2_000;
+/** How often a copy without the port re-reads the owner's /health. */
+const PEER_REFRESH_MS = 2_000;
+/** Owner state older than this is not believed: a few missed refreshes, not one. */
+const PEER_STALE_MS = 10_000;
 
 /**
  * Build the bearer token for this process.
@@ -140,9 +154,10 @@ export function resolveToken(): { token: string; generated: boolean; persisted: 
   if (fromEnv && fromEnv.length > 0) return { token: fromEnv, generated: false, persisted: false };
 
   const file = tokenFile();
+  const homeWarning = homeLocationWarning(dirname(file));
   try {
     const found = readTokenFile(file);
-    if (found) return { token: found, generated: false, persisted: true };
+    if (found) return { token: found, generated: false, persisted: true, ...(homeWarning ? { warning: homeWarning } : {}) };
   } catch (err) {
     return {
       token: randomBytes(24).toString("hex"),
@@ -155,7 +170,7 @@ export function resolveToken(): { token: string; generated: boolean; persisted: 
   const fresh = randomBytes(24).toString("hex");
   try {
     writeTokenFile(file, fresh);
-    return { token: fresh, generated: true, persisted: true };
+    return { token: fresh, generated: true, persisted: true, ...(homeWarning ? { warning: homeWarning } : {}) };
   } catch (err) {
     return {
       token: fresh,
@@ -225,7 +240,66 @@ export function tokenFileRefusal(
   return null;
 }
 
+/**
+ * Why the directory holding the token must not be trusted, or null if it may be.
+ *
+ * A symlink or junction (Node's lstat reports both as symbolic links) is refused
+ * everywhere: it can point the token at a folder someone else controls. On
+ * POSIX a directory that others can write to, or that someone else owns, lets
+ * them swap the token file between our checks and our read, so it is refused
+ * too. Windows has no mode bits, and reading its ACLs needs a dependency or a
+ * subprocess, so there only the link check runs (see SECURITY.md).
+ */
+export function tokenHomeRefusal(
+  dir: string,
+  info: TokenFileStat & { isDirectory(): boolean },
+  myUid: number | null,
+  checkMode = CHECKS_MODE,
+): string | null {
+  if (info.isSymbolicLink()) {
+    return `${dir} is a symlink or junction; refusing to keep the bridge token there. Point CUBES_MCP_HOME at a real folder you own.`;
+  }
+  if (!info.isDirectory()) return `${dir} is not a directory.`;
+  if (!checkMode) return null;
+  if ((info.mode & 0o022) !== 0) {
+    return (
+      `${dir} is writable by other users (mode ${(info.mode & 0o777).toString(8)}). ` +
+      `Run chmod 700 on it, point CUBES_MCP_HOME somewhere you own, or set CUBES_MCP_TOKEN.`
+    );
+  }
+  if (myUid !== null && info.uid !== myUid) {
+    return `${dir} is owned by uid ${info.uid}, not by you. Point CUBES_MCP_HOME somewhere you own, or set CUBES_MCP_TOKEN.`;
+  }
+  return null;
+}
+
+function checkTokenHome(dir: string): void {
+  let info;
+  try {
+    info = lstatSync(dir);
+  } catch {
+    return; // Not there yet; writeTokenFile creates it 0700.
+  }
+  const refusal = tokenHomeRefusal(dir, info, typeof process.getuid === "function" ? process.getuid() : null);
+  if (refusal) throw new Error(refusal);
+}
+
+/**
+ * Windows only: a home outside the user profile is usually somewhere other
+ * accounts can reach, and nothing here can check its ACL. Warn, don't refuse.
+ */
+function homeLocationWarning(dir: string): string | null {
+  if (process.platform !== "win32") return null;
+  const profile = resolvePath(homedir()).toLowerCase() + sep;
+  if ((resolvePath(dir).toLowerCase() + sep).startsWith(profile)) return null;
+  return (
+    `CUBES_MCP_HOME (${dir}) is outside your user profile. Its permissions are not checked on Windows, ` +
+    `so make sure other accounts cannot write there.`
+  );
+}
+
 function readTokenFile(file: string): string | null {
+  checkTokenHome(dirname(file));
   let info;
   try {
     info = lstatSync(file);
@@ -242,13 +316,19 @@ function readTokenFile(file: string): string | null {
   return value.length > 0 ? value : null;
 }
 
-/** Write-then-rename so a crash cannot leave a half-written token behind. */
+/**
+ * Write-then-rename so a crash cannot leave a half-written token behind.
+ *
+ * The temp name is random and opened with `wx` (O_CREAT|O_EXCL), which fails on
+ * any existing path, symlinks included, so it can never be followed into a file
+ * someone planted. Rename replaces a link at `file` rather than writing through it.
+ */
 function writeTokenFile(file: string, token: string): void {
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
-  const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, token + "\n", { encoding: "utf8", mode: 0o600 });
-  // writeFileSync's mode is ignored when the path already exists, and rename
-  // keeps the source inode, so set it explicitly on the file we actually made.
+  checkTokenHome(dirname(file));
+  const tmp = `${file}.${randomBytes(8).toString("hex")}.tmp`;
+  writeFileSync(tmp, token + "\n", { encoding: "utf8", mode: 0o600, flag: "wx" });
+  // Belt and braces against a umask that stripped bits we did not ask for.
   if (CHECKS_MODE) chmodSync(tmp, 0o600);
   renameSync(tmp, file);
 }
@@ -293,7 +373,8 @@ export class StudioBridge implements StudioTransport {
   /** Which Studio window the socket belongs to. */
   private socketInstance = DEFAULT_INSTANCE;
   private wss?: WebSocketServer;
-  private _writeEnabled = false;
+  /** Command ids sent on each socket and not yet answered. */
+  private readonly socketInFlight = new WeakMap<WebSocket, Set<string>>();
   private lastHandshake: { protocol: number | null; ok: boolean; at: number } | null = null;
   /**
    * Why the bridge is unusable, when it is. Every field here exists because the
@@ -317,6 +398,23 @@ export class StudioBridge implements StudioTransport {
   private listening = false;
   /** Set while a failed start keeps retrying the port (see retryListen). */
   private retryTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * What the copy that DOES hold the port reports, while this one cannot bind it.
+   *
+   * Every Claude session starts its own copy of this server and only one can own
+   * the port. The others used to fail every call with studio_not_connected until
+   * that session closed, which with several chats open meant most of them could
+   * not reach Studio at all. Now a copy without the port sends its commands
+   * through the owner's `/rpc` and mirrors its connection state from `/health`.
+   */
+  private peer: {
+    connected: boolean;
+    writeEnabled: boolean;
+    instances: StudioInstance[];
+    problem?: string;
+    at: number;
+  } | null = null;
+  private peerTimer: ReturnType<typeof setInterval> | null = null;
   readonly token: string;
   readonly tokenGenerated: boolean;
   /** True when the token came from, or was written to, the token file. */
@@ -373,8 +471,19 @@ export class StudioBridge implements StudioTransport {
 
   /** True if the Studio plugin holds a socket, or has polled us recently. */
   get connected(): boolean {
+    if (this.proxying) return this.peerFresh ? this.peer!.connected : false;
     if (this.socketOpen) return true;
     return Date.now() - this.lastSeen < HEARTBEAT_WINDOW_MS;
+  }
+
+  /** The port is held by another copy, so commands go through its `/rpc`. */
+  private get proxying(): boolean {
+    return !this.listening && this.listenError !== null;
+  }
+
+  /** The owner's state was read recently enough to believe. */
+  private get peerFresh(): boolean {
+    return this.peer !== null && Date.now() - this.peer.at < PEER_STALE_MS;
   }
 
   private get socketOpen(): boolean {
@@ -398,8 +507,23 @@ export class StudioBridge implements StudioTransport {
     // forgery AUDIT.md #27 describes, reproduced end to end during verification.
     // There is no way to authenticate the toggle without authenticating the
     // plugin, so the honest resolution is that the escape hatch buys reads only.
+    return this.writesAllowed();
+  }
+
+  /**
+   * The write gate for one command. The toggle is per Studio window, so a
+   * targeted command uses its window's toggle. An untargeted one can be picked
+   * up by whichever window polls first, so it needs every connected window ON:
+   * one window's toggle must never authorise a write that lands in another.
+   */
+  private writesAllowed(target?: string): boolean {
     if (this.allowUnauthenticated) return false;
-    return this.connected && this._writeEnabled;
+    if (!this.connected) return false;
+    if (this.proxying && !this.peer!.writeEnabled) return false;
+    const live = this.listInstances();
+    if (target) return live.some((i) => i.id === target && i.writeEnabled);
+    if (this.proxying) return true;
+    return live.length > 0 && live.every((i) => i.writeEnabled);
   }
 
   /**
@@ -432,6 +556,7 @@ export class StudioBridge implements StudioTransport {
     };
     if (this.listenError) out.listenError = this.listenError;
     if (this.everPolled) out.msSinceLastPoll = Date.now() - this.lastSeen;
+    if (this.proxying) out.proxying = true;
     return out;
   }
 
@@ -446,6 +571,13 @@ export class StudioBridge implements StudioTransport {
    */
   describeDisconnect(): string {
     const d = this.diagnosis;
+    if (d.listenError && this.peerFresh) {
+      return (
+        this.peer!.problem ??
+        `Port ${d.port} belongs to another session's copy of this server. Calls are routed through it, ` +
+          `and it is not connected to Studio either.`
+      );
+    }
     if (d.listenError) {
       return (
         `The bridge is not listening: port ${d.port} is in use (${d.listenError}). ` +
@@ -497,6 +629,7 @@ export class StudioBridge implements StudioTransport {
    * without this the map keeps every window the session has ever seen.
    */
   listInstances(): StudioInstance[] {
+    if (this.proxying) return this.peerFresh ? [...this.peer!.instances] : [];
     const now = Date.now();
     for (const [id, info] of this.instances) {
       const live = info.transport === "websocket" ? this.socketInstance === id && this.socketOpen : now - info.lastSeen < HEARTBEAT_WINDOW_MS;
@@ -516,6 +649,9 @@ export class StudioBridge implements StudioTransport {
     writeEnabled: boolean;
   }): string {
     const id = typeof info.id === "string" && info.id.trim() ? info.id.trim().slice(0, 64) : DEFAULT_INSTANCE;
+    // A new id is a new window or a restarted plugin: prune the dead ones now, so
+    // a read-only session that never calls listInstances() doesn't keep them all.
+    if (!this.instances.has(id)) this.listInstances();
     this.instances.set(id, {
       id,
       ...(typeof info.placeId === "number" ? { placeId: info.placeId } : {}),
@@ -556,7 +692,7 @@ export class StudioBridge implements StudioTransport {
       // The WebSocket endpoint shares the HTTP listener. `noServer` means every
       // upgrade goes through our own guard first — ws never sees a request we
       // have not authenticated.
-      this.wss = new WebSocketServer({ noServer: true });
+      this.wss = new WebSocketServer({ noServer: true, maxPayload: MAX_BODY_BYTES });
       this.httpServer.on("upgrade", (req, socket, head) => this.handleUpgrade(req, socket, head));
 
       // Reject only the startup attempt; later errors must be logged, not
@@ -608,6 +744,10 @@ export class StudioBridge implements StudioTransport {
       this.stopRetry();
       process.stderr.write(`[cubes-mcp] Studio bridge took over http://127.0.0.1:${this.port}\n`);
     });
+    // Until then, work through the owner rather than failing every call.
+    void this.refreshPeer();
+    this.peerTimer = setInterval(() => void this.refreshPeer(), PEER_REFRESH_MS);
+    this.peerTimer.unref?.();
     this.retryTimer = setInterval(() => {
       if (this.listening || server.listening) return this.stopRetry();
       try {
@@ -623,6 +763,84 @@ export class StudioBridge implements StudioTransport {
   private stopRetry(): void {
     if (this.retryTimer) clearInterval(this.retryTimer);
     this.retryTimer = null;
+    if (this.peerTimer) clearInterval(this.peerTimer);
+    this.peerTimer = null;
+    this.peer = null;
+  }
+
+  /** Mirror the port owner's connection state from its /health. */
+  private async refreshPeer(): Promise<void> {
+    try {
+      const res = await fetch(`http://127.0.0.1:${this.port}/health`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${this.token}` },
+        signal: AbortSignal.timeout(PEER_REFRESH_MS),
+      });
+      const h = (await res.json()) as any;
+      if (!this.proxying) return;
+      this.peer = {
+        connected: h?.connected === true,
+        writeEnabled: h?.writeEnabled === true,
+        instances: Array.isArray(h?.instances) ? h.instances : [],
+        ...(typeof h?.problem === "string" ? { problem: h.problem } : {}),
+        at: Date.now(),
+      };
+    } catch {
+      // The owner is gone or busy. Leave the old state to go stale on its own;
+      // the retry timer takes the port over if it has exited.
+    }
+  }
+
+  /**
+   * Run a command through the port owner's `/rpc`.
+   *
+   * The owner applies its own write gate, so the only check here is the one
+   * that belongs to THIS process: a read-only build never writes, whoever holds
+   * the port.
+   */
+  private async sendViaPeer(
+    tool: string,
+    args: Record<string, unknown>,
+    timeoutMs: number,
+    target?: string,
+  ): Promise<unknown> {
+    if (this.readOnly && !this.readOnlyCommands.has(tool)) {
+      throw new BridgeError("read_only_build", `This server was started read-only; '${tool}' is a write command.`);
+    }
+    let res: Response;
+    try {
+      res = await fetch(`http://127.0.0.1:${this.port}/rpc`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${this.token}` },
+        body: JSON.stringify({ tool, args, timeoutMs, ...(target ? { target } : {}) }),
+        // The owner times the command out itself; this only covers the owner hanging.
+        signal: AbortSignal.timeout(timeoutMs + 5_000),
+      });
+    } catch (err) {
+      if (err instanceof Error && err.name === "TimeoutError") {
+        throw new BridgeError("studio_timeout", `Studio did not respond within ${timeoutMs}ms (via the server on port ${this.port}).`);
+      }
+      throw new BridgeError("studio_not_connected", this.describeDisconnect(), this.diagnosis);
+    }
+    let body: any = null;
+    try {
+      body = await res.json();
+    } catch {
+      // Handled below as a bare HTTP status.
+    }
+    if (res.ok && body?.ok === true) return body.result;
+    if (res.status === 401) {
+      throw new BridgeError(
+        "peer_unauthorized",
+        `Another server holds port ${this.port} and refused this one's token. Both copies must use the same ` +
+          `bridge token (CUBES_MCP_TOKEN, or ${tokenFile()}).`,
+      );
+    }
+    throw new BridgeError(
+      String(body?.error ?? "peer_error"),
+      String(body?.message ?? body?.hint ?? `The server on port ${this.port} answered HTTP ${res.status}.`),
+      body?.detail,
+    );
   }
 
   /** Shut the HTTP listener down. Used by tests and by clean exit paths. */
@@ -655,6 +873,7 @@ export class StudioBridge implements StudioTransport {
     timeoutMs = 30_000,
     target?: string,
   ): Promise<unknown> {
+    if (this.proxying) return this.sendViaPeer(tool, args, timeoutMs, target);
     if (!this.connected) {
       const hs = this.lastHandshake;
       if (hs && !hs.ok) {
@@ -678,7 +897,7 @@ export class StudioBridge implements StudioTransport {
     // reconnects before the queue drains, the command lands with the user's
     // toggle off. Small window, needs a reconnect to hit, free to close. Same
     // policy the /rpc door uses, so there is one rule and two doors.
-    if (!this.readOnlyCommands.has(tool) && (this.readOnly || !this.writeEnabled)) {
+    if (!this.readOnlyCommands.has(tool) && (this.readOnly || !this.writesAllowed(target))) {
       return Promise.reject(
         new BridgeError(
           this.readOnly ? "read_only_build" : "write_mode_disabled",
@@ -732,9 +951,7 @@ export class StudioBridge implements StudioTransport {
     // A live socket takes it immediately: no queue, no waiting for a poll.
     if (this.socketOpen && (!cmd.target || cmd.target === this.socketInstance)) {
       try {
-        this.socket?.send(
-          JSON.stringify({ type: "command", id: cmd.id, tool: cmd.tool, args: cmd.args, via: cmd.via }),
-        );
+        this.sendToSocket(cmd);
         return;
       } catch {
         // The socket died between the readyState check and the write. Fall
@@ -826,6 +1043,7 @@ export class StudioBridge implements StudioTransport {
       }
     }
     this.socket = ws;
+    this.socketInFlight.set(ws, new Set());
     // Until `hello` arrives this socket has no identity, so it must not inherit
     // the previous socket's. Otherwise a command addressed to the window that
     // just went away could be handed to the one that just arrived.
@@ -834,13 +1052,13 @@ export class StudioBridge implements StudioTransport {
 
     ws.on("message", (raw) => this.handleSocketMessage(ws, raw.toString()));
     ws.on("close", () => {
+      this.failInFlightAfterGrace(ws);
       if (this.socket === ws) {
         this.socket = null;
         this.instances.delete(this.socketInstance);
         this.socketInstance = DEFAULT_INSTANCE;
-        // Writes must never outlive the plugin that authorised them. Same rule
-        // as a /poll that omits the field (AUDIT.md #24).
-        this._writeEnabled = false;
+        // Deleting the instance above also drops its write toggle: writes must
+        // never outlive the plugin that authorised them (AUDIT.md #24).
       }
     });
     ws.on("error", () => {
@@ -881,7 +1099,6 @@ export class StudioBridge implements StudioTransport {
           if (this.socket === ws) this.socket = null;
           return;
         }
-        this._writeEnabled = msg.writeEnabled === true;
         this.socketInstance = this.noteInstance({
           id: msg.instanceId,
           placeId: msg.placeId,
@@ -889,7 +1106,7 @@ export class StudioBridge implements StudioTransport {
           role: msg.role,
           transport: "websocket",
           protocol: got,
-          writeEnabled: this.writeEnabled,
+          writeEnabled: msg.writeEnabled === true,
         });
         ws.send(
           JSON.stringify({
@@ -905,9 +1122,13 @@ export class StudioBridge implements StudioTransport {
       }
       case "state":
         // A missing field means off, never unchanged.
-        this._writeEnabled = msg.writeEnabled === true;
+        {
+          const inst = this.instances.get(this.socketInstance);
+          if (inst) inst.writeEnabled = msg.writeEnabled === true;
+        }
         return;
       case "result":
+        if (typeof msg.id === "string") this.socketInFlight.get(ws)?.delete(msg.id);
         this.handleResult(msg);
         return;
       case "ping":
@@ -926,10 +1147,39 @@ export class StudioBridge implements StudioTransport {
       if (idx < 0) break;
       const [cmd] = this.queue.splice(idx, 1);
       if (!cmd) break;
-      this.socket?.send(
-        JSON.stringify({ type: "command", id: cmd.id, tool: cmd.tool, args: cmd.args, via: cmd.via }),
-      );
+      this.sendToSocket(cmd);
     }
+  }
+
+  private sendToSocket(cmd: BridgeCommand): void {
+    const ws = this.socket;
+    if (!ws) throw new Error("no socket");
+    ws.send(JSON.stringify({ type: "command", id: cmd.id, tool: cmd.tool, args: cmd.args, via: cmd.via }));
+    this.socketInFlight.get(ws)?.add(cmd.id);
+  }
+
+  /**
+   * A socket closed with commands still out on it. Give the plugin a grace
+   * window to come back (any reconnect or poll can still post their results);
+   * if it hasn't, fail them now instead of letting each wait out its timeout.
+   */
+  private failInFlightAfterGrace(ws: WebSocket): void {
+    const ids = this.socketInFlight.get(ws);
+    this.socketInFlight.delete(ws);
+    if (!ids || ids.size === 0) return;
+    const closedAt = Date.now();
+    const t = setTimeout(() => {
+      if (this.socketOpen || this.lastSeen > closedAt) return; // plugin is back: let results arrive
+      for (const id of ids) {
+        const p = this.pending.get(id);
+        if (!p) continue;
+        clearTimeout(p.timer);
+        this.pending.delete(id);
+        this.markCancelled(id);
+        p.reject(new BridgeError("studio_disconnected", "The Studio plugin disconnected before answering."));
+      }
+    }, DISCONNECT_GRACE_MS);
+    t.unref?.();
   }
 
   private static denySocket(socket: Duplex, status: number, code: string): void {
@@ -959,8 +1209,10 @@ export class StudioBridge implements StudioTransport {
 
     // DNS rebinding gives an attacker page a same-origin path to 127.0.0.1, but
     // the Host header still carries their domain.
-    const host = (req.headers.host ?? "").split(":")[0].toLowerCase();
-    const loopback = host === "127.0.0.1" || host === "localhost" || host === "[::1]" || host === "::1";
+    // `[::1]:44820` must be split after the bracket, not at the first colon.
+    const rawHost = (req.headers.host ?? "").toLowerCase();
+    // Whole-string match, so `[::1].evil.example` and `[::1]x` cannot pass on their prefix.
+    const loopback = /^(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?$/.test(rawHost);
     if (!loopback) {
       return { status: 403, code: "host_not_allowed", message: "Host must be loopback." };
     }
@@ -1005,8 +1257,8 @@ export class StudioBridge implements StudioTransport {
     // Upgrades only. Roblox's WebSocket client cannot be relied on to set custom
     // headers, so `/ws?token=` is accepted there and nowhere else. It is a real
     // downgrade — query strings land in logs and referrers — but the listener is
-    // loopback-only and the token is per-run, so the exposure is a local log
-    // file. Never widen this to the HTTP routes, which have no such excuse.
+    // loopback-only and the token file is 0600 in a home only you can write, so the
+    // exposure is a local log file. Never widen this to the HTTP routes, which have no such excuse.
     if (allowQuery) {
       const q = (req.url ?? "").split("?")[1];
       if (q) {
@@ -1126,7 +1378,6 @@ export class StudioBridge implements StudioTransport {
     }
     // A missing field means "off", never "unchanged" — a reconnecting plugin must
     // not inherit the previous session's toggle (AUDIT.md #24).
-    this._writeEnabled = body.value?.writeEnabled === true;
     this.lastSeen = Date.now();
     const instance = this.noteInstance({
       id: body.value?.instanceId,
@@ -1135,7 +1386,7 @@ export class StudioBridge implements StudioTransport {
       role: body.value?.role,
       transport: "long-poll",
       protocol: got,
-      writeEnabled: this.writeEnabled,
+      writeEnabled: body.value?.writeEnabled === true,
     });
     await this.holdPoll(res, instance);
   }
@@ -1190,7 +1441,8 @@ export class StudioBridge implements StudioTransport {
       res.end(JSON.stringify({ error: "missing_tool" }));
       return;
     }
-    if (!this.readOnlyCommands.has(tool) && (this.readOnly || !this.writeEnabled)) {
+    const target = typeof body.value?.target === "string" ? body.value.target : undefined;
+    if (!this.readOnlyCommands.has(tool) && (this.readOnly || !this.writesAllowed(target))) {
       res.statusCode = 403;
       res.setHeader("content-type", "application/json");
       res.end(
@@ -1207,8 +1459,16 @@ export class StudioBridge implements StudioTransport {
       );
       return;
     }
+    // Optional, so a plain /rpc call behaves as before. A copy of this server that
+    // routes through this one (sendViaPeer) passes both, so a yielding tool keeps
+    // its longer budget and a targeted command still reaches its window.
+    const rawTimeout = body.value?.timeoutMs;
+    const timeoutMs =
+      typeof rawTimeout === "number" && Number.isFinite(rawTimeout)
+        ? Math.min(Math.max(rawTimeout, 1_000), 600_000)
+        : undefined;
     try {
-      const result = await this.send(tool, args as Record<string, unknown>);
+      const result = await this.send(tool, args as Record<string, unknown>, timeoutMs, target);
       res.setHeader("content-type", "application/json");
       res.end(JSON.stringify({ ok: true, result }));
     } catch (err: any) {
@@ -1293,6 +1553,11 @@ export class StudioBridge implements StudioTransport {
     this.pending.delete(id);
     if (ok) {
       pending.resolve(result);
+    } else if (typeof error?.error === "string" && error.code === undefined) {
+      // A handler's own { error: "..." } body (mutate's rolled_back, read's
+      // not_found). The plugin now flags these ok=false so its HUD counts them,
+      // but callers read the body, so hand it back as before.
+      pending.resolve(error);
     } else {
       // Plugin handlers historically used either { code, message } or { error: "..." }.
       const errStr = typeof error?.error === "string" ? error.error : undefined;

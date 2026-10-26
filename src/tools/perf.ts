@@ -36,7 +36,6 @@ export const PERF_TOOLS: ToolEntry[] = [
           },
         },
       },
-      readOnly: true,
       outputSchema: objectResult({ result: {} }),
     },
     (args) => `
@@ -93,7 +92,6 @@ return out
           topClasses: { type: "number", description: "How many classes to list (default 12)." },
         },
       },
-      readOnly: true,
       outputSchema: objectResult({ result: {} }),
       // A big Workspace walk is the expensive part, so declare a real budget
       // rather than racing the default timeout.

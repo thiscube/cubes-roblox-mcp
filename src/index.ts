@@ -3,7 +3,6 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StudioBridge, resolveToken } from "./bridge.js";
 import { createMcpServer, readOnlyFromEnv } from "./server.js";
 import { rpcReadOnlyCommands } from "./rpc-policy.js";
-import { lintAvailable } from "./lint.js";
 import { installPlugin, installedPluginFiles, pluginsDir, PLUGIN_FILENAME } from "./install-plugin.js";
 import { MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION } from "./protocol.js";
 import { tokenFile } from "./paths.js";
@@ -190,24 +189,29 @@ async function main(): Promise<void> {
   // was tried in this ecosystem and removed again, because it produces a plugin
   // panel that reports "connected" while pointing at a port nothing is serving.
   // A named failure beats a silent mismatch.
-  let bridgeStarted = true;
-  try {
-    await bridge.start();
-  } catch (err) {
-    bridgeStarted = false;
-    // Usually another Claude session's copy of this server. Keep trying, so this
-    // one takes over when that session closes instead of staying down.
-    bridge.retryListen();
-    console.error(
-      `[cubes-mcp] the Studio bridge could not start: ${err instanceof Error ? err.message : String(err)}\n` +
-        `[cubes-mcp] MCP is still up and every tool is still listed; the ones that need\n` +
-        `[cubes-mcp] Studio will explain this instead of hanging. Retrying the port every 3s.`,
-    );
-  }
+  //
+  // The listen runs alongside the stdio handshake rather than before it: the
+  // client's `initialize` does not need the port, and a Studio call made before
+  // the listen settles reports "not connected", as it would a moment later.
+  const bridgeStart = bridge.start().then(
+    () => true,
+    (err) => {
+      // Usually another Claude session's copy of this server. Keep trying, so this
+      // one takes over when that session closes instead of staying down.
+      bridge.retryListen();
+      console.error(
+        `[cubes-mcp] the Studio bridge could not start: ${err instanceof Error ? err.message : String(err)}\n` +
+          `[cubes-mcp] Until the port frees up, Studio calls go through the copy that holds it\n` +
+          `[cubes-mcp] (usually another Claude session). Retrying the port every 3s.`,
+      );
+      return false;
+    },
+  );
 
   const server = createMcpServer(bridge, { readOnly: READ_ONLY });
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  const bridgeStarted = await bridgeStart;
 
   console.error(
     bridgeStarted
@@ -223,21 +227,21 @@ async function main(): Promise<void> {
   if (bridge.tokenWarning) {
     console.error(`[cubes-mcp] ${bridge.tokenWarning}`);
   }
+  // Never the token itself: MCP clients keep stderr in their logs. Its location
+  // and last four characters are enough to find it and tell two apart.
+  const fingerprint = `...${bridge.token.slice(-4)}`;
   if (bridge.tokenPersisted) {
-    // Printed once, on the run that created it. On later runs the value is
-    // unchanged, so re-echoing a live secret into the client's log every start
-    // buys nothing -- the panel already has it.
     console.error(
       bridge.tokenGenerated
-        ? `[cubes-mcp] bridge token: ${bridge.token}\n` +
-            `[cubes-mcp] paste this into the Cubes MCP panel in Studio. It is saved to\n` +
-            `[cubes-mcp] ${tokenFile()} and will not change on restart.`
-        : `[cubes-mcp] bridge token loaded from ${tokenFile()} (unchanged since first run).`,
+        ? `[cubes-mcp] new bridge token (${fingerprint}) saved to ${tokenFile()}.\n` +
+            `[cubes-mcp] npm run setup bakes it into the plugin; to paste it by hand, copy it from that file.`
+        : `[cubes-mcp] bridge token ${fingerprint} loaded from ${tokenFile()} (unchanged since first run).`,
     );
   } else if (bridge.tokenGenerated) {
     console.error(
-      `[cubes-mcp] bridge token (this run only): ${bridge.token}\n` +
-        `[cubes-mcp] it could not be saved, so it changes every restart. Set CUBES_MCP_TOKEN to pin it.`,
+      `[cubes-mcp] bridge token ${fingerprint} is for this run only: it could not be saved, and it is not\n` +
+        `[cubes-mcp] printed because client logs keep stderr. Set CUBES_MCP_TOKEN to a value of your own\n` +
+        `[cubes-mcp] and paste the same value into the Studio panel.`,
     );
   } else {
     console.error("[cubes-mcp] bridge token loaded from CUBES_MCP_TOKEN.");
@@ -246,7 +250,8 @@ async function main(): Promise<void> {
     `[cubes-mcp] protocol ${MIN_PROTOCOL_VERSION}-${MAX_PROTOCOL_VERSION}; ` +
       `the plugin must report a version in that range or every call fails.`,
   );
-  const lint = await lintAvailable();
+  // Loaded after the handshake: nothing before `ready` needs the linter.
+  const lint = await (await import("./lint.js")).lintAvailable();
   if (!lint.ok) {
     console.error(`[cubes-mcp] inline Luau lint is OFF (${lint.reason}). Set CUBES_MCP_LINT_CWD if your selene.toml lives elsewhere.`);
   }

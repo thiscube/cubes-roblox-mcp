@@ -161,6 +161,20 @@ local function removeAttrsList(inst, names)
 	return removed
 end
 
+-- Returned by coerceValue for an explicit clear ({__nil = true}). JSON null
+-- can't carry this: HttpService:JSONDecode drops null keys entirely.
+local NIL = table.freeze({})
+
+-- Resolve a ref/path for an Instance-typed prop. Never yields nil silently:
+-- an unresolved token is an error, not a clear.
+local function resolveInstanceValue(propName, token)
+	local inst = Refs.resolve(token)
+	if not inst then
+		error(string.format("unresolved_ref: property '%s': %s", propName, tostring(token)))
+	end
+	return inst
+end
+
 -- Coerce a JSON value into the Roblox type the property currently holds.
 local function coerceValue(target, propName, value)
 	-- Fast path: booleans are unambiguous — no Roblox property accepts a bool
@@ -173,8 +187,11 @@ local function coerceValue(target, propName, value)
 	local t = ok and typeof(current) or nil
 
 	if type(value) == "table" then
+		if value.__nil == true then
+			return NIL
+		end
 		if value.__ref then
-			return Refs.resolve(value.__ref)
+			return resolveInstanceValue(propName, value.__ref)
 		end
 		-- Envelope string form: {__t = T, value = tostring(v)} from Serialize.value.
 		if value.__t and type(value.value) == "string" then
@@ -275,7 +292,7 @@ local function coerceValue(target, propName, value)
 
 	if type(value) == "string" then
 		if t == "Instance" then
-			return Refs.resolve(value)
+			return resolveInstanceValue(propName, value)
 		end
 		if t == "EnumItem" and current then
 			local leaf = string.match(value, "([%w_]+)$")
@@ -321,6 +338,9 @@ local function applyProps(inst, props)
 	local modified = {}
 	for propName, raw in pairs(props or {}) do
 		local value = coerceValue(inst, propName, raw)
+		if value == NIL then
+			value = nil
+		end
 		local ok, err = pcall(function()
 			inst[propName] = value
 		end)
@@ -339,7 +359,7 @@ function Mutate.mutate(args)
 	local created = {} -- for rollback
 	local changes = {}
 
-	local function resolveTarget(token)
+	local function resolveTargetRaw(token)
 		if type(token) ~= "string" then
 			return nil
 		end
@@ -351,6 +371,15 @@ function Mutate.mutate(args)
 			return Refs.resolve(key)
 		end
 		return Refs.resolve(token)
+	end
+
+	-- Refuse instances that were destroyed or unparented out of the DataModel.
+	local function resolveTarget(token)
+		local inst = resolveTargetRaw(token)
+		if inst and inst ~= game and not inst:IsDescendantOf(game) then
+			error(string.format("ref_dead: %s (destroyed or unparented)", tostring(token)))
+		end
+		return inst
 	end
 
 	local waypointName = "Cubes MCP mutate"

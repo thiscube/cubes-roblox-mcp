@@ -14,6 +14,7 @@ import { LIGHTING_TOOLS } from "./lighting.js";
 import { DOCS_TOOLS } from "./docs.js";
 import { ASSETS_TOOLS } from "./assets.js";
 import { PERF_TOOLS } from "./perf.js";
+import { CLOUD_TOOLS } from "./cloud.js";
 
 /**
  * Every specialist tool, assembled from the per-category files.
@@ -40,4 +41,5 @@ export const ALL_TOOLS: ToolEntry[] = [
   ...DOCS_TOOLS,
   ...ASSETS_TOOLS,
   ...PERF_TOOLS,
+  ...CLOUD_TOOLS,
 ];

@@ -127,6 +127,12 @@ local function matchesFilters(inst, filters)
 	return true
 end
 
+-- Hard cap on nodes visited by one query, and how often to yield while walking.
+local MAX_VISITED = 100000
+local YIELD_EVERY = 5000
+
+-- Returns the matched instances, and `true` as a second value if MAX_VISITED
+-- cut the walk short.
 function Query.run(query)
 	local segments = {}
 	for seg in string.gmatch(query, "[^/]+") do
@@ -168,35 +174,91 @@ function Query.run(query)
 		end
 	end
 
+	local canYield = coroutine.isyieldable()
+	local visited = 0
+	local truncated = false
+	-- Count a visited node; false once the cap is hit.
+	local function visit()
+		visited += 1
+		if visited > MAX_VISITED then
+			truncated = true
+			return false
+		end
+		if canYield and visited % YIELD_EVERY == 0 then
+			task.wait()
+		end
+		return true
+	end
+
 	for i = 2, #segments do
 		local name, filters = parseSegment(segments[i])
 		if name == "" and #filters > 0 then
 			name = "*"
 		end
 		local nextSet = {}
+		local seen = {}
+		local function add(inst)
+			if not seen[inst] then
+				seen[inst] = true
+				nextSet[#nextSet + 1] = inst
+			end
+		end
+		-- For `**`, expand only nodes with no ancestor in the set: a nested
+		-- node's descendants are already covered, and expanding it again is
+		-- what made `**/**` quadratic.
+		local inSet = nil
+		if name == "**" then
+			inSet = {}
+			for _, node in ipairs(current) do
+				inSet[node] = true
+			end
+		end
 		for _, node in ipairs(current) do
+			if truncated then
+				break
+			end
 			if name == "**" then
-				for _, descendant in ipairs(node:GetDescendants()) do
-					if matchesFilters(descendant, filters) then
-						nextSet[#nextSet + 1] = descendant
+				local covered = false
+				local anc = node.Parent
+				while anc do
+					if inSet[anc] then
+						covered = true
+						break
+					end
+					anc = anc.Parent
+				end
+				if not covered then
+					for _, descendant in ipairs(node:GetDescendants()) do
+						if not visit() then
+							break
+						end
+						if matchesFilters(descendant, filters) then
+							add(descendant)
+						end
 					end
 				end
 			elseif name == "*" then
 				for _, child in ipairs(node:GetChildren()) do
+					if not visit() then
+						break
+					end
 					if matchesFilters(child, filters) then
-						nextSet[#nextSet + 1] = child
+						add(child)
 					end
 				end
 			else
 				local child = node:FindFirstChild(name)
 				if child and matchesFilters(child, filters) then
-					nextSet[#nextSet + 1] = child
+					add(child)
 				end
 			end
 		end
 		current = nextSet
+		if truncated then
+			break
+		end
 	end
-	return current
+	return current, truncated
 end
 
 return Query

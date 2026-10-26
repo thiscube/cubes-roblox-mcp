@@ -89,6 +89,15 @@ global budget of 4 stream clients, also shared with every other plugin.
 | `mesh_bake` | 2 | read-only: `{ positions, normals, colors, indices, center, size, skipped }`, see `plugin/src/MeshTools.luau` |
 | `mesh_build` | 2 | writes: `{ ref, path, vertexCount, triangleCount, size }` |
 
+`mesh_bake` args are `{ target, encoding? }`. When `encoding` is `"f32b64"` the
+plugin may reply with `encoding: "f32b64"` and `positions`, `normals`, `colors`
+as base64 strings of float32 little-endian values, and `indices` as base64 of
+uint32 little-endian, in the same order as the arrays. Values are rounded to 4
+decimals before packing and the server re-rounds after widening, so they equal
+the JSON path for |x| < 1024. A plugin that ignores the arg replies with arrays,
+and the server accepts either per field. `mesh_build` is still arrays only: the
+handshake carries no capability field the server could negotiate it on.
+
 Protocol 4 adds the WebSocket transport below; it carries the same commands.
 
 Every command sent while an MCP tool call is running also carries `via`, the

@@ -90,6 +90,9 @@ export const CORE_OUTPUT_SCHEMAS: Record<string, JsonSchema> = {
     // Always set by handleMutate on the success path, so they can be typed.
     lint: { type: "array" },
     appliedLevel: { type: "string", enum: ["none", "soft", "hard", "nuclear"] },
+    // Set when the batch touched script source: how many versions script
+    // history saved, plus `error` if saving them failed (script-history.ts).
+    history: { type: "object" },
     // The gate's own fields. They are server-written on the REFUSAL path, but
     // this same schema also validates a plugin's success object, and a plugin
     // that happens to use one of these names with a different shape would have

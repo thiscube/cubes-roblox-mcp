@@ -746,6 +746,76 @@ describe("tokenFileRefusal", () => {
   });
 });
 
+/**
+ * Several Claude sessions each start a copy of this server, and only one can
+ * own the port. The others used to fail every call until that session closed.
+ */
+describe("shared port across sessions", () => {
+  async function ownerAndGuest() {
+    const owner = await makeBridge();
+    const guest = new StudioBridge(owner.port, { readOnlyCommands: rpcReadOnlyCommands() });
+    await assert.rejects(() => guest.start());
+    // Long retry interval: the owner keeps the port for the whole test.
+    guest.retryListen(60_000);
+    return { owner, guest };
+  }
+
+  async function until(check, ms = 3000) {
+    const deadline = Date.now() + ms;
+    while (!check() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 25));
+  }
+
+  test("a copy without the port runs commands through the one that has it", async () => {
+    const { owner, guest } = await ownerAndGuest();
+    try {
+      const poll = owner.call("/poll", { body: { protocol: MAX_PROTOCOL_VERSION, writeEnabled: true } });
+      await new Promise((r) => setTimeout(r, 50));
+      await until(() => guest.connected);
+      assert.equal(guest.connected, true, "the guest never picked up the owner's connection");
+      assert.equal(guest.writeEnabled, true);
+      assert.equal(guest.diagnosis.proxying, true);
+
+      const inflight = guest.send("read", { path: "Workspace" }, 3000);
+      const cmd = await (await poll).json();
+      assert.equal(cmd.tool, "read");
+      assert.deepEqual(cmd.args, { path: "Workspace" });
+      await owner.call("/result", { body: { id: cmd.id, ok: true, result: { items: ["hello"] } } });
+      assert.deepEqual(await inflight, { items: ["hello"] });
+    } finally {
+      await owner.bridge.stop();
+      await guest.stop();
+    }
+  });
+
+  test("the owner's write gate applies to commands routed through it", async () => {
+    const { owner, guest } = await ownerAndGuest();
+    try {
+      const poll = owner.call("/poll", { body: { protocol: MAX_PROTOCOL_VERSION, writeEnabled: false } });
+      await new Promise((r) => setTimeout(r, 50));
+      await until(() => guest.connected);
+      assert.equal(guest.writeEnabled, false);
+      await assert.rejects(() => guest.send("mutate", { ops: [] }, 2000), { code: "write_mode_disabled" });
+      await owner.bridge.stop();
+      await poll.catch(() => {});
+    } finally {
+      await owner.bridge.stop();
+      await guest.stop();
+    }
+  });
+
+  test("with no plugin anywhere, the guest says what the owner says", async () => {
+    const { owner, guest } = await ownerAndGuest();
+    try {
+      await until(() => guest.diagnosis.proxying && guest.describeDisconnect().includes("nothing has ever polled"));
+      assert.equal(guest.connected, false);
+      await assert.rejects(() => guest.send("read", {}, 2000), { code: "studio_not_connected" });
+    } finally {
+      await owner.bridge.stop();
+      await guest.stop();
+    }
+  });
+});
+
 describe("command provenance (via)", () => {
   test("a command sent inside a tool call names that call, however deep the send", async () => {
     const { bridge, call } = await makeBridge();

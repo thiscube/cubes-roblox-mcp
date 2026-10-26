@@ -14,6 +14,8 @@ import {
 import { beginUndo, cancelUndo, endUndo } from "./_luau-helpers.js";
 import {
   type MeshData,
+  MESH_WIRE_ENCODING,
+  decodeMeshWire,
   meshBounds,
   meshFormatOf,
   readMeshFile,
@@ -24,6 +26,12 @@ import {
 
 /** EditableMesh refuses meshes much past this; say so before sending megabytes. */
 const MAX_IMPORT_VERTICES = 60000;
+
+/** A model-supplied string made safe for a human prompt: one line, no control characters, short. */
+function promptText(value: unknown, max = 80): string {
+  const s = String(value ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").trim();
+  return s.length > max ? `${s.slice(0, max)}...` : s;
+}
 
 function pathError(err: unknown, hint: string): Record<string, unknown> {
   return { error: "path_not_allowed", message: err instanceof Error ? err.message : String(err), hint };
@@ -305,6 +313,9 @@ return {
       // going to be allowed.
       let resolved: string;
       try {
+        if (/:/.test(String(args.filePath ?? "").replace(/^[A-Za-z]:/, ""))) {
+          throw new Error("Refusing a path with ':' after the drive (NTFS alternate data stream).");
+        }
         resolved = resolveUploadPath(
           String(args.filePath ?? ""),
           undefined,
@@ -324,7 +335,7 @@ return {
       // criticises the competition for. It is honoured only as the fallback for
       // a client that cannot show a prompt at all.
       const approved = await ctx.confirmWithUser?.(
-        `Upload "${args.name}" to Roblox as a ${args.assetType}?`,
+        `Upload "${promptText(args.name)}" to Roblox as a ${promptText(args.assetType)}?`,
         [
           `File: ${resolved}`,
           "This publishes to the Roblox account behind your Open Cloud key.",
@@ -388,11 +399,17 @@ return {
     async (args, ctx) => {
       let out: string;
       try {
+        // Overwriting is a destructive disk write, so it waits for Allow writes.
+        if (args.overwrite === true && !ctx.bridge.writeEnabled) {
+          return { error: "write_mode_disabled", hint: "Replacing an existing file needs Allow writes on in the Studio panel, or pick a new path." };
+        }
         out = await resolveMeshWritePath(String(args.path ?? ""), { overwrite: args.overwrite === true });
       } catch (err) {
         return pathError(err, "Write to a .obj or .glb under the project directory; pass overwrite: true to replace.");
       }
-      const baked = (await ctx.bridge.send("mesh_bake", { target: args.target }, 90_000)) as MeshData & {
+      // Ask for the compact encoding; an older plugin ignores it and sends arrays.
+      const reply = (await ctx.bridge.send("mesh_bake", { target: args.target, encoding: MESH_WIRE_ENCODING }, 90_000)) as Record<string, unknown> | null;
+      let baked: MeshData & {
         name?: string;
         vertexCount?: number;
         triangleCount?: number;
@@ -401,6 +418,11 @@ return {
         center?: number[];
         size?: number[];
       };
+      try {
+        baked = decodeMeshWire(reply ?? {}) as typeof baked;
+      } catch (err) {
+        return { error: "bad_mesh_reply", message: err instanceof Error ? err.message : String(err) };
+      }
       if (!baked?.positions?.length || !baked?.indices?.length) {
         return { error: "nothing_to_export", message: "Nothing in the target could be turned into triangles.", skipped: baked?.skipped ?? [] };
       }

@@ -43,7 +43,8 @@ export type Category =
   | "debug"
   | "docs"
   | "perf"
-  | "session";
+  | "session"
+  | "cloud";
 
 /** Everything a tool handler needs from the server. */
 export interface ToolContext {
@@ -290,7 +291,8 @@ interface IndexDoc {
 
 export class ToolRegistry {
   private readonly entries = new Map<string, ToolEntry>();
-  private readonly index: MiniSearch<IndexDoc>;
+  /** Built on the first search, not at startup: the handshake never needs it. */
+  private indexCache?: MiniSearch<IndexDoc>;
   private readonly searchCache = new Map<string, ToolEntry[]>();
   private static readonly SEARCH_CACHE_MAX = 64;
 
@@ -301,8 +303,11 @@ export class ToolRegistry {
       }
       this.entries.set(entry.name, entry);
     }
+  }
 
-    this.index = new MiniSearch<IndexDoc>({
+  private get index(): MiniSearch<IndexDoc> {
+    if (this.indexCache) return this.indexCache;
+    const index = new MiniSearch<IndexDoc>({
       fields: ["name", "category", "subcategories", "keywords", "description"],
       storeFields: ["name"],
       searchOptions: {
@@ -312,9 +317,8 @@ export class ToolRegistry {
         combineWith: "OR",
       },
     });
-
-    this.index.addAll(
-      entries.map((e) => ({
+    index.addAll(
+      [...this.entries.values()].map((e) => ({
         id: e.name,
         name: e.name,
         category: e.category,
@@ -323,6 +327,7 @@ export class ToolRegistry {
         description: e.description,
       })),
     );
+    return (this.indexCache = index);
   }
 
   get(name: string): ToolEntry | undefined {
@@ -360,13 +365,24 @@ export class ToolRegistry {
     const lowerQuery = query.toLowerCase();
     const intentCats = intent ? INTENT_CATEGORIES[intent] ?? [] : [];
     const recentSet = new Set(recent);
+    // Whether the query names a category, decided once per category rather
+    // than compiling a RegExp for every scored document.
+    const namedCats = new Map<string, boolean>();
+    const namesCategory = (cat: string) => {
+      let hit = namedCats.get(cat);
+      if (hit === undefined) {
+        hit = new RegExp(`\\b${cat}\\b`, "i").test(lowerQuery);
+        namedCats.set(cat, hit);
+      }
+      return hit;
+    };
 
     const results = this.index.search(query, {
       boostDocument: (id: string) => {
         const entry = this.entries.get(id);
         if (!entry) return 1;
         let boost = 1;
-        if (new RegExp(`\\b${entry.category}\\b`, "i").test(lowerQuery)) boost *= 2;
+        if (namesCategory(entry.category)) boost *= 2;
         if (intentCats.includes(entry.category)) boost *= 1.5;
         // What the session just used is a strong hint at what it means now.
         if (recentSet.has(entry.name)) boost *= 1.4;
@@ -422,6 +438,8 @@ interface ToolMeta {
  * knows which properties to ask for. It stays an eval tool rather than becoming
  * a local one that calls the bridge, because its effect really is in Studio and
  * the channel is what decides capability.
+ *
+ * Every eval tool is write-class, whatever its meta says: see the note in the body.
  */
 export function evalTool(
   meta: ToolMeta,
@@ -429,6 +447,10 @@ export function evalTool(
 ): ToolEntry {
   return {
     ...meta,
+    // Always write-class. The bridge and plugin refuse "eval" while writes are off,
+    // and must: any token holder could send arbitrary Luau through a read-only eval
+    // path. So a `readOnly` on an eval tool would only be a wrong label.
+    readOnly: undefined,
     channel: "eval",
     handler: async (args, ctx) => {
       const result = await ctx.bridge.send(

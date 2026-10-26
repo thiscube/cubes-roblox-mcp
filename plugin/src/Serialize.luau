@@ -5,11 +5,14 @@ local Refs = require(script.Parent.Refs)
 
 local Serialize = {}
 
--- Safe property read: returns (value, ok).
+local function index(inst, name)
+	return inst[name]
+end
+
+-- Safe property read: returns (value, ok). pcall on a shared function rather
+-- than a fresh closure, since this runs once per property per instance.
 function Serialize.getProp(inst, name)
-	local ok, value = pcall(function()
-		return inst[name]
-	end)
+	local ok, value = pcall(index, inst, name)
 	if not ok then
 		return nil, false
 	end
@@ -44,11 +47,24 @@ local function isArray(tbl)
 	return n == #tbl
 end
 
+-- Tables a producer has built JSON-safe already (mesh_bake's flat arrays,
+-- snapshot records). deep() returns them as-is instead of walking and copying
+-- every element. Weak keys: the mark dies with the table.
+local preSanitized = setmetatable({}, { __mode = "k" })
+
+function Serialize.jsonSafe(tbl)
+	preSanitized[tbl] = true
+	return tbl
+end
+
 -- Deep-sanitize an arbitrary value so HttpService:JSONEncode never throws.
 function Serialize.deep(v, depth)
 	depth = depth or 0
 	local t = typeof(v)
 	if t == "table" then
+		if preSanitized[v] then
+			return v
+		end
 		if depth > 6 then
 			return "<max-depth>"
 		end

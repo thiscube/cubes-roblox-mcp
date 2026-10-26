@@ -23,6 +23,13 @@ const NUCLEAR_SERVICES: ReadonlySet<string> = new Set(
     "RunService", "HttpService", "DataStoreService", "MarketplaceService",
     "TeleportService", "MessagingService", "Teams", "CollectionService",
     "PhysicsService", "TweenService", "UserInputService", "ContextActionService",
+    "TextChatService", "MaterialService", "VoiceChatService", "BadgeService",
+    "GroupService", "PolicyService", "LocalizationService", "SocialService",
+    "AvatarEditorService", "AssetService", "InsertService", "GamePassService",
+    "ProximityPromptService", "PathfindingService", "GuiService", "TextService",
+    "StarterPlayerScripts", "StarterCharacterScripts", "Debris", "Selection",
+    "ChangeHistoryService", "LogService", "ScriptContext", "Stats",
+    "game", "DataModel",
   ].map((s) => s.toLowerCase()),
 );
 
@@ -56,11 +63,40 @@ const REF_TOKEN = /^[a-z]+\d+$/;
  */
 export function serviceTargetOf(rawTarget: unknown): string | null {
   let t = String(rawTarget ?? "").trim();
+  if (t.startsWith("@")) t = t.slice(1); // `@Path` still resolves as a path plugin-side
+  t = t.replace(/\s*\.\s*/g, ".").replace(/\.{2,}/g, ".").replace(/^\.+|\.+$/g, "");
   if (!t) return null;
-  t = t.replace(/^game\s*[.:]\s*/i, "");
+  // `game.game.Workspace`, `DataModel.Workspace`, `game:GetService(...)`.
+  while (/^(game|DataModel)\s*[.:]\s*\S/i.test(t)) t = t.replace(/^(game|DataModel)\s*[.:]\s*/i, "");
   t = t.replace(/^GetService\(["']?|["']?\)$/gi, "");
   if (t.includes(".")) return null; // a path into a service, not the service itself
   return NUCLEAR_SERVICES.has(t.toLowerCase()) ? t : null;
+}
+
+/**
+ * The ids a batch's own `create` ops register. Mutate.luau's resolveTarget
+ * treats `@x` as a same-batch result only when `x` is one of these; any other
+ * `@x` falls through to `Refs.resolve(x)`, i.e. an ordinary path or ref.
+ */
+export function batchIdsOf(ops: unknown[]): Set<string> {
+  const ids = new Set<string>();
+  for (const raw of ops) {
+    const op = raw as { op?: unknown; id?: unknown } | null;
+    if (op && typeof op === "object" && op.op === "create" && typeof op.id === "string") ids.add(op.id);
+  }
+  return ids;
+}
+
+/**
+ * The path/ref a target resolves to outside the batch, with a leading `@`
+ * stripped, or null when it names an instance this batch creates.
+ */
+export function externalTarget(rawTarget: unknown, batchIds: Set<string>): string | null {
+  if (typeof rawTarget !== "string") return null;
+  const t = rawTarget.trim();
+  if (!t.startsWith("@")) return t || null;
+  const key = t.slice(1);
+  return batchIds.has(key) ? null : key || null;
 }
 
 /** True when the server cannot tell what a target points at. */
@@ -69,6 +105,17 @@ function isOpaqueTarget(rawTarget: unknown): boolean {
   if (!t) return false;
   // Session ref tokens and same-batch @id references resolve plugin-side only.
   return REF_TOKEN.test(t) || t.startsWith("@");
+}
+
+/** A `set` that reparents (a ref that fails to resolve assigns nil: a delete). */
+function setsParent(op: Op): boolean {
+  return !!op.props && typeof op.props === "object" && Object.keys(op.props).some((k) => k.toLowerCase() === "parent");
+}
+
+/** `Archivable = false` drops the instance from saves and clones. */
+function clearsArchivable(op: Op): boolean {
+  return !!op.props && typeof op.props === "object" &&
+    Object.entries(op.props).some(([k, v]) => k.toLowerCase() === "archivable" && v !== true);
 }
 
 function classifyOp(op: Op): { level: DestructivenessLevel; uncertain: boolean } {
@@ -82,13 +129,22 @@ function classifyOp(op: Op): { level: DestructivenessLevel; uncertain: boolean }
   if (verb === "set") {
     const writesSource =
       op.props && typeof op.props === "object" && Object.keys(op.props).some((k) => k === "Source");
-    return { level: writesSource ? "hard" : "soft", uncertain: false };
+    return { level: writesSource || setsParent(op) || clearsArchivable(op) ? "hard" : "soft", uncertain: false };
   }
   // delete
   if (serviceTargetOf(op.target)) return { level: "nuclear", uncertain: false };
   // A ref or @id could BE a service; we cannot tell from here. Still `hard`
   // (so it needs confirmation either way) but the summary says so.
   return { level: "hard", uncertain: isOpaqueTarget(op.target) };
+}
+
+/**
+ * Make model-supplied text safe to show in a confirmation prompt: no control
+ * characters or newlines (which could forge extra prompt lines), and bounded.
+ */
+export function safeText(v: unknown, max = 120): string {
+  const s = String(v ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ");
+  return s.length > max ? `${s.slice(0, max)}…` : s;
 }
 
 export function assessDestructiveness(ops: unknown[]): Assessment {
@@ -98,6 +154,7 @@ export function assessDestructiveness(ops: unknown[]): Assessment {
   let creates = 0;
   let propSets = 0;
   let scriptWrites = 0;
+  let reparents = 0;
   let deletes = 0;
   let serviceDeletes = 0;
   let unknownOps = 0;
@@ -119,13 +176,24 @@ export function assessDestructiveness(ops: unknown[]): Assessment {
     const verb = typeof op.op === "string" ? op.op : "";
     if (!KNOWN_OPS.has(verb)) {
       unknownOps += 1;
-      detail.push(`unrecognised op "${verb || "(missing)"}" on ${String(op.target ?? "?")}`);
+      detail.push(`unrecognised op "${safeText(verb || "(missing)")}" on ${safeText(op.target ?? "?")}`);
     } else if (verb === "create") {
       creates += 1;
     } else if (verb === "set") {
       if (opLevel === "hard") {
-        scriptWrites += 1;
-        detail.push(`overwrite script source on ${op.target}`);
+        const t = safeText(op.target);
+        if (op.props && Object.keys(op.props).includes("Source")) {
+          scriptWrites += 1;
+          detail.push(`overwrite script source on ${t}`);
+        }
+        if (setsParent(op)) {
+          reparents += 1;
+          detail.push(`reparent ${t} (a Parent that does not resolve sets nil: this may DELETE it)`);
+        }
+        if (clearsArchivable(op)) {
+          reparents += 1;
+          detail.push(`set Archivable=false on ${t} (it will not be saved or cloned)`);
+        }
       } else {
         propSets += 1;
       }
@@ -133,13 +201,13 @@ export function assessDestructiveness(ops: unknown[]): Assessment {
       const svc = serviceTargetOf(op.target);
       if (svc) {
         serviceDeletes += 1;
-        detail.push(`DELETE SERVICE / TOP-LEVEL NODE: ${svc}`);
+        detail.push(`DELETE SERVICE / TOP-LEVEL NODE: ${safeText(svc)}`);
       } else {
         deletes += 1;
         detail.push(
           opUncertain
-            ? `delete ${op.target} (a ref — this MIGHT be a service; the server cannot tell)`
-            : `delete ${op.target}`,
+            ? `delete ${safeText(op.target)} (a ref — this MIGHT be a service; the server cannot tell)`
+            : `delete ${safeText(op.target)}`,
         );
       }
     }
@@ -149,6 +217,7 @@ export function assessDestructiveness(ops: unknown[]): Assessment {
   if (creates) parts.push(`create ${creates}`);
   if (propSets) parts.push(`set props on ${propSets}`);
   if (scriptWrites) parts.push(`overwrite ${scriptWrites} script source(s)`);
+  if (reparents) parts.push(`reparent / unarchive ${reparents} instance(s)`);
   if (deletes) parts.push(`delete ${deletes} instance(s)`);
   if (serviceDeletes) parts.push(`delete ${serviceDeletes} service/top-level node(s)`);
   if (unknownOps) parts.push(`${unknownOps} unrecognised op(s)`);

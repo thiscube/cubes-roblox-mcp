@@ -171,7 +171,7 @@ end
 -- Sort targets by relevance so the first page is the useful page:
 --   recently modified this session  >  selected in Studio  >  sticky class  >  name
 -- `stickyClasses` is an optional ordered list passed down by the MCP server.
-local function rankTargets(targets, stickyClasses)
+local function rankTargets(targets, stickyClasses, need)
 	if #targets < 2 then
 		return targets
 	end
@@ -188,7 +188,7 @@ local function rankTargets(targets, stickyClasses)
 		end
 	end
 
-	local score = {}
+	local score, name = {}, {}
 	for _, inst in ipairs(targets) do
 		local s = 0
 		local recency = SessionState.recency(inst)
@@ -200,14 +200,37 @@ local function rankTargets(targets, stickyClasses)
 		end
 		s += (stickyRank[inst.ClassName] or 0) * 1000
 		score[inst] = s
+		-- Cached: the comparator reads it O(n log n) times, each a property fetch.
+		name[inst] = inst.Name
 	end
 
-	table.sort(targets, function(a, b)
+	local function before(a, b)
 		if score[a] == score[b] then
-			return a.Name < b.Name
+			return name[a] < name[b]
 		end
 		return score[a] > score[b]
-	end)
+	end
+
+	-- Only the first `need` are ever returned. When that is a small slice of a
+	-- big list, keep a sorted top-`need` window in one pass instead of sorting
+	-- everything (O(n*need) with need <= 200, vs O(n log n) full sort).
+	if need and need >= 1 and need <= 200 and need * 8 < #targets then
+		local top = {}
+		for _, inst in ipairs(targets) do
+			local n = #top
+			if n < need or before(inst, top[n]) then
+				local i = math.min(n, need - 1)
+				while i >= 1 and before(inst, top[i]) do
+					top[i + 1] = top[i]
+					i -= 1
+				end
+				top[i + 1] = inst
+			end
+		end
+		return top
+	end
+
+	table.sort(targets, before)
 	return targets
 end
 
@@ -229,6 +252,7 @@ function Read.read(args)
 	end
 
 	local targets = {}
+	local queryTruncated = nil
 
 	if args.ref then
 		local inst = Refs.resolve(args.ref)
@@ -240,9 +264,12 @@ function Read.read(args)
 		end
 		targets = args.children and inst:GetChildren() or { inst }
 	elseif args.query then
-		targets = Query.run(args.query)
+		targets, queryTruncated = Query.run(args.query)
 	elseif args.path then
 		local res = Refs.resolveWithSuggestions(args.path)
+		if not res.ok and res.refDead then
+			return { error = "ref_dead", ref = args.path, hint = "Ref is from an earlier plugin load. Re-read to get a fresh ref." }
+		end
 		if not res.ok then
 			return {
 				error = "not_found",
@@ -264,11 +291,10 @@ function Read.read(args)
 		targets = game:GetChildren()
 	end
 
-	targets = rankTargets(targets, args.stickyClasses)
-
 	local total = #targets
 	local limit = tonumber(args.limit) or 20
 	local offset = tonumber(args.cursor) or 0
+	targets = rankTargets(targets, args.stickyClasses, offset + limit)
 	local page = {}
 	for i = offset + 1, math.min(offset + limit, total) do
 		page[#page + 1] = targets[i]
@@ -314,6 +340,7 @@ function Read.read(args)
 		cursor = nextCursor,
 		items = items,
 		prefetched = prefetched,
+		query_truncated = queryTruncated or nil,
 	}
 	return result
 end

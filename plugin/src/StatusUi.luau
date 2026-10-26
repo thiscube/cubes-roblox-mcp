@@ -8,6 +8,7 @@
 
 local Config = require(script.Parent.Config)
 local HudOverlay = require(script.Parent.HudOverlay)
+local PlaytestBus = require(script.Parent.PlaytestBus)
 local TweenService = game:GetService("TweenService")
 local TextService = game:GetService("TextService")
 
@@ -606,15 +607,9 @@ local function signalIcon(parent, layoutOrder)
 end
 
 -- ---- public -----------------------------------------------------------
-function StatusUi.create(plugin, Transport)
-	local widgetInfo = DockWidgetPluginGuiInfo.new(
-		Enum.InitialDockState.Float, false, false,
-		380, 580, 320, 380
-	)
-	local widget = plugin:CreateDockWidgetPluginGui("CubesMCP_Status", widgetInfo)
-	widget.Title = "Cubes MCP"
-	widget.Name = "CubesMCP_Status"
-
+-- The panel contents. Built on the first open (see StatusUi.create), so a
+-- closed panel costs no instances, tweens or Transport.changed renders.
+local function buildContents(plugin, Transport, widget)
 	-- root: dark background, padding, vertical list, fixed header/footer + scroll body
 	local root = Instance.new("Frame")
 	root.BackgroundColor3 = C.bg
@@ -1421,8 +1416,7 @@ function StatusUi.create(plugin, Transport)
 		paintVisualDebug()
 	end
 
-	-- Sync the HUD + button visuals to the restored state.
-	HudOverlay.setVisible(visualDebugOn)
+	-- The HUD itself was restored at load by StatusUi.create; sync the button.
 	paintVisualDebug()
 
 	-- Allow writes: the server refuses every write-class command while this is
@@ -1630,7 +1624,6 @@ function StatusUi.create(plugin, Transport)
 	local IDLE_AFTER_LOCAL = 4 -- total seconds of "doing X" display, then Idle
 
 	local function detectActivity(status)
-		local RunService = game:GetService("RunService")
 		if not status.polling or status.mode == "off" then
 			return "Inactive", C.dim, false
 		end
@@ -1649,7 +1642,8 @@ function StatusUi.create(plugin, Transport)
 			-- to a static green afterward so the eye isn't constantly drawn there.
 			return label, C.green, age < DOING_WINDOW
 		end
-		if RunService:IsRunning() then
+		-- RunService:IsRunning() is false in the edit DM even mid-playtest.
+		if PlaytestBus.isAnyLive() then
 			return "Playtest", C.yellow, true
 		end
 		return "Idle", C.yellow, false
@@ -1683,9 +1677,6 @@ function StatusUi.create(plugin, Transport)
 		local status = Transport.status
 		local info = MODE_INFO[status.mode] or MODE_INFO.off
 
-		if status.mode == "connecting" and not widget.Enabled then
-			widget.Enabled = true
-		end
 		-- header status text (no dot — color carries the state)
 		statusText.Text = info.label
 		statusText.TextColor3 = info.color
@@ -1830,7 +1821,14 @@ function StatusUi.create(plugin, Transport)
 		applyEndpoint()
 	end)
 
-	Transport.changed.Event:Connect(render)
+	-- render() derives everything from Transport.status, so skipping it while
+	-- the panel is hidden loses nothing; it catches up on show.
+	Transport.changed.Event:Connect(function()
+		if widget.Enabled then render() end
+	end)
+	widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+		if widget.Enabled then render() end
+	end)
 
 	-- keep relative times fresh
 	local stopped = false
@@ -1844,7 +1842,41 @@ function StatusUi.create(plugin, Transport)
 	render()
 
 	local function cleanup() stopped = true end
-	return widget, cleanup
+	return cleanup
+end
+
+function StatusUi.create(plugin, Transport)
+	local widgetInfo = DockWidgetPluginGuiInfo.new(
+		Enum.InitialDockState.Float, false, false,
+		380, 580, 320, 380
+	)
+	local widget = plugin:CreateDockWidgetPluginGui("CubesMCP_Status", widgetInfo)
+	widget.Title = "Cubes MCP"
+	widget.Name = "CubesMCP_Status"
+
+	-- The activity bar lives in the viewport, not the panel, so its saved
+	-- state is restored now even though the panel builds lazily.
+	local activityBarOn = true
+	pcall(function()
+		local saved = plugin:GetSetting("activityBar")
+		if type(saved) == "boolean" then activityBarOn = saved end
+	end)
+	HudOverlay.setVisible(activityBarOn)
+
+	local cleanup = nil
+	local function ensureBuilt()
+		if cleanup == nil then
+			cleanup = buildContents(plugin, Transport, widget)
+		end
+	end
+	if widget.Enabled then ensureBuilt() end
+	widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+		if widget.Enabled then ensureBuilt() end
+	end)
+
+	return widget, function()
+		if cleanup then cleanup() end
+	end
 end
 
 return StatusUi

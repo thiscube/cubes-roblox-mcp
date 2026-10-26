@@ -31,6 +31,8 @@ export const TOOL_ACTIVITY: Record<string, string> = {
   find_references: "Searching",
   script_edit: "Scripting",
   script_read: "Reading",
+  script_history: "Checking",
+  script_restore: "Restoring",
 
   // debug
   debug_highlight: "Marking",
@@ -61,6 +63,8 @@ export const TOOL_ACTIVITY: Record<string, string> = {
   playtest_set_players: "Configuring",
   playtest_status: "Checking",
   tune: "Tuning",
+  client_eval: "Tuning",
+  signal_capture: "Measuring",
   character_goto: "Pathfinding",
   players_state: "Inspecting",
   character_state: "Inspecting",
@@ -117,6 +121,10 @@ export const TOOL_ACTIVITY: Record<string, string> = {
   // perf
   perf_stats: "Profiling",
   scene_analysis: "Analyzing",
+
+  // cloud
+  analytics_query: "Querying",
+  list_player_saves: "Listing",
 };
 
 const SCRIPT_CLASSES = new Set(["Script", "LocalScript", "ModuleScript"]);
@@ -146,9 +154,43 @@ export function mutateActivity(args: unknown): string {
   }
   const most = Math.max(creates, deletes, sets);
   if (most === 0) return "Editing";
+  // Destructive verbs win: a batch that deletes must not read as "Building".
+  if (deletes > 0) return "Deleting";
   if (creates === most) return "Building";
   if (sets === most) return renameOnly ? "Renaming" : tagOnly ? "Tagging" : "Editing";
   return "Deleting";
+}
+
+/** Only the head of a huge chunk is scanned: this runs before the write gate. */
+const SCAN_MAX = 64 * 1024;
+
+/**
+ * Drop `--[==[ ... ]==]` and `-- ...` comments in one linear pass. The old
+ * lazy-backreference regex was quadratic on many unclosed `--[[`.
+ */
+function stripComments(src: string): string {
+  let out = "";
+  let i = 0;
+  while (i < src.length) {
+    const at = src.indexOf("--", i);
+    if (at < 0) {
+      out += src.slice(i);
+      break;
+    }
+    out += src.slice(i, at);
+    const long = /^--\[(=*)\[/.exec(src.slice(at, at + 64));
+    if (long) {
+      // An unclosed long comment runs to end of file, as in Lua. Stopping here
+      // (rather than falling back to a line comment) keeps the scan linear.
+      const close = src.indexOf(`]${long[1]}]`, at + long[0].length);
+      if (close < 0) break;
+      i = close + long[1].length + 2;
+      continue;
+    }
+    const nl = src.indexOf("\n", at);
+    i = nl < 0 ? src.length : nl;
+  }
+  return out;
 }
 
 /**
@@ -158,13 +200,14 @@ export function mutateActivity(args: unknown): string {
  */
 export function runCodeActivity(luau: unknown): string {
   if (typeof luau !== "string" || luau.trim() === "") return "Executing";
-  const code = luau.replace(/--\[(=*)\[[\s\S]*?\]\1\]/g, "").replace(/--[^\n]*/g, "");
+  const code = stripComments(luau.length > SCAN_MAX ? luau.slice(0, SCAN_MAX) : luau);
 
   if (/\.\s*Source\s*=(?!=)|UpdateSourceAsync/.test(code)) return "Scripting";
   if (/Terrain/.test(code) && /:\s*(Fill\w*|WriteVoxels|ReplaceMaterial|Clear)\s*\(/.test(code)) return "Sculpting";
   if (/TweenService|:\s*LoadAnimation\s*\(/.test(code)) return "Animating";
-  if (/Instance\s*\.\s*new\s*\(|:\s*Clone\s*\(/.test(code)) return "Building";
+  // Destructive verbs win: a chunk that destroys must not read as "Building".
   if (/:\s*(Destroy|ClearAllChildren)\s*\(/.test(code)) return "Deleting";
+  if (/Instance\s*\.\s*new\s*\(|:\s*Clone\s*\(/.test(code)) return "Building";
   if (/__MCP\s*\.\s*mutate\s*\(/.test(code)) return "Editing";
   if (
     /[\w\]\)]\s*\.\s*\w+\s*=(?!=)|\]\s*=(?!=)/.test(code) ||

@@ -140,9 +140,12 @@ describe("write gate (#2, A2)", () => {
 
   test("#2 genuinely read-only specialists still work with writes off", async () => {
     const h = harness(new FakeTransport({ writeEnabled: false, reply: () => ({ ok: true }) }));
-    await h.callTool("search_tools", { query: "script_read source" });
-    const p = h.payloadOf(await h.callTool("script_read", { target: "ServerScriptService.Main" }));
+    // Not script_read: eval-channel tools are write-class now, because the bridge
+    // refuses eval with writes off. A read on the read channel must still pass.
+    await h.callTool("search_tools", { query: "snapshot" });
+    const p = h.payloadOf(await h.callTool("snapshot", { name: "before", path: "Workspace" }));
     assert.notEqual(p.error, "write_mode_disabled");
+    assert.ok(h.transport.sent.length > 0, "it reached Studio");
   });
 
   test("core write tools stay gated", async () => {

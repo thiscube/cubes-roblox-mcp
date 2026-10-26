@@ -349,7 +349,6 @@ return { cleared = false, note = "no debug folder present" }
       category: "debug",
       subcategories: ["errors", "diagnostics", "context"],
       keywords: ["error", "crash", "stack", "debug", "fix", "exception", "traceback", "broken"],
-      readOnly: true,
       description:
         "Most recent runtime error with ±N source lines around the failure point + call stack + recent prior errors. One call instead of tail-logs → parse → read-source.",
       inputSchema: {
@@ -583,7 +582,6 @@ return {
       // whole tool write-class — so a read-only build could not even LIST
       // breakpoints. A flag that flips a tool between reading and deleting can
       // only ever be classified as the more dangerous of the two.
-      readOnly: true,
       category: "debug",
       subcategories: ["debugger", "inspect", "trace"],
       keywords: ["breakpoint", "list", "debug", "debugger", "active", "show", "clear", "remove"],
