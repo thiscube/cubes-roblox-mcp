@@ -76,8 +76,9 @@ The plugin reports it on every poll, and a poll that omits the field means OFF â
 a reconnecting plugin never inherits the previous session's toggle.
 
 The toggle is tracked **per Studio window**. A command addressed to one window
-uses that window's toggle. An unaddressed command can be picked up by whichever
-window polls first, so it needs every connected window to have writes ON.
+uses that window's toggle. With several windows open a session has to choose one,
+and a call is refused until it does, so one window's toggle never authorises a
+write that lands in another.
 
 Whether a tool is write-class is **derived from how it reaches Studio**, not from
 a label someone remembered to type. See CLAUDE.md. This matters here because the

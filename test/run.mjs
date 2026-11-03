@@ -9,6 +9,9 @@
  * through cmd and nothing expands it.
  *
  * So: list the files here and hand them over explicitly.
+ *
+ * `--offline` sets CUBES_MCP_OFFLINE=1 for the run, because `VAR=1 node ...` in
+ * an npm script stops dead in cmd on Windows.
  */
 import { readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -27,7 +30,10 @@ if (files.length === 0) {
   process.exit(1);
 }
 
-const result = spawnSync(process.execPath, ["--test", ...process.argv.slice(2), ...files], {
+const args = process.argv.slice(2);
+const offline = args.includes("--offline");
+const result = spawnSync(process.execPath, ["--test", ...args.filter((a) => a !== "--offline"), ...files], {
   stdio: "inherit",
+  env: offline ? { ...process.env, CUBES_MCP_OFFLINE: "1" } : process.env,
 });
 process.exit(result.status ?? 1);

@@ -69,9 +69,10 @@ export interface ToolContext {
   /**
    * Ask the human a question mid-call, when the client supports MCP elicitation.
    * Resolves to null when the client can't elicit — callers must handle that and
-   * fall back to refusing rather than assuming consent.
+   * fall back to refusing rather than assuming consent. "no_answer" means it was
+   * asked and nothing came back, which must never count as yes.
    */
-  confirmWithUser?: (question: string, detail?: string[]) => Promise<boolean | null>;
+  confirmWithUser?: (question: string, detail?: string[]) => Promise<boolean | "no_answer" | null>;
 }
 
 export interface ToolEntry {

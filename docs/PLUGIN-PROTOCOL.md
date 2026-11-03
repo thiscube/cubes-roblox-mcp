@@ -12,7 +12,7 @@ keeps working and simply misses the new features.
 ## Transport
 
 ```
-POST /poll     -> { protocol, writeEnabled }   long-poll, held up to 25s
+POST /poll     -> { protocol, writeEnabled, instanceId, placeId, placeName }   long-poll, held up to 25s
 POST /result   -> { id, ok, result | error }
 POST /rpc      -> out-of-band tool call, deny-by-default
 POST /health
@@ -212,8 +212,11 @@ Routing, once ids are in play:
 - A command **addressed** to a window is only ever handed to that window. If it
   is not connected, the command waits in the queue and eventually times out. It
   is never diverted to a different window.
-- A command with **no** address goes to whoever polls first, which is what every
-  command did before this existed.
+- A command with **no** address goes to the window chosen with
+  `studio_instances { use: "<id>" }`, or the only one open. With several open and
+  none chosen it is refused with `choose_window`. If the chosen window has gone
+  it is refused once with `window_gone`, so work never moves to another place
+  unnoticed.
 
 ## The `__MCP` sandbox
 

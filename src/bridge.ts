@@ -91,6 +91,8 @@ interface Pending {
   resolve: (value: unknown) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  /** The window holding this command, once a poll has taken it. */
+  handedTo?: string;
 }
 
 /** Returns true if it actually handed the command to a live socket. */
@@ -363,11 +365,16 @@ export class StudioBridge implements StudioTransport {
   /**
    * Connected Studio windows, by id (PLAN.md #11).
    *
-   * One entry for a normal session. The plugin half that reports distinct ids
-   * per window is not in this repo, so a plugin that sends none is recorded
-   * under a single default id and behaves exactly as it always has.
+   * One entry for a normal session. A plugin that sends no id (anything before
+   * protocol 5) is recorded under a single default id and behaves exactly as it
+   * always has.
    */
   private readonly instances = new Map<string, StudioInstance>();
+  /**
+   * The window this server's calls go to, when the session has picked one. Per
+   * copy of the server, so two Claude sessions can each work in their own window.
+   */
+  private chosenWindow: string | null = null;
   /** The plugin's WebSocket, when it chose that transport. */
   private socket: WebSocket | null = null;
   /** Which Studio window the socket belongs to. */
@@ -473,7 +480,19 @@ export class StudioBridge implements StudioTransport {
   get connected(): boolean {
     if (this.proxying) return this.peerFresh ? this.peer!.connected : false;
     if (this.socketOpen) return true;
-    return Date.now() - this.lastSeen < HEARTBEAT_WINDOW_MS;
+    return Date.now() - this.lastSeen < HEARTBEAT_WINDOW_MS || this.busy();
+  }
+
+  /**
+   * A window is holding a command we handed it. The plugin does not poll while it
+   * runs one, so a long command would otherwise read as Studio having gone away.
+   * Each command's own timeout bounds this.
+   */
+  private busy(window?: string): boolean {
+    for (const p of this.pending.values()) {
+      if (p.handedTo !== undefined && (window === undefined || p.handedTo === window)) return true;
+    }
+    return false;
   }
 
   /** The port is held by another copy, so commands go through its `/rpc`. */
@@ -493,7 +512,7 @@ export class StudioBridge implements StudioTransport {
   /** Which transport the plugin is using. Informational, reported by /health. */
   get transportKind(): "websocket" | "long-poll" | "none" {
     if (this.socketOpen) return "websocket";
-    return Date.now() - this.lastSeen < HEARTBEAT_WINDOW_MS ? "long-poll" : "none";
+    return Date.now() - this.lastSeen < HEARTBEAT_WINDOW_MS || this.busy() ? "long-poll" : "none";
   }
 
   /**
@@ -507,7 +526,8 @@ export class StudioBridge implements StudioTransport {
     // forgery AUDIT.md #27 describes, reproduced end to end during verification.
     // There is no way to authenticate the toggle without authenticating the
     // plugin, so the honest resolution is that the escape hatch buys reads only.
-    return this.writesAllowed();
+    const chosen = this.chosenWindow;
+    return this.writesAllowed(chosen && this.listInstances().some((i) => i.id === chosen) ? chosen : undefined);
   }
 
   /**
@@ -519,10 +539,9 @@ export class StudioBridge implements StudioTransport {
   private writesAllowed(target?: string): boolean {
     if (this.allowUnauthenticated) return false;
     if (!this.connected) return false;
-    if (this.proxying && !this.peer!.writeEnabled) return false;
     const live = this.listInstances();
     if (target) return live.some((i) => i.id === target && i.writeEnabled);
-    if (this.proxying) return true;
+    if (this.proxying) return this.peer!.writeEnabled;
     return live.length > 0 && live.every((i) => i.writeEnabled);
   }
 
@@ -632,10 +651,54 @@ export class StudioBridge implements StudioTransport {
     if (this.proxying) return this.peerFresh ? [...this.peer!.instances] : [];
     const now = Date.now();
     for (const [id, info] of this.instances) {
-      const live = info.transport === "websocket" ? this.socketInstance === id && this.socketOpen : now - info.lastSeen < HEARTBEAT_WINDOW_MS;
+      const live = info.transport === "websocket" ? this.socketInstance === id && this.socketOpen : now - info.lastSeen < HEARTBEAT_WINDOW_MS || this.busy(id);
       if (!live) this.instances.delete(id);
     }
     return [...this.instances.values()].sort((a, b) => b.lastSeen - a.lastSeen);
+  }
+
+  /** The window chosen with `chooseInstance`, if any. */
+  get chosenInstance(): string | null {
+    return this.chosenWindow;
+  }
+
+  /** Send this server's calls to one window. False if no such window is connected. */
+  chooseInstance(id: string): boolean {
+    if (!this.listInstances().some((i) => i.id === id)) return false;
+    this.chosenWindow = id;
+    return true;
+  }
+
+  /**
+   * Which window a command goes to. Every command in a call lands in the same
+   * window this way, and a new window opening cannot pick up a queued command.
+   *
+   * With several open and none chosen it refuses instead of guessing: "whoever
+   * polls first" alternates, so a mutate's backup was read from one place and its
+   * write landed in the other.
+   */
+  private windowFor(target?: string): string | undefined {
+    if (target) return target;
+    const live = this.listInstances();
+    if (live.length === 0) return this.chosenWindow ?? undefined;
+    const open = live.map((i) => `${i.placeName ?? "unnamed place"} (${i.id})`).join(", ");
+    if (this.chosenWindow) {
+      if (live.some((i) => i.id === this.chosenWindow)) return this.chosenWindow;
+      this.chosenWindow = null;
+      throw new BridgeError(
+        "window_gone",
+        `The Studio window this session was using has closed or reloaded, so nothing ran. Open now: ${open}. ` +
+          `Check this is the right place, or pick one with studio_instances { use: "<id>" }.`,
+        { windows: live },
+      );
+    }
+    if (live.length === 1) return live[0].id;
+    throw new BridgeError(
+      "choose_window",
+      `${live.length} Studio windows are open, so nothing ran: ${open}. ` +
+        `Pick the one to work in with studio_instances { use: "<id>" }, or ask the user which they mean.`,
+      { windows: live },
+    );
   }
 
   /** Record or refresh a connection. Returns the id it was filed under. */
@@ -873,7 +936,13 @@ export class StudioBridge implements StudioTransport {
     timeoutMs = 30_000,
     target?: string,
   ): Promise<unknown> {
-    if (this.proxying) return this.sendViaPeer(tool, args, timeoutMs, target);
+    let window: string | undefined;
+    try {
+      window = this.connected ? this.windowFor(target) : target;
+    } catch (err) {
+      return Promise.reject(err);
+    }
+    if (this.proxying) return this.sendViaPeer(tool, args, timeoutMs, window);
     if (!this.connected) {
       const hs = this.lastHandshake;
       if (hs && !hs.ok) {
@@ -897,7 +966,7 @@ export class StudioBridge implements StudioTransport {
     // reconnects before the queue drains, the command lands with the user's
     // toggle off. Small window, needs a reconnect to hit, free to close. Same
     // policy the /rpc door uses, so there is one rule and two doors.
-    if (!this.readOnlyCommands.has(tool) && (this.readOnly || !this.writesAllowed(target))) {
+    if (!this.readOnlyCommands.has(tool) && (this.readOnly || !this.writesAllowed(window))) {
       return Promise.reject(
         new BridgeError(
           this.readOnly ? "read_only_build" : "write_mode_disabled",
@@ -925,7 +994,7 @@ export class StudioBridge implements StudioTransport {
       id: randomUUID(),
       tool,
       args,
-      ...(target ? { target } : {}),
+      ...(window ? { target: window } : {}),
       ...(via ? { via } : {}),
     };
     return new Promise((resolve, reject) => {
@@ -1442,7 +1511,7 @@ export class StudioBridge implements StudioTransport {
       return;
     }
     const target = typeof body.value?.target === "string" ? body.value.target : undefined;
-    if (!this.readOnlyCommands.has(tool) && (this.readOnly || !this.writesAllowed(target))) {
+    if (!this.readOnlyCommands.has(tool) && (this.readOnly || !this.writesAllowed(target ?? this.chosenWindow ?? undefined))) {
       res.statusCode = 403;
       res.setHeader("content-type", "application/json");
       res.end(
@@ -1511,6 +1580,8 @@ export class StudioBridge implements StudioTransport {
         }
         finish();
         if (cmd) {
+          const pending = this.pending.get(cmd.id);
+          if (pending) pending.handedTo = instance;
           res.setHeader("content-type", "application/json");
           res.end(JSON.stringify(cmd));
         } else {
@@ -1533,7 +1604,11 @@ export class StudioBridge implements StudioTransport {
       this.waiters.push(waiter);
       // Studio going away must free the waiter immediately, not 25s later.
       res.on("close", () => {
-        if (!settled) finish();
+        if (settled) return;
+        finish();
+        // Forget it now rather than 30s from now, or a closed window would keep
+        // calls refused as ambiguous. A window that is still there polls straight back.
+        if (!this.waiters.some((w) => w.instance === instance)) this.instances.delete(instance);
       });
       timer = setTimeout(() => waiter(null), POLL_HOLD_MS);
     });

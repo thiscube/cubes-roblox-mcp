@@ -19,17 +19,24 @@ export const SESSION_TOOLS: ToolEntry[] = [
       subcategories: ["connection", "window", "place"],
       keywords: ["instance", "window", "studio", "connected", "place", "which", "multi", "session", "target"],
       description:
-        "List the Studio windows connected to this server: id, place, role, transport and whether writes are on for each. Tools cannot yet be pointed at a specific window; with more than one open, calls go to whichever answers first.",
-      inputSchema: { type: "object", properties: {} },
+        "List the connected Studio windows: id, place and whether writes are on. With several open, calls are refused until you pass use with a window's id.",
+      inputSchema: {
+        type: "object",
+        properties: { use: { type: "string", description: "Window id to send this session's calls to." } },
+      },
       outputSchema: objectResult({
         instances: { type: "array" },
         count: { type: "number" },
       }),
     },
-    async (_args, ctx) => {
+    async (args, ctx) => {
       // Optional on the seam: a fake transport in a test has no windows, and a
       // second transport (Open Cloud) has no notion of one at all.
       const instances = ctx.bridge.listInstances?.() ?? [];
+      if (typeof args.use === "string" && !ctx.bridge.chooseInstance?.(args.use.trim())) {
+        return { error: "unknown_window", use: args.use, instances };
+      }
+      const chosen = ctx.bridge.chosenInstance ?? null;
       const now = Date.now();
       return {
         instances: instances.map((i) => ({
@@ -37,16 +44,12 @@ export const SESSION_TOOLS: ToolEntry[] = [
           secondsSinceSeen: Math.round((now - i.lastSeen) / 1000),
         })),
         count: instances.length,
+        chosen,
         ...(instances.length === 0
           ? { hint: "No Studio window is connected. Open Studio with the Cubes MCP plugin active." }
           : {}),
-        ...(instances.length > 1
-          ? {
-              note:
-                "Several windows are connected and no tool accepts a target yet, so every call goes to " +
-                "whichever window answers first. The bridge can route by instance id; the seam does not " +
-                "expose it. Close the windows you do not want touched.",
-            }
+        ...(instances.length > 1 && !chosen
+          ? { note: 'Several windows are open and none is chosen, so calls to Studio are refused. Pass use: "<id>" to pick one.' }
           : {}),
       };
     },

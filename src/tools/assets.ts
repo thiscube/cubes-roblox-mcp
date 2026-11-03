@@ -348,6 +348,12 @@ return {
           hint: "The user declined this upload. Do not retry it without new instructions.",
         };
       }
+      if (approved === "no_answer") {
+        return {
+          error: "confirmation_unanswered",
+          hint: "The user was asked and did not answer, so nothing was uploaded. Check with them before retrying.",
+        };
+      }
       if (approved !== true && args.confirm !== true) {
         return {
           error: "needs_confirmation",

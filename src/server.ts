@@ -383,7 +383,12 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
    * apart from "couldn't ask" — an LLM relaying its own confirmation prompt is
    * not a safety gate.
    */
-  async function confirmWithUser(question: string, detail: string[] = []): Promise<boolean | null> {
+  /**
+   * true/false is the human's answer. null means this client cannot ask, the one
+   * case where a model's `confirm: true` counts. "no_answer" means it asked and
+   * got nothing back (the SDK times a prompt out at 60s): that is not consent.
+   */
+  async function confirmWithUser(question: string, detail: string[] = []): Promise<boolean | "no_answer" | null> {
     const caps = server.getClientCapabilities();
     if (!caps?.elicitation) return null;
     try {
@@ -403,7 +408,7 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
       if (res?.action !== "accept") return false;
       return res?.content?.confirm === true;
     } catch {
-      return null;
+      return "no_answer";
     }
   }
 
@@ -415,7 +420,15 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
     }
   };
 
-  const getPlaceContext = () => ensurePlaceContext(bridge, session);
+  // Choosing another window changes which place is open, so the cached one is stale.
+  let placeWindow = bridge.chosenInstance;
+  const getPlaceContext = () => {
+    if (bridge.chosenInstance !== placeWindow) {
+      placeWindow = bridge.chosenInstance;
+      session.place.invalidate();
+    }
+    return ensurePlaceContext(bridge, session);
+  };
 
   /**
    * MCP tool annotations, derived from the same capability the gate uses.
@@ -839,6 +852,13 @@ export function createMcpServer(bridge: StudioTransport, opts: ServerOptions = {
           summary: assessment.summary,
           hint: "The user declined this destructive batch. Do not retry it without new instructions.",
         };
+      } else if (approved === "no_answer") {
+        return {
+          error: "confirmation_unanswered",
+          level: assessment.level,
+          summary: assessment.summary,
+          hint: "The user was asked and did not answer, so nothing was changed. Check with them before retrying.",
+        };
       } else if (args.confirm !== true) {
         return {
           error: "needs_confirmation",
@@ -1070,6 +1090,11 @@ function applyAutoUnlock(
 ): string[] {
   if (!payload || typeof payload !== "object") return [];
   const p = payload as Record<string, any>;
+  // The one failure with an obvious next step, and the tool it names has to be
+  // callable for the error to be any use.
+  if ((p.error === "choose_window" || p.error === "window_gone") && registry.has("studio_instances")) {
+    return session.tools.unlock(["studio_instances"], session.turn).unlocked;
+  }
   if (p.error) return [];
 
   const candidates = new Set<string>();

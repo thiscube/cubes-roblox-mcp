@@ -724,13 +724,13 @@ describe("tokenFileRefusal", () => {
 
   test("any group or other bit is refused", () => {
     for (const mode of [0o100640, 0o100604, 0o100644, 0o100660, 0o100666, 0o100601]) {
-      const r = tokenFileRefusal("/t", stat({ mode }), 1000);
+      const r = tokenFileRefusal("/t", stat({ mode }), 1000, true);
       assert.match(r, /readable by other users/, `mode ${mode.toString(8)} should be refused`);
     }
   });
 
   test("another user's file is refused even at a perfect 0600", () => {
-    const r = tokenFileRefusal("/t", stat({ uid: 65534 }), 1000);
+    const r = tokenFileRefusal("/t", stat({ uid: 65534 }), 1000, true);
     assert.match(r, /owned by uid 65534/);
   });
 

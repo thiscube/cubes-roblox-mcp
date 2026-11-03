@@ -223,8 +223,12 @@ return { path = inst:GetFullName(), ref = __MCP.refFor(inst), source = inst.Sour
         confirm: args.confirm === true,
       });
 
+      // At the top level too: that is the only place the server looks when it
+      // flags a call as failed, same as script_restore below.
+      const failed = !!(result && typeof result === "object" && "error" in result);
       return {
-        edited: !(result && typeof result === "object" && "error" in result),
+        ...(failed ? { error: (result as { error: unknown }).error } : {}),
+        edited: !failed,
         path: read.path,
         ref: read.ref,
         edits: report,

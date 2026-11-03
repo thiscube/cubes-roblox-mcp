@@ -15,6 +15,8 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+// Making a symlink on Windows needs admin or developer mode, and /etc/passwd isn't there.
+const NO_SYMLINKS = process.platform === "win32" && "needs POSIX symlinks";
 
 import { ASSETS_TOOLS } from "../../dist/tools/assets.js";
 import { __setAssetFetchForTest, ASSET_TYPES, UPLOAD_ASSET_TYPES } from "../../dist/assets.js";
@@ -259,7 +261,7 @@ describe("asset_upload gate", () => {
     }
   });
 
-  test("a symlink out of the project is refused, not followed", async () => {
+  test("a symlink out of the project is refused, not followed", { skip: NO_SYMLINKS }, async () => {
     // resolve() collapses `..` and knows nothing about symlinks, so a
     // model.rbxm inside the project pointing at /etc/passwd walked straight
     // through the first version of this check.
@@ -483,7 +485,7 @@ describe("asset_upload formats", () => {
     }
   });
 
-  test("confinement still holds for every newly allowed extension", async () => {
+  test("confinement still holds for every newly allowed extension", { skip: NO_SYMLINKS }, async () => {
     // Widening the extension list must not widen the path boundary with it.
     for (const ext of [".fbx", ".gltf", ".glb", ".flac"]) {
       const link = join(ROOT, "test", "fixtures", `escape2${ext}`);

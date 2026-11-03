@@ -37,10 +37,9 @@ export interface StudioInstance {
 export interface StudioTransport {
   /** Queue a command for Studio and await its result. Rejects with BridgeError. */
   /**
-   * `target` names one Studio window (see `listInstances`). The bridge honours
-   * it; nothing above this line passes it yet, so with several windows open a
-   * command still goes to whichever answers first. The gap is real and is
-   * recorded in PLAN.md item 11 rather than papered over here.
+   * `target` names one Studio window (see `listInstances`). Without it the
+   * command goes to the window chosen with `chooseInstance`, or the only one
+   * open; with several open and none chosen it rejects with `choose_window`.
    */
   send(
     tool: string,
@@ -57,6 +56,10 @@ export interface StudioTransport {
    * transport (Open Cloud) has no notion of a window at all.
    */
   listInstances?(): StudioInstance[];
+  /** Send later calls to this window. False if it is not connected. */
+  chooseInstance?(id: string): boolean;
+  /** The window chosen with `chooseInstance`, if any. */
+  readonly chosenInstance?: string | null;
   /** True only if connected AND the user has opted into writes. */
   readonly writeEnabled: boolean;
 }

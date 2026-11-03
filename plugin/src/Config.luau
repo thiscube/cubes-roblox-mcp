@@ -46,11 +46,11 @@ Config.VERSION_MISMATCH_WAIT = 10
 
 -- Wire-protocol version. Sent in every /poll body; the MCP server accepts a
 -- range (MIN..MAX in src/protocol.ts) and answers anything outside it with 426.
--- 2 = bearer token on every request. 3-5 (capture, WebSocket, multi-window) are
--- additive and not implemented here.
+-- 2 = bearer token on every request. 5 = says which window it is. 3-4 (capture,
+-- WebSocket) are additive and not implemented here.
 -- Bump only when the wire format of /poll, /result, or any tool's args/results
 -- change in a way the other side can't safely ignore.
-Config.PROTOCOL_VERSION = 2
+Config.PROTOCOL_VERSION = 5
 
 -- The bridge token, written in by `npm run setup` when it installs this file, so
 -- nobody has to paste it. The placeholder means "not baked": the token then comes

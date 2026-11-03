@@ -307,3 +307,71 @@ function argsFor(name) {
       return {};
   }
 }
+
+describe("destructive prompts", () => {
+  const remove = { ops: [{ op: "delete", target: "ServerScriptService" }], confirm: true };
+
+  /** A client that advertises prompts and answers them with `answer`. */
+  function asking(answer) {
+    const transport = new FakeTransport();
+    const h = harness(transport);
+    h.server.getClientCapabilities = () => ({ elicitation: {} });
+    h.server.elicitInput = answer;
+    return { h, transport };
+  }
+
+  test("a prompt nobody answers is not consent, whatever the model sent", async () => {
+    const { h, transport } = asking(async () => {
+      throw new Error("Request timed out");
+    });
+    const res = await h.callTool("mutate", remove);
+    assert.equal(h.payloadOf(res).error, "confirmation_unanswered");
+    assert.equal(res.isError, true);
+    assert.deepEqual(transport.sent, [], "nothing may reach Studio");
+  });
+
+  test("a human no and a human yes still mean what they say", async () => {
+    const no = asking(async () => ({ action: "decline" }));
+    assert.equal(no.h.payloadOf(await no.h.callTool("mutate", remove)).error, "declined_by_user");
+    assert.deepEqual(no.transport.sent, []);
+
+    const yes = asking(async () => ({ action: "accept", content: { confirm: true } }));
+    await yes.h.callTool("mutate", remove);
+    assert.ok(yes.transport.sent.some((c) => c.tool === "mutate"));
+  });
+
+  test("a client that cannot prompt still falls back to the confirm flag", async () => {
+    const transport = new FakeTransport();
+    const h = harness(transport);
+    await h.callTool("mutate", remove);
+    assert.ok(transport.sent.some((c) => c.tool === "mutate"));
+  });
+});
+
+describe("script_edit failures", () => {
+  const editArgs = { target: "X", edits: [{ find: "a", replace: "b" }] };
+  const source = { path: "X", ref: "p1", source: "a" };
+
+  test("a batch that wants confirmation is flagged as failed", async () => {
+    const h = harness(new FakeTransport({ reply: () => source }));
+    const res = await h.callTool("script_edit", editArgs);
+    const body = h.payloadOf(res);
+    assert.equal(res.isError, true);
+    assert.equal(body.error, "needs_confirmation");
+    assert.equal(body.edited, false);
+  });
+
+  test("a rolled-back write is flagged as failed", async () => {
+    const h = harness(new FakeTransport({ reply: (tool) => (tool === "mutate" ? { error: "mutate_failed" } : source) }));
+    const res = await h.callTool("script_edit", { ...editArgs, confirm: true });
+    assert.equal(res.isError, true);
+    assert.equal(h.payloadOf(res).error, "mutate_failed");
+  });
+
+  test("a good edit is not", async () => {
+    const h = harness(new FakeTransport({ reply: (tool) => (tool === "mutate" ? { changes: [] } : source) }));
+    const res = await h.callTool("script_edit", { ...editArgs, confirm: true });
+    assert.equal(res.isError, undefined);
+    assert.equal(h.payloadOf(res).edited, true);
+  });
+});

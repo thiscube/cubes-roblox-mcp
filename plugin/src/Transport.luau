@@ -1243,6 +1243,10 @@ local function scheduleViewRevert()
 	end)
 end
 
+-- Tells this Studio window apart from any other polling the same server, so a
+-- call can't land in the wrong place. New each plugin load.
+local INSTANCE_ID = HttpService:GenerateGUID(false)
+
 -- Returns (command|nil, errorTag|nil, errorMessage|nil). A nil command with nil
 -- error means the long-poll timed out cleanly (server alive, just idle) —
 -- re-poll immediately.
@@ -1258,6 +1262,9 @@ local function pollOnce()
 			Body = HttpService:JSONEncode({
 				writeEnabled = Transport.status.writeEnabled,
 				protocol = Config.PROTOCOL_VERSION,
+				instanceId = INSTANCE_ID,
+				placeId = game.PlaceId,
+				placeName = game.Name,
 			}),
 		})
 	end)

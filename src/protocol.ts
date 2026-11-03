@@ -31,7 +31,8 @@
  *   5 - additive: `instanceId`, `placeId`, `placeName` and `role` on /poll and
  *       on the WebSocket `hello`, so several Studio windows can share one
  *       server. A plugin that sends none is filed under a single default id and
- *       behaves exactly as before, so MIN stays 2.
+ *       behaves exactly as before, so MIN stays 2. The shipped plugin speaks
+ *       this: it sends an id per plugin load, and no capture or socket yet.
  */
 
 /** Newest protocol this server speaks. Advertised in /health. */

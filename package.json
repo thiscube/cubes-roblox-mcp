@@ -21,7 +21,7 @@
     "install-plugin": "node dist/index.js --install-plugin",
     "prepublishOnly": "npm run build && node test/run.mjs",
     "prepare": "npm run build",
-    "ci": "npx tsc --noEmit && npm run build && CUBES_MCP_OFFLINE=1 node test/run.mjs"
+    "ci": "npx tsc --noEmit && npm run build && node test/run.mjs --offline"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.24.0",

@@ -22,7 +22,7 @@
 
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { extname, resolve, sep } from "node:path";
+import { extname, parse, resolve, sep } from "node:path";
 
 const TOOLBOX = "https://apis.roblox.com/toolbox-service/v1";
 const THUMBNAILS = "https://thumbnails.roblox.com/v1";
@@ -244,8 +244,8 @@ const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 export function uploadRoot(): string {
   const configured = process.env.CUBES_MCP_UPLOAD_ROOT;
   const base = resolve(configured && configured.trim() ? configured : process.cwd());
-  const parts = base.split(sep).filter(Boolean);
-  if (parts.length === 0) {
+  // parse().root, because splitting on the separator leaves `C:` on Windows.
+  if (parse(base).root === base) {
     throw new Error(
       "The upload root is the filesystem root, which confines nothing. " +
         "Set CUBES_MCP_UPLOAD_ROOT to your project directory.",

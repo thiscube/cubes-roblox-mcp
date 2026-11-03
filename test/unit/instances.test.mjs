@@ -1,11 +1,11 @@
 /**
  * Several Studio windows, one server (PLAN.md #11).
  *
- * The plugin half that reports distinct ids per window is not in this repo, so
- * what is testable here is the server half: that a window is recorded, that a
- * targeted command reaches only that window, and — most importantly — that a
- * plugin which sends no id at all behaves exactly as it always has. That last
- * one is the whole compatibility story, since protocol 5 is additive.
+ * What is testable without Studio is the server half: that a window is recorded,
+ * that a command reaches only the window it is for, that several windows are
+ * never guessed between, and that a plugin which sends no id at all behaves
+ * exactly as it always has. That last one is the whole compatibility story, since
+ * protocol 5 is additive.
  */
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
@@ -142,6 +142,113 @@ describe("studio instances", () => {
     }
   });
 
+  test("with several windows and none chosen, a command is refused, not guessed", async () => {
+    const { bridge, post } = await makeBridge();
+    try {
+      const a = poll(post, { instanceId: "win-a", placeName: "Lobby" });
+      const b = poll(post, { instanceId: "win-b", placeName: "Arena" });
+      await settle();
+      await assert.rejects(bridge.send("read", {}, 300), (err) => {
+        assert.equal(err.code, "choose_window");
+        assert.match(err.message, /Lobby \(win-a\)/);
+        assert.match(err.message, /Arena \(win-b\)/);
+        return true;
+      });
+      assert.equal(await Promise.race([a, b, settle(80).then(() => "still parked")]), "still parked");
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  test("every command of a call lands in the chosen window", async () => {
+    const { bridge, post } = await makeBridge();
+    try {
+      poll(post, { instanceId: "win-a" });
+      const firstB = poll(post, { instanceId: "win-b" });
+      await settle();
+      assert.equal(bridge.chooseInstance("win-nope"), false);
+      assert.equal(bridge.chooseInstance("win-b"), true);
+
+      const backup = bridge.send("eval", {}, 3000);
+      const cmd1 = await firstB;
+      assert.equal(cmd1.tool, "eval");
+      await post("/result", { id: cmd1.id, ok: true, result: {} });
+      await backup;
+
+      // win-a is parked and win-b is not: the write must still wait for win-b.
+      const write = bridge.send("mutate", {}, 3000);
+      await settle();
+      assert.equal(bridge.queueDepth, 1, "win-a must not be handed win-b's write");
+      const cmd2 = await poll(post, { instanceId: "win-b" });
+      assert.equal(cmd2.tool, "mutate");
+      await post("/result", { id: cmd2.id, ok: true, result: {} });
+      await write;
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  test("a chosen window that goes away is reported once, never silently swapped", async () => {
+    const { bridge, post } = await makeBridge();
+    try {
+      poll(post, { instanceId: "win-a" });
+      poll(post, { instanceId: "win-b" });
+      await settle();
+      bridge.chooseInstance("win-a");
+      bridge.listInstances().find((i) => i.id === "win-a").lastSeen = 0;
+      await assert.rejects(bridge.send("read", {}, 300), { code: "window_gone" });
+      assert.equal(bridge.chosenInstance, null);
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  test("a window that closes while parked is forgotten at once", async () => {
+    const { bridge } = await makeBridge();
+    const controller = new AbortController();
+    try {
+      fetch(`http://127.0.0.1:${bridge.boundPort}/poll`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${bridge.token}` },
+        body: JSON.stringify({ protocol: MAX_PROTOCOL_VERSION, writeEnabled: true, instanceId: "win-a" }),
+        signal: controller.signal,
+      }).catch(() => {});
+      await settle();
+      assert.equal(bridge.listInstances().length, 1);
+      controller.abort();
+      await settle();
+      assert.deepEqual(bridge.listInstances(), []);
+    } finally {
+      await bridge.stop();
+    }
+  });
+
+  test("a window busy on a long command stays connected", async () => {
+    const { bridge, post } = await makeBridge();
+    const realNow = Date.now;
+    try {
+      const handed = poll(post, { instanceId: "win-a" });
+      await settle();
+      const long = bridge.send("mesh_bake", {}, 90_000);
+      const cmd = await handed;
+
+      // Past the heartbeat window, with the plugin holding the command and not polling.
+      Date.now = () => realNow() + 31_000;
+      assert.equal(bridge.connected, true);
+      assert.equal(bridge.transportKind, "long-poll");
+      assert.deepEqual(bridge.listInstances().map((i) => i.id), ["win-a"]);
+
+      // And once it has answered, silence means gone again.
+      await post("/result", { id: cmd.id, ok: true, result: {} });
+      await long;
+      Date.now = () => realNow() + 62_000;
+      assert.equal(bridge.connected, false);
+    } finally {
+      Date.now = realNow;
+      await bridge.stop();
+    }
+  });
+
   test("an untargeted command still goes to whoever is parked", async () => {
     const { bridge, post } = await makeBridge();
     try {
@@ -249,10 +356,29 @@ describe("studio_instances tool", () => {
     );
     assert.equal(res.count, 2);
     assert.equal(res.instances[0].secondsSinceSeen, 3);
-    // The note has to say the honest thing: the bridge can route by id, but no
-    // tool accepts one yet, so a second window is a hazard rather than a target.
-    assert.match(res.note, /answers first/);
-    assert.match(res.note, /does not expose it/);
+    assert.match(res.note, /refused/);
+    assert.match(res.note, /use/);
+  });
+
+  test("use picks a window, and an unknown id is an error", async () => {
+    const chosen = [];
+    const ctx = {
+      bridge: {
+        connected: true,
+        writeEnabled: true,
+        chosenInstance: "a",
+        chooseInstance: (id) => (id === "a" ? (chosen.push(id), true) : false),
+        listInstances: () => [
+          { id: "a", transport: "long-poll", writeEnabled: true, lastSeen: Date.now(), protocol: 5 },
+          { id: "b", transport: "long-poll", writeEnabled: true, lastSeen: Date.now(), protocol: 5 },
+        ],
+      },
+    };
+    const ok = await tool.handler({ use: "a" }, ctx);
+    assert.deepEqual(chosen, ["a"]);
+    assert.equal(ok.chosen, "a");
+    assert.equal(ok.note, undefined);
+    assert.equal((await tool.handler({ use: "nope" }, ctx)).error, "unknown_window");
   });
 
   test("it is read-only, so the inspector build keeps it", async () => {

@@ -90,7 +90,7 @@ describe("bridge fixes", () => {
       await settle();
       assert.equal(bridge.writeEnabled, false);
       await assert.rejects(bridge.send("mutate", {}, 500, "B"), { code: "write_mode_disabled" });
-      await assert.rejects(bridge.send("mutate", {}, 500), { code: "write_mode_disabled" });
+      await assert.rejects(bridge.send("mutate", {}, 500), { code: "choose_window" });
       // Targeted at the window that said yes: passes the gate (then times out, nobody answers).
       await assert.rejects(bridge.send("mutate", {}, 300, "A"), (err) => err.code !== "write_mode_disabled");
     } finally {
