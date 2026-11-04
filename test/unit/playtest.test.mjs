@@ -125,3 +125,79 @@ describe("character_goto", () => {
     assert.match(luau, /__MCP\.decode/, "arguments travel as data, not as spliced source");
   });
 });
+
+describe("player_input and ui_inspect", () => {
+  const tool = (name) => PLAYTEST_TOOLS.find((t) => t.name === name);
+
+  /** Run a tool against a bridge that records what it was asked to send. */
+  async function run(name, args, reply = { done: [], __via: "modulescript" }) {
+    const sent = [];
+    const out = await tool(name).handler(args, {
+      bridge: {
+        connected: true,
+        writeEnabled: true,
+        async send(command, payload, timeoutMs) {
+          sent.push({ command, payload, timeoutMs });
+          return reply;
+        },
+      },
+    });
+    return { out, sent };
+  }
+
+  test("they run in the play client, and are gated like writes", () => {
+    for (const name of ["player_input", "ui_inspect"]) {
+      assert.equal(tool(name).pluginCommand, "client_eval");
+      assert.equal(capabilities(tool(name)).write, true);
+    }
+  });
+
+  test("actions reach the client as data, never spliced into source", async () => {
+    const nasty = '"] end; game:Shutdown(); --';
+    const { sent } = await run("player_input", { actions: [{ do: "click", target: nasty }] });
+    const { luau } = sent[0].payload;
+    assert.equal(sent[0].command, "client_eval");
+    assert.doesNotMatch(luau, /(?<!\\)"\] end/, "the payload closed its own string literal");
+    assert.match(luau, /JSONDecode/);
+    assert.doesNotMatch(luau, /__MCP/, "__MCP does not exist in the play client");
+  });
+
+  test("player picks the client, and is left out when not given", async () => {
+    const one = await run("player_input", { actions: [{ do: "wait", seconds: 1 }], player: "Player2" });
+    assert.equal(one.sent[0].payload.player, "Player2");
+    const two = await run("ui_inspect", {});
+    assert.equal("player" in two.sent[0].payload, false);
+  });
+
+  test("a call too long for the bus is refused before it is sent", async () => {
+    for (const actions of [
+      [],
+      "not-an-array",
+      [{ do: "wait", seconds: 30 }],
+      [{ do: "key", key: "W", hold: 21 }],
+      Array.from({ length: 31 }, () => ({ do: "key", key: "W" })),
+      Array.from({ length: 14 }, () => ({ do: "look", dx: 60000 })),
+    ]) {
+      const { out, sent } = await run("player_input", { actions });
+      assert.equal(out.error, "bad_args");
+      assert.deepEqual(sent, []);
+    }
+  });
+
+  test("a failure from the client stays a top-level error", async () => {
+    const { out } = await run(
+      "player_input",
+      { actions: [{ do: "click", target: "Shop" }] },
+      { error: "click_missed", message: "nope", done: [], __via: "modulescript" },
+    );
+    assert.equal(out.error, "click_missed");
+    assert.equal("__via" in out, false);
+  });
+});
+
+describe("undo left open by a tool that throws", () => {
+  test("every undo recording tells the plugin about itself", async () => {
+    const { beginUndo } = await import("../../dist/tools/_luau-helpers.js");
+    assert.match(beginUndo("x"), /_G\.__CUBES_MCP_UNDO = __rec/);
+  });
+});

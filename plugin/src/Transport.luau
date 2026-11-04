@@ -551,8 +551,17 @@ local function dispatch(cmd)
 		if not Transport.status.writeEnabled then
 			return false, { code = "write_mode_disabled", message = "Writes were turned off before this eval ran." }
 		end
+		_G.__CUBES_MCP_UNDO = nil
 		local ok, ret = pcall(fn)
 		if not ok then
+			-- A tool that threw inside its undo recording never closed it, and an open
+			-- recording makes Studio refuse the next one. Takes back what it had done.
+			local recording = _G.__CUBES_MCP_UNDO
+			if recording then
+				pcall(function()
+					game:GetService("ChangeHistoryService"):FinishRecording(recording, Enum.FinishRecordingOperation.Cancel)
+				end)
+			end
 			return false, { code = "runtime_error", message = tostring(ret) }
 		end
 		if ret == nil then
@@ -568,7 +577,7 @@ local function dispatch(cmd)
 		if type(args.player) == "string" and args.player ~= "" then
 			clientCtx = "client:" .. args.player
 		end
-		if not PlaytestBus.isLive(clientCtx) then
+		if not PlaytestBus.awaitLive(clientCtx) then
 			if clientCtx ~= "client" and PlaytestBus.isLive("client") then
 				return false, {
 					code = "no_such_player",
@@ -606,7 +615,7 @@ local function dispatch(cmd)
 		-- loadstrings + runs it and writes back a structured result.
 		-- Desync guard: if the flag thinks we're running but Studio isn't, clear it
 		-- (matches the playtest_play/stop guards) so the error below is accurate.
-		if _STS_running and not PlaytestBus.isLive() and not RunService:IsRunning() then
+		if _STS_running and not PlaytestBus.awaitLive() and not RunService:IsRunning() then
 			_STS_running = false
 			_STS_mode = "edit"
 		end
@@ -671,7 +680,7 @@ local function dispatch(cmd)
 		-- Result (when EndTest fires) is captured into a module-level slot.
 		-- Desync guard: if the flag thinks we're running but Studio isn't, clear it.
 		-- Can happen when EndTest never resumed the prior spawned coroutine.
-		if _STS_running and not PlaytestBus.isLive() and not RunService:IsRunning() then
+		if _STS_running and not PlaytestBus.awaitLive() and not RunService:IsRunning() then
 			_STS_running = false
 			_STS_mode = "edit"
 		end
@@ -748,7 +757,7 @@ local function dispatch(cmd)
 		end
 		return true, { ok = true, started = _STS_mode, players = players, spawning = true }
 	elseif tool == "playtest_run_mode" then
-		if _STS_running and not PlaytestBus.isLive() and not RunService:IsRunning() then
+		if _STS_running and not PlaytestBus.awaitLive() and not RunService:IsRunning() then
 			_STS_running = false
 			_STS_mode = "edit"
 		end

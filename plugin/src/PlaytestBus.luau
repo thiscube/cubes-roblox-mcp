@@ -79,6 +79,77 @@ end
 -- Ids whose poll() timed out; their result may still land after it.
 local abandoned = {}
 
+-- Settings shared between DataModels drop things: a stress test lost about 3% of
+-- commands and answers, and a read can briefly come back nil. So the edit DM
+-- resends until answered, and a bus runs each id once and repeats its answer.
+local RESEND_EVERY = 1
+local KEEP_ANSWERS = 16
+-- A bus quiet this long has gone. A new test's bus has no memory of what the old
+-- one ran, so a resend must not reach it.
+local RESEND_QUIET_LIMIT = 2
+-- id -> { inboxKey, payload, ctx } while a command is waiting for its answer.
+local unanswered = {}
+
+local function addToInbox(inboxKey, id)
+	local inbox = {}
+	local inboxRaw = getSetting(inboxKey)
+	if type(inboxRaw) == "string" and #inboxRaw > 0 then
+		local ok, decoded = pcall(function() return HttpService:JSONDecode(inboxRaw) end)
+		if ok and type(decoded) == "table" then inbox = decoded end
+	end
+	-- The edit DM is the inbox's only writer (a bus clearing it raced this
+	-- read-modify-write and lost ids), so drop ids whose command is consumed.
+	local pending = {}
+	for _, old in ipairs(inbox) do
+		if old ~= id and (getSetting(KEY_CMD .. old) ~= nil or unanswered[old]) then
+			pending[#pending + 1] = old
+		end
+	end
+	pending[#pending + 1] = id
+	setSetting(inboxKey, HttpService:JSONEncode(pending))
+end
+
+-- The bus side of that promise, for one inbox. take() returns commands not yet
+-- run as { id, raw }, and answers any resend of one that has finished.
+local function openInbox(inboxKey)
+	local answers = {} -- id -> false while running, then the encoded answer
+	local finished = {}
+	local inbox = {}
+
+	function inbox.take()
+		local raw = getSetting(inboxKey)
+		if type(raw) ~= "string" or #raw == 0 then return {} end
+		local ok, decoded = pcall(function() return HttpService:JSONDecode(raw) end)
+		if not ok or type(decoded) ~= "table" then return {} end
+		local fresh = {}
+		for _, id in ipairs(decoded) do
+			local cmd = getSetting(KEY_CMD .. id)
+			if type(cmd) == "string" and #cmd > 0 then
+				setSetting(KEY_CMD .. id, nil)
+				if answers[id] == nil then
+					answers[id] = false
+					fresh[#fresh + 1] = { id = id, raw = cmd }
+				elseif answers[id] then
+					setSetting(KEY_RESULT .. id, answers[id])
+				end
+			end
+		end
+		return fresh
+	end
+
+	function inbox.answer(id, encoded)
+		setSetting(KEY_RESULT .. id, encoded)
+		answers[id] = encoded
+		finished[#finished + 1] = id
+		if #finished > KEEP_ANSWERS then
+			-- Still true, not nil, so a very late resend can't run it again.
+			answers[table.remove(finished, 1)] = ""
+		end
+	end
+
+	return inbox
+end
+
 -- Wipe all __cubesMCP_* settings. Called at the start of every play so we don't
 -- inherit ghost commands/results from a prior session.
 function PlaytestBus.cleanup()
@@ -121,6 +192,17 @@ function PlaytestBus.isLive(ctx)
 	local n = tonumber(getSetting(KEY_ALIVE .. (ctx or "server")))
 	if not n then return false end
 	return (os.time() - n) <= ALIVE_WINDOW
+end
+
+-- isLive, for when "no" would end or refuse something: one nil read is not a
+-- playtest ending. Costs the wait only when nothing is running.
+function PlaytestBus.awaitLive(ctx)
+	local deadline = os.clock() + 0.5
+	while not PlaytestBus.isLive(ctx) do
+		if os.clock() >= deadline then return false end
+		task.wait(0.05)
+	end
+	return true
 end
 
 -- Any play-DM context alive at all. The server bus is the one that owns the
@@ -199,25 +281,22 @@ end
 -- Push a command to the play-DM bootstrap. Returns the cmd id (use with poll()).
 function PlaytestBus.send(tool, args, ctx)
 	local id = nextId()
+	-- Address the plain "client" to the client holding it right now. Its own inbox
+	-- has one reader, so a resend can't reach a second client if the claim moves.
+	if ctx == "client" then
+		local owner = getSetting(KEY_OWNER)
+		local name = type(owner) == "string" and owner:match("^(.*)|%d+$")
+		if name and PlaytestBus.isLive("client:" .. name) then
+			ctx = "client:" .. name
+		end
+	end
 	rememberCtx(ctx)
 	local inboxKey = KEY_INBOX .. (ctx or "server")
 	local payload = HttpService:JSONEncode({ tool = tool, args = args or {} })
 	setSetting(KEY_CMD .. id, payload)
+	unanswered[id] = { inboxKey = inboxKey, payload = payload, ctx = ctx }
 	-- Also append to the inbox so the bootstrap doesn't have to guess ids.
-	local inboxRaw = getSetting(inboxKey)
-	local inbox = {}
-	if type(inboxRaw) == "string" and #inboxRaw > 0 then
-		local ok, decoded = pcall(function() return HttpService:JSONDecode(inboxRaw) end)
-		if ok and type(decoded) == "table" then inbox = decoded end
-	end
-	-- The edit DM is the inbox's only writer (a bus clearing it raced this
-	-- read-modify-write and lost ids), so drop ids whose command is consumed.
-	local pending = {}
-	for _, old in ipairs(inbox) do
-		if getSetting(KEY_CMD .. old) ~= nil then pending[#pending + 1] = old end
-	end
-	pending[#pending + 1] = id
-	setSetting(inboxKey, HttpService:JSONEncode(pending))
+	addToInbox(inboxKey, id)
 	return id
 end
 
@@ -227,19 +306,40 @@ function PlaytestBus.poll(id, timeoutSec)
 	timeoutSec = tonumber(timeoutSec) or 15
 	local deadline = os.clock() + timeoutSec
 	local resultKey = KEY_RESULT .. id
+	local nextResend = os.clock() + RESEND_EVERY
+	local quietSince = nil
 	while os.clock() < deadline do
 		local raw = getSetting(resultKey)
 		if type(raw) == "string" and #raw > 0 then
 			-- Consume the result so the store doesn't grow.
 			setSetting(resultKey, nil)
+			setSetting(KEY_CMD .. id, nil)
+			unanswered[id] = nil
 			local ok, decoded = pcall(function() return HttpService:JSONDecode(raw) end)
 			if not ok then return nil, "decode_failed" end
 			return decoded, nil
+		end
+		local sent = unanswered[id]
+		if sent and os.clock() >= nextResend then
+			nextResend = os.clock() + RESEND_EVERY
+			if PlaytestBus.isLive(sent.ctx) then
+				quietSince = nil
+			else
+				quietSince = quietSince or os.clock()
+			end
+			if quietSince and os.clock() - quietSince >= RESEND_QUIET_LIMIT then
+				unanswered[id] = nil
+				setSetting(KEY_CMD .. id, nil)
+			else
+				setSetting(KEY_CMD .. id, sent.payload)
+				addToInbox(sent.inboxKey, id)
+			end
 		end
 		task.wait(0.05)
 	end
 	-- Timeout: drop the command if nothing took it, and clear a late result at
 	-- the next cleanup() so it doesn't sit in settings forever.
+	unanswered[id] = nil
 	setSetting(KEY_CMD .. id, nil)
 	abandoned[#abandoned + 1] = id
 	return nil, "timeout"
@@ -750,34 +850,17 @@ function PlaytestBus.startServerBus()
 	addViewHandlers(HANDLERS)
 
 	-- Read-only: the edit DM owns the inbox (see PlaytestBus.send).
-	local seen = {}
-	local function popInbox()
-		local raw = getS(KEY_INBOX .. "server")
-		if type(raw) ~= "string" or #raw == 0 then return {} end
-		local ok, decoded = pcall(function() return HttpService:JSONDecode(raw) end)
-		if not ok or type(decoded) ~= "table" then return {} end
-		local fresh = {}
-		for _, id in ipairs(decoded) do
-			if not seen[id] then
-				seen[id] = true
-				fresh[#fresh + 1] = id
-			end
-		end
-		return fresh
-	end
+	local inbox = openInbox(KEY_INBOX .. "server")
 
-	local function processCommand(id)
-		local raw = getS(KEY_CMD .. id)
-		if type(raw) ~= "string" or #raw == 0 then return end
-		setS(KEY_CMD .. id, nil) -- consume
+	local function processCommand(id, raw)
 		local okDec, cmd = pcall(function() return HttpService:JSONDecode(raw) end)
 		if not okDec or type(cmd) ~= "table" then
-			setS(KEY_RESULT .. id, HttpService:JSONEncode({ ok = false, error = { code = "decode_failed" } }))
+			inbox.answer(id, HttpService:JSONEncode({ ok = false, error = { code = "decode_failed" } }))
 			return
 		end
 		local handler = HANDLERS[cmd.tool]
 		if not handler then
-			setS(KEY_RESULT .. id, HttpService:JSONEncode({ ok = false, error = { code = "unknown_tool", tool = cmd.tool } }))
+			inbox.answer(id, HttpService:JSONEncode({ ok = false, error = { code = "unknown_tool", tool = cmd.tool } }))
 			return
 		end
 		local ok, success, ret = pcall(handler, cmd.args or {})
@@ -796,7 +879,7 @@ function PlaytestBus.startServerBus()
 				error = { code = "encode_failed", message = tostring(encoded) },
 			})
 		end
-		setS(KEY_RESULT .. id, encoded)
+		inbox.answer(id, encoded)
 	end
 
 	print("[Cubes MCP bootstrap] play-DM bus running")
@@ -833,8 +916,8 @@ function PlaytestBus.startServerBus()
 		end
 		-- Spawned, so a long command (character_walk, a waiting tune) doesn't
 		-- stall the heartbeat and read as the session ending.
-		for _, id in ipairs(popInbox()) do
-			task.spawn(processCommand, id)
+		for _, cmd in ipairs(inbox.take()) do
+			task.spawn(processCommand, cmd.id, cmd.raw)
 		end
 		task.wait(0.05)
 	end
@@ -959,37 +1042,18 @@ local function runBusLoop(ctx, HANDLERS, shouldServe)
 	local RunService = game:GetService("RunService")
 	local aliveKey = KEY_ALIVE .. ctx
 	rememberCtx(ctx)
-	local inboxKey = KEY_INBOX .. ctx
-
 	-- Read-only: the edit DM owns the inbox (see PlaytestBus.send).
-	local seen = {}
-	local function popInbox()
-		local raw = getSetting(inboxKey)
-		if type(raw) ~= "string" or #raw == 0 then return {} end
-		local ok, decoded = pcall(function() return HttpService:JSONDecode(raw) end)
-		if not ok or type(decoded) ~= "table" then return {} end
-		local fresh = {}
-		for _, id in ipairs(decoded) do
-			if not seen[id] then
-				seen[id] = true
-				fresh[#fresh + 1] = id
-			end
-		end
-		return fresh
-	end
+	local inbox = openInbox(KEY_INBOX .. ctx)
 
-	local function processCommand(id)
-		local raw = getSetting(KEY_CMD .. id)
-		if type(raw) ~= "string" or #raw == 0 then return end
-		setSetting(KEY_CMD .. id, nil)
+	local function processCommand(id, raw)
 		local okDec, cmd = pcall(function() return HttpService:JSONDecode(raw) end)
 		if not okDec or type(cmd) ~= "table" then
-			setSetting(KEY_RESULT .. id, HttpService:JSONEncode({ ok = false, error = { code = "decode_failed" } }))
+			inbox.answer(id, HttpService:JSONEncode({ ok = false, error = { code = "decode_failed" } }))
 			return
 		end
 		local handler = HANDLERS[cmd.tool]
 		if not handler then
-			setSetting(KEY_RESULT .. id, HttpService:JSONEncode({
+			inbox.answer(id, HttpService:JSONEncode({
 				ok = false,
 				error = { code = "unknown_tool", tool = cmd.tool, context = ctx },
 			}))
@@ -1011,7 +1075,7 @@ local function runBusLoop(ctx, HANDLERS, shouldServe)
 				error = { code = "encode_failed", message = tostring(encoded) },
 			})
 		end
-		setSetting(KEY_RESULT .. id, encoded)
+		inbox.answer(id, encoded)
 	end
 
 	local served = false
@@ -1024,8 +1088,8 @@ local function runBusLoop(ctx, HANDLERS, shouldServe)
 				aliveWritten = now
 				setSetting(aliveKey, now)
 			end
-			for _, id in ipairs(popInbox()) do
-				task.spawn(processCommand, id)
+			for _, cmd in ipairs(inbox.take()) do
+				task.spawn(processCommand, cmd.id, cmd.raw)
 			end
 		end
 		task.wait(0.05)
@@ -1068,12 +1132,20 @@ function PlaytestBus.startClientBus()
 	-- The claim is "name|os.time()", refreshed while held. A client claims
 	-- only a missing or stale one, and serves from the tick after, so two
 	-- clients claiming together settle on the last writer before either serves.
+	local claimMissingSince = nil
 	local function ownsClientInbox()
 		local raw = getSetting(KEY_OWNER)
 		local name, at = nil, nil
 		if type(raw) == "string" then
 			name, at = raw:match("^(.*)|(%d+)$")
 			at = tonumber(at)
+		end
+		-- One nil read is not a missing claim, and taking it would steal it.
+		if at == nil then
+			claimMissingSince = claimMissingSince or os.clock()
+			if os.clock() - claimMissingSince < 1 then return false end
+		else
+			claimMissingSince = nil
 		end
 		local mine = name == me.Name
 		-- The claim holds whole seconds; rewriting an identical one is a no-op.

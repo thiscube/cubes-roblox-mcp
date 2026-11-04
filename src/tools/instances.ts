@@ -287,22 +287,22 @@ return { painted = touched }
       subcategories: ["effects", "particles", "vfx"],
       keywords: ["particle", "particles", "emitter", "vfx", "effect", "sparkle", "smoke", "fire", "magic"],
       description:
-        "Add a ParticleEmitter to a BasePart or Attachment; a couple of params are usually enough. Returns the emitter ref.",
+        "Add a ParticleEmitter to a BasePart or Attachment. Returns its ref.",
       inputSchema: {
         type: "object",
         properties: {
           target: { type: "string", description: "Ref/path of a BasePart or Attachment." },
           rate: { type: "number", description: "Particles per second (default 20)." },
-          lifetimeMin: { type: "number", description: "Min lifetime (default 1)." },
-          lifetimeMax: { type: "number", description: "Max lifetime (default 1)." },
-          speedMin: { type: "number", description: "Min speed (default 0)." },
-          speedMax: { type: "number", description: "Max speed (default 5)." },
-          size: { type: "number", description: "Particle size (default 1)." },
+          lifetimeMin: { type: "number", description: "Default 1." },
+          lifetimeMax: { type: "number", description: "Default 1." },
+          speedMin: { type: "number", description: "Default 0." },
+          speedMax: { type: "number", description: "Default 5." },
+          size: { type: "number", description: "Default 1." },
           color: { type: "string", description: "Color 'r,g,b' (0-255)." },
           texture: { type: "string", description: "Texture id (default sparkle)." },
-          rotationSpeedMin: { type: "number", description: "Rotation speed min (default 0)." },
-          rotationSpeedMax: { type: "number", description: "Rotation speed max (default 0)." },
-          enabled: { type: "boolean", description: "Initially enabled (default true)." },
+          rotationSpeedMin: { type: "number", description: "Default 0." },
+          rotationSpeedMax: { type: "number", description: "Default 0." },
+          enabled: { type: "boolean", description: "Default true." },
         },
         required: ["target"],
       },
@@ -318,10 +318,14 @@ ${parseColorLua}
 ${beginUndo("Cubes MCP: particle_emitter_add")}
 local e = Instance.new("ParticleEmitter")
 e.Rate = tonumber(a.rate) or 20
-e.Lifetime = NumberRange.new(tonumber(a.lifetimeMin) or 1, tonumber(a.lifetimeMax) or 1)
-e.Speed = NumberRange.new(tonumber(a.speedMin) or 0, tonumber(a.speedMax) or 5)
+-- NumberRange throws when min is over max, and a lone min can easily be over the default max.
+local function __range(lo, hi)
+  return NumberRange.new(math.min(lo, hi), math.max(lo, hi))
+end
+e.Lifetime = __range(tonumber(a.lifetimeMin) or 1, tonumber(a.lifetimeMax) or tonumber(a.lifetimeMin) or 1)
+e.Speed = __range(tonumber(a.speedMin) or 0, tonumber(a.speedMax) or math.max(tonumber(a.speedMin) or 0, 5))
 e.Size = NumberSequence.new(tonumber(a.size) or 1)
-e.RotSpeed = NumberRange.new(tonumber(a.rotationSpeedMin) or 0, tonumber(a.rotationSpeedMax) or 0)
+e.RotSpeed = __range(tonumber(a.rotationSpeedMin) or 0, tonumber(a.rotationSpeedMax) or tonumber(a.rotationSpeedMin) or 0)
 local col = __parseColor(a.color)
 if col then e.Color = ColorSequence.new(col) end
 if a.texture then
@@ -342,20 +346,20 @@ return { ref = __MCP.refFor(e), parent = inst:GetFullName(), enabled = e.Enabled
       subcategories: ["effects", "beam", "vfx"],
       keywords: ["beam", "laser", "ray", "line", "connection", "magic", "lightning"],
       description:
-        "Connect two BaseParts with a Beam, creating the Attachments (optional offsets). Width, color, transparency, segments, scrolling texture.",
+        "Connect two BaseParts with a Beam, creating the Attachments (optional offsets).",
       inputSchema: {
         type: "object",
         properties: {
-          part0: { type: "string", description: "Ref/path of the first BasePart." },
-          part1: { type: "string", description: "Ref/path of the second BasePart." },
-          offset0: { type: "array", items: { type: "number" }, description: "Local [x,y,z] offset of Attachment0 (default origin)." },
-          offset1: { type: "array", items: { type: "number" }, description: "Local [x,y,z] offset of Attachment1." },
-          width: { type: "number", description: "Beam Width0 + Width1 (default 0.5)." },
+          part0: { type: "string", description: "Ref/path." },
+          part1: { type: "string", description: "Ref/path." },
+          offset0: { type: "array", items: { type: "number" }, description: "Local [x,y,z]." },
+          offset1: { type: "array", items: { type: "number" }, description: "Local [x,y,z]." },
+          width: { type: "number", description: "Default 0.5." },
           color: { type: "string", description: "Color 'r,g,b'." },
           transparency: { type: "number", description: "0..1 (default 0)." },
-          segments: { type: "number", description: "Number of segments (default 10)." },
-          texture: { type: "string", description: "Texture asset ID for a scrolling beam (optional)." },
-          textureSpeed: { type: "number", description: "Texture scroll speed when texture is set (default 1)." },
+          segments: { type: "number", description: "Default 10." },
+          texture: { type: "string", description: "Asset ID; it scrolls." },
+          textureSpeed: { type: "number", description: "Default 1." },
         },
         required: ["part0", "part1"],
       },
@@ -404,19 +408,19 @@ return { ref = __MCP.refFor(beam), attachments = { __MCP.refFor(at0), __MCP.refF
       subcategories: ["world", "game", "settings"],
       keywords: ["workspace", "gravity", "fall", "settings", "walkspeed", "jumppower", "zoom", "streaming"],
       description:
-        "Set world settings: Gravity, FallenPartsDestroyHeight, StreamingEnabled, and StarterPlayer WalkSpeed/JumpPower/JumpHeight/MaxZoomDistance. Only what you pass changes.",
+        "Set world and StarterPlayer settings. Only what you pass changes.",
       inputSchema: {
         type: "object",
         properties: {
-          gravity: { type: "number", description: "Workspace.Gravity (default 196.2)." },
+          gravity: { type: "number", description: "Default 196.2." },
           fallenPartsDestroyHeight: { type: "number", description: "Y below which parts are destroyed." },
-          streamingEnabled: { type: "boolean", description: "Workspace.StreamingEnabled." },
-          walkSpeed: { type: "number", description: "StarterPlayer.CharacterWalkSpeed (default 16)." },
-          jumpPower: { type: "number", description: "StarterPlayer.CharacterJumpPower." },
-          jumpHeight: { type: "number", description: "StarterPlayer.CharacterJumpHeight." },
-          maxHealth: { type: "number", description: "StarterPlayer.CharacterMaxHealth." },
-          maxZoomDistance: { type: "number", description: "StarterPlayer.CameraMaxZoomDistance." },
-          minZoomDistance: { type: "number", description: "StarterPlayer.CameraMinZoomDistance." },
+          streamingEnabled: { type: "boolean", description: "Streaming on or off." },
+          walkSpeed: { type: "number", description: "Default 16." },
+          jumpPower: { type: "number", description: "On StarterPlayer." },
+          jumpHeight: { type: "number", description: "On StarterPlayer." },
+          maxHealth: { type: "number", description: "On StarterPlayer." },
+          maxZoomDistance: { type: "number", description: "On StarterPlayer." },
+          minZoomDistance: { type: "number", description: "On StarterPlayer." },
         },
       },
     },

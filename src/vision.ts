@@ -246,17 +246,17 @@ $hwnd = $proc.MainWindowHandle
 if ([CubesCap]::IsIconic($hwnd)) { [Console]::Error.WriteLine('studio_minimized'); exit 4 }
 $rect = New-Object CubesCap+R
 [void][CubesCap]::GetWindowRect($hwnd, [ref]$rect)
-$W = $rect.Rt - $rect.L; $H = $rect.B - $rect.T
-if ($W -lt 50 -or $H -lt 50) { [Console]::Error.WriteLine('studio_window_too_small'); exit 3 }
-$full = New-Object System.Drawing.Bitmap $W, $H
+$winW = $rect.Rt - $rect.L; $winH = $rect.B - $rect.T
+if ($winW -lt 50 -or $winH -lt 50) { [Console]::Error.WriteLine('studio_window_too_small'); exit 3 }
+$full = New-Object System.Drawing.Bitmap $winW, $winH
 $g = [System.Drawing.Graphics]::FromImage($full)
 $hdc = $g.GetHdc()
 $printed = [CubesCap]::PrintWindow($hwnd, $hdc, 2)
 $g.ReleaseHdc($hdc)
 if (-not $printed) { $g.CopyFromScreen($rect.L, $rect.T, 0, 0, $full.Size) }
 $g.Dispose()
-$x = ${left}; $y = ${top}; $w = $W - ${left} - ${right}; $h = $H - ${top} - ${bottom}
-if (${wholeWindow}) { $x = 0; $y = 0; $w = $W; $h = $H }
+$x = ${left}; $y = ${top}; $w = $winW - ${left} - ${right}; $h = $winH - ${top} - ${bottom}
+if (${wholeWindow}) { $x = 0; $y = 0; $w = $winW; $h = $winH }
 elseif (${vw} -gt 0 -and ${vh} -gt 0) {
   # The viewport child window: exact size first, then the same size under display scaling.
   $best = $null
@@ -270,7 +270,7 @@ elseif (${vw} -gt 0 -and ${vh} -gt 0) {
   if ($best) { $x = $best.L - $rect.L; $y = $best.T - $rect.T; $w = $best.Rt - $best.L; $h = $best.B - $best.T }
 }
 $x = [Math]::Max(0, $x); $y = [Math]::Max(0, $y)
-$w = [Math]::Min($w, $W - $x); $h = [Math]::Min($h, $H - $y)
+$w = [Math]::Min($w, $winW - $x); $h = [Math]::Min($h, $winH - $y)
 if ($w -lt 50 -or $h -lt 50) { [Console]::Error.WriteLine('studio_window_too_small'); exit 3 }
 $crop = $full.Clone((New-Object System.Drawing.Rectangle $x, $y, $w, $h), $full.PixelFormat)
 $crop.Save($env:CUBES_MCP_SHOT, [System.Drawing.Imaging.ImageFormat]::Png)
@@ -527,8 +527,6 @@ export const screenshotTool: ToolEntry = {
     // Owner-only on POSIX; the capture tools write into the file we create.
     if (process.platform !== "win32") await writeFile(path, "", { mode: 0o600, flag: "wx" }).catch(() => undefined);
 
-    let actualRegion: Region = requested;
-    let warning: string | undefined;
     // An exact viewport crop needs the camera's pixel size; only Windows can use it.
     const viewport =
       requested === "viewport" && source !== "os" && process.platform === "win32"
@@ -546,26 +544,14 @@ export const screenshotTool: ToolEntry = {
           hint: "Roblox Studio is minimized, so there is nothing to capture. Ask the user to restore the Studio window.",
         };
       }
-      if (requested === "full") {
-        await cleanup();
-        return {
-          error: "screenshot_failed",
-          message: err instanceof Error ? err.message : String(err),
-          platform: process.platform,
-        };
-      }
-      warning = `Fell back to full screen: ${err instanceof Error ? err.message : String(err)}`;
-      actualRegion = "full";
-      try {
-        await capture(path, "full", insets);
-      } catch (err2) {
-        await cleanup();
-        return {
-          error: "screenshot_failed",
-          message: err2 instanceof Error ? err2.message : String(err2),
-          platform: process.platform,
-        };
-      }
+      // Never widened to the whole monitor: that is everything else on the user's
+      // screen, and 'full' has to be asked for by name.
+      await cleanup();
+      return {
+        error: "screenshot_failed",
+        message: err instanceof Error ? err.message : String(err),
+        platform: process.platform,
+      };
     }
 
     try {
@@ -590,13 +576,11 @@ export const screenshotTool: ToolEntry = {
       const base64 = buf.toString("base64");
       const meta: Record<string, unknown> = {
         sizeBytes: buf.length,
-        region: actualRegion,
+        region: requested,
         source: "os",
         platform: process.platform,
       };
-      if (actualRegion !== requested) meta.requested = requested;
       if (downscaled) meta.downscaled = `longest edge ${DOWNSCALE_MAX_EDGE}px`;
-      if (warning) meta.warning = warning;
 
       return {
         __mcpContent: [

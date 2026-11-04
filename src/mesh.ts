@@ -92,6 +92,10 @@ export const MAX_MESH_FILE_BYTES = 64 * 1024 * 1024;
 /** Parse-time caps, checked before allocating, so a tiny GLB can't expand to gigabytes. */
 const MAX_PARSE_VERTICES = 1_000_000;
 const MAX_PARSE_INDICES = 3_000_000;
+/** A face that long is not a real model, and splitting it is what runs out of memory. */
+const MAX_OBJ_LINE_CHARS = 64 * 1024;
+/** Numbers read from GLB accessors across the whole file, which can reuse one many times. */
+const MAX_PARSE_COMPONENTS = 20_000_000;
 const MAX_NODE_VISITS = 10_000;
 const MAX_NODE_DEPTH = 64;
 
@@ -256,12 +260,17 @@ export function parseObj(text: string): MeshData {
     return i < 0 ? count + i : i - 1;
   };
 
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
+  // Line by line rather than one split, so a file over the caps stops at the cap.
+  for (let start = 0, end = 0; start < text.length; start = end + 1) {
+    end = text.indexOf("\n", start);
+    if (end < 0) end = text.length;
+    if (end - start > MAX_OBJ_LINE_CHARS) throw new Error(`The OBJ has a line over ${MAX_OBJ_LINE_CHARS} characters.`);
+    const line = text.slice(start, end).trim();
     if (!line || line.startsWith("#")) continue;
     const parts = line.split(/\s+/);
     const kind = parts[0];
     if (kind === "v") {
+      if (v.length / 3 >= MAX_PARSE_VERTICES) throw new Error(`The OBJ has more than ${MAX_PARSE_VERTICES} vertices.`);
       v.push(Number(parts[1]), Number(parts[2]), Number(parts[3]));
       const r = Number(parts[4]), g = Number(parts[5]), b = Number(parts[6]);
       if (parts.length >= 7 && Number.isFinite(r) && Number.isFinite(g) && Number.isFinite(b)) {
@@ -271,8 +280,11 @@ export function parseObj(text: string): MeshData {
         vc.push(NaN, 0, 0);
       }
     } else if (kind === "vn") {
+      if (vn.length / 3 >= MAX_PARSE_VERTICES) throw new Error(`The OBJ has more than ${MAX_PARSE_VERTICES} normals.`);
       vn.push(Number(parts[1]), Number(parts[2]), Number(parts[3]));
     } else if (kind === "f") {
+      if (positions.length / 3 + parts.length - 1 > MAX_PARSE_VERTICES) throw new Error(`The OBJ has more than ${MAX_PARSE_VERTICES} vertices.`);
+      if (indices.length + (parts.length - 3) * 3 > MAX_PARSE_INDICES) throw new Error(`The OBJ has more than ${MAX_PARSE_INDICES / 3} triangles.`);
       const vCount = v.length / 3;
       const nCount = vn.length / 3;
       cp.length = 0;
@@ -463,6 +475,7 @@ export function parseGlb(buf: Buffer): MeshData {
   }
   if (!json) throw new Error("The GLB has no JSON chunk.");
 
+  let componentsRead = 0;
   const readAccessor = (i: number): { data: Float64Array; size: number } => {
     const acc = json.accessors[i];
     const view = json.bufferViews[acc.bufferView];
@@ -480,6 +493,8 @@ export function parseGlb(buf: Buffer): MeshData {
     if (count > 0 && (start < 0 || viewEnd > bin.byteLength || start + (count - 1) * stride + elem > viewEnd)) {
       throw new Error(`Accessor ${i} (${count} x ${stride} bytes) runs past the end of its buffer.`);
     }
+    componentsRead += count * size;
+    if (componentsRead > MAX_PARSE_COMPONENTS) throw new Error(`The GLB needs more than ${MAX_PARSE_COMPONENTS} numbers read to parse.`);
     const norm = acc.normalized === true;
     const data = new Float64Array(count * size);
     let w = 0;

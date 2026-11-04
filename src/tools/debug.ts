@@ -150,26 +150,26 @@ return { bounded = boxed, count = #boxed }
       subcategories: ["visualize", "text"],
       keywords: ["label", "text", "name", "tag", "annotate", "billboard", "debug"],
       description:
-        "Camera-facing text labels above instances or at world positions, to annotate parts for a screenshot review.",
+        "Camera-facing text labels above instances or at world positions.",
       inputSchema: {
         type: "object",
         properties: {
           labels: {
             type: "array",
-            description: "List of label specs. Each must have either `target` (ref/path) or `position` ([x,y,z]).",
+            description: "Each needs target or position.",
             items: {
               type: "object",
               properties: {
-                target: { type: "string", description: "Ref or path to adorn." },
-                position: { type: "array", items: { type: "number" }, description: "World [x,y,z] if no target." },
+                target: { type: "string", description: "Ref/path." },
+                position: { type: "array", items: { type: "number" }, description: "World [x,y,z]." },
                 text: { type: "string", description: "Label text." },
-                color: { type: "string", description: "Text color 'r,g,b' (default 255,255,255)." },
-                offsetY: { type: "number", description: "Vertical offset in studs (default 2)." },
+                color: { type: "string", description: "'r,g,b'." },
+                offsetY: { type: "number", description: "Studs (default 2)." },
               },
               required: ["text"],
             },
           },
-          clear: { type: "boolean", description: "Clear existing labels first (default true)." },
+          clear: { type: "boolean", description: "Default true." },
           duration: { type: "number", description: "Auto-clear ALL debug viz after N seconds." },
         },
         required: ["labels"],

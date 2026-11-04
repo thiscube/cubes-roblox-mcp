@@ -9,6 +9,317 @@ import { objectResult } from "../output-schema.js";
  * so there is never a question of where a new tool goes (A6).
  */
 
+/**
+ * Real player input, through UserInputService:CreateVirtualInput().
+ *
+ * Runs through the `client_eval` plugin command because the virtual input only
+ * works in the play client, and that needs no plugin change. `__MCP` does not
+ * exist there, so arguments are decoded with HttpService directly.
+ */
+const CLIENT_GUI_LUAU = `
+local HttpService = game:GetService("HttpService")
+local me = game:GetService("Players").LocalPlayer
+local playerGui = me:FindFirstChildOfClass("PlayerGui")
+local function shown(g)
+  if not g:IsA("GuiObject") or g.AbsoluteSize.X <= 0 or g.AbsoluteSize.Y <= 0 then return false end
+  -- A SurfaceGui or BillboardGui's positions are not screen positions.
+  if not g:FindFirstAncestorWhichIsA("ScreenGui") then return false end
+  local node = g
+  while node and node ~= playerGui do
+    if node:IsA("GuiObject") and not node.Visible then return false end
+    if node:IsA("LayerCollector") and not node.Enabled then return false end
+    node = node.Parent
+  end
+  return true
+end
+local function pathOf(g)
+  return string.sub(g:GetFullName(), #playerGui:GetFullName() + 2)
+end
+local function clickable(g)
+  return g:IsA("GuiButton") or g:IsA("TextBox")
+end
+local function textOf(g)
+  if g:IsA("TextButton") or g:IsA("TextLabel") or g:IsA("TextBox") then return g.Text end
+  return nil
+end
+`;
+
+const PLAYER_INPUT_LUAU = `
+local UIS = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+-- One per client, kept between calls so a key pressed in one is released in the next.
+local state = _G.__CUBES_INPUT
+if not state then
+  state = { vi = UIS:CreateVirtualInput(), held = {} }
+  _G.__CUBES_INPUT = state
+end
+local vi = state.vi
+
+local KEY_ALIASES = { shift = "LeftShift", ctrl = "LeftControl", alt = "LeftAlt", enter = "Return", esc = "Escape" }
+local function keyCode(name)
+  local want = string.lower(tostring(name))
+  want = string.lower(KEY_ALIASES[want] or want)
+  for _, item in Enum.KeyCode:GetEnumItems() do
+    if string.lower(item.Name) == want then return item end
+  end
+  return nil
+end
+
+local function findTarget(name)
+  local want = string.lower(name)
+  local seen, hits = {}, {}
+  for _, g in playerGui:GetDescendants() do
+    if shown(g) then
+      local path = string.lower(pathOf(g))
+      local text = textOf(g)
+      if string.lower(g.Name) == want or path == want or string.sub(path, -#want - 1) == "." .. want
+        or (text and string.lower(text) == want) then
+        -- A label inside a button means the button.
+        local hit = clickable(g) and g or g:FindFirstAncestorWhichIsA("GuiButton") or g
+        if not seen[hit] then
+          seen[hit] = true
+          hits[#hits + 1] = hit
+        end
+      end
+    end
+  end
+  local buttons = {}
+  for _, g in hits do
+    if clickable(g) then buttons[#buttons + 1] = g end
+  end
+  return #buttons > 0 and buttons or hits
+end
+
+local function pressAt(pos, kind)
+  local screen = pos + GuiService:GetGuiInset()
+  vi:SendMousePosition(screen)
+  task.wait(0.05)
+  vi:SendMouseButton(screen, kind, true, 0)
+  task.wait(0.05)
+  vi:SendMouseButton(screen, kind, false, 0)
+end
+
+local function topAt(pos)
+  local top = playerGui:GetGuiObjectsAtPosition(pos.X, pos.Y)[1]
+  return top and pathOf(top) or nil
+end
+
+local function click(act)
+  local kind = act.button == "right" and Enum.UserInputType.MouseButton2 or Enum.UserInputType.MouseButton1
+  if type(act.at) == "table" then
+    local pos = Vector2.new(tonumber(act.at[1]) or 0, tonumber(act.at[2]) or 0)
+    pressAt(pos, kind)
+    task.wait(0.1)
+    return { at = act.at, under = topAt(pos) }
+  end
+  if type(act.target) ~= "string" or act.target == "" then
+    return nil, "bad_action", "click needs 'target' or 'at'."
+  end
+  local found = findTarget(act.target)
+  if #found == 0 then
+    return nil, "not_found", "Nothing visible on screen matches '" .. act.target .. "'. ui_inspect lists what is there."
+  end
+  if #found > 1 then
+    local paths = {}
+    for i, g in found do
+      if i > 8 then break end
+      local center = g.AbsolutePosition + g.AbsoluteSize / 2
+      paths[i] = pathOf(g) .. " at [" .. math.floor(center.X) .. ", " .. math.floor(center.Y) .. "]"
+    end
+    return nil, "ambiguous", "'" .. act.target .. "' matches several things: " .. table.concat(paths, ", ") .. ". Use a longer path, or click 'at' one of those."
+  end
+  local g = found[1]
+  local pos = g.AbsolutePosition + g.AbsoluteSize / 2
+  local view = workspace.CurrentCamera.ViewportSize
+  if pos.X < 0 or pos.Y < -GuiService:GetGuiInset().Y or pos.X > view.X or pos.Y > view.Y then
+    return nil, "off_screen", pathOf(g) .. " is outside the screen."
+  end
+  local fired = false
+  local conn
+  if g:IsA("GuiButton") then
+    local signal = kind == Enum.UserInputType.MouseButton2 and g.MouseButton2Click or g.Activated
+    conn = signal:Connect(function() fired = true end)
+  end
+  pressAt(pos, kind)
+  local started = os.clock()
+  while not fired and os.clock() - started < 0.3 do task.wait() end
+  if conn then conn:Disconnect() end
+  if g:IsA("TextBox") then fired = g:IsFocused() end
+  if clickable(g) and not fired then
+    return nil, "click_missed", "Clicked " .. pathOf(g) .. " and it did not respond. On top there: " .. tostring(topAt(pos)) .. "."
+  end
+  return { clicked = pathOf(g), verified = clickable(g) }
+end
+
+-- Where the right button can go down and reach the camera: a button there would take it.
+local function openSpot()
+  local inset = GuiService:GetGuiInset()
+  local view = workspace.CurrentCamera.ViewportSize
+  for _, fx in { 0.5, 0.25, 0.75 } do
+    for _, fy in { 0.5, 0.25, 0.75 } do
+      local screen = Vector2.new(view.X * fx, view.Y * fy)
+      local blocked = false
+      for _, g in playerGui:GetGuiObjectsAtPosition(screen.X - inset.X, screen.Y - inset.Y) do
+        if g.Active then blocked = true break end
+      end
+      if not blocked then return screen end
+    end
+  end
+  return nil
+end
+
+local function look(act)
+  local cam = workspace.CurrentCamera
+  local before = cam.CFrame.LookVector
+  local dx, dy = tonumber(act.dx) or 0, tonumber(act.dy) or 0
+  -- A fixed cap, so a big turn takes bigger steps rather than outlasting the call.
+  local steps = math.clamp(math.ceil(math.max(math.abs(dx), math.abs(dy)) / 30), 1, 30)
+  -- The default camera only turns while the right button is down, unless the mouse is locked.
+  local free = UIS.MouseBehavior == Enum.MouseBehavior.Default
+  local right = Enum.UserInputType.MouseButton2
+  local spot = nil
+  if free then
+    spot = openSpot()
+    if not spot then
+      return nil, "no_open_spot", "A menu covers the screen, so the camera can't be turned. Close it first."
+    end
+    if UIS:IsMouseButtonPressed(right) then vi:SendMouseButton(spot, right, false, 0) task.wait(0.05) end
+    vi:SendMouseButton(spot, right, true, 0)
+    task.wait(0.05)
+  end
+  local okTurn, turnErr = pcall(function()
+    for _ = 1, steps do
+      vi:SendMouseDelta(Vector2.new(dx / steps, dy / steps))
+      task.wait(0.03)
+    end
+  end)
+  -- Whatever happened above: a button left down blocks every later turn.
+  if free then pcall(function() vi:SendMouseButton(spot, right, false, 0) end) end
+  if not okTurn then return nil, "look_failed", tostring(turnErr) end
+  task.wait(0.05)
+  local dot = math.clamp(cam.CFrame.LookVector:Dot(before), -1, 1)
+  return { turnedDegrees = math.floor(math.deg(math.acos(dot)) * 10) / 10 }
+end
+
+local function run(act)
+  local kind = act["do"]
+  if kind == "wait" then
+    task.wait(tonumber(act.seconds) or 0)
+    return { waited = tonumber(act.seconds) or 0 }
+  elseif kind == "click" then
+    return click(act)
+  elseif kind == "look" then
+    return look(act)
+  elseif kind == "type" then
+    if not UIS:GetFocusedTextBox() then
+      return nil, "no_text_box", "No text box has focus. Click one first."
+    end
+    vi:SendTextInput(tostring(act.text or ""))
+    task.wait(0.05)
+    return { typed = UIS:GetFocusedTextBox() and UIS:GetFocusedTextBox().Text }
+  elseif kind == "release" and act.key == nil then
+    for name, code in state.held do
+      vi:SendKey(false, code, false)
+      state.held[name] = nil
+    end
+    return { released = "all" }
+  elseif kind == "key" or kind == "press" or kind == "release" then
+    local code = keyCode(act.key)
+    if not code then return nil, "bad_key", "No key called '" .. tostring(act.key) .. "'." end
+    if kind == "release" then
+      vi:SendKey(false, code, false)
+      state.held[code.Name] = nil
+      return { released = code.Name }
+    end
+    vi:SendKey(true, code, false)
+    if kind == "press" then
+      state.held[code.Name] = code
+      return { pressed = code.Name }
+    end
+    task.wait(tonumber(act.hold) or 0.05)
+    vi:SendKey(false, code, false)
+    return { key = code.Name, held = tonumber(act.hold) or 0.05 }
+  end
+  return nil, "bad_action", "Unknown action '" .. tostring(kind) .. "'."
+end
+
+local function rootPosition()
+  local root = me.Character and me.Character:FindFirstChild("HumanoidRootPart")
+  return root and root.Position or nil
+end
+local function heldKeys()
+  local names = {}
+  for name in state.held do names[#names + 1] = name end
+  return names
+end
+local function moved(from)
+  local to = rootPosition()
+  return from and to and math.floor((to - from).Magnitude * 10) / 10 or nil
+end
+
+local start = rootPosition()
+local done = {}
+for i, act in a.actions do
+  local okRun, result, code, message = pcall(run, act)
+  if not okRun then
+    code, message, result = "input_failed", tostring(result), nil
+  end
+  if not result then
+    return { error = code, at = i, message = message, done = done, moved = moved(start), held = heldKeys() }
+  end
+  done[#done + 1] = result
+end
+return { done = done, moved = moved(start), held = heldKeys() }
+`;
+
+const UI_INSPECT_LUAU = `
+local want = type(a.find) == "string" and string.lower(a.find) or nil
+local limit = math.clamp(tonumber(a.limit) or 40, 1, 200)
+local items, total = {}, 0
+for _, g in playerGui:GetDescendants() do
+  if shown(g) then
+    local text = textOf(g)
+    local isHit
+    if want then
+      isHit = string.find(string.lower(pathOf(g)), want, 1, true) ~= nil
+        or (text ~= nil and string.find(string.lower(text), want, 1, true) ~= nil)
+    else
+      isHit = clickable(g) or (a.all == true)
+    end
+    if isHit then
+      total += 1
+      if #items < limit then
+        local center = g.AbsolutePosition + g.AbsoluteSize / 2
+        items[#items + 1] = {
+          path = pathOf(g),
+          class = g.ClassName,
+          text = text and string.sub(text, 1, 80) or nil,
+          clickable = clickable(g),
+          at = { math.floor(center.X), math.floor(center.Y) },
+          size = { math.floor(g.AbsoluteSize.X), math.floor(g.AbsoluteSize.Y) },
+        }
+      end
+    end
+  end
+end
+return { elements = items, total = total, truncated = total > #items }
+`;
+
+/** What the plugin allows a client_eval, less room for the round trip. */
+const INPUT_MAX_SECONDS = 20;
+const INPUT_MAX_ACTIONS = 30;
+
+function clientChunk(body: string, args: unknown): string {
+  return `${CLIENT_GUI_LUAU}\nlocal a = HttpService:JSONDecode(${luaJson(args)})\n${body}`;
+}
+
+/** Drop the chunk's own bookkeeping; the server's isError comes from `error`. */
+function fromClient(reply: unknown): unknown {
+  if (!reply || typeof reply !== "object") return reply;
+  const { __via: _via, ...rest } = reply as Record<string, unknown>;
+  return rest;
+}
+
 
 /**
  * Walk a character along a computed path.
@@ -20,8 +331,7 @@ import { objectResult } from "../output-schema.js";
  *
  * The honest limit: Humanoid:MoveTo is server-side puppeteering, so the game's
  * own control scripts still do not run. It buys intent ("get to that door")
- * rather than fidelity; real input needs the client DataModel, which cannot
- * reach this bridge at all (see PLAN.md #10).
+ * rather than fidelity; for the game's own controls, use player_input.
  */
 const gotoBudgetMs = (args: any): number =>
   (Math.min(60, Math.max(1, Number(args?.timeout) || 20)) + 10) * 1000;
@@ -831,6 +1141,94 @@ return { ok = true, frames = count, elapsed = os.clock() - startClock }
           30_000,
         ),
       };
+    },
+  ),
+  commandTool(
+    {
+      name: "player_input",
+      category: "playtest",
+      subcategories: ["live", "input", "client"],
+      keywords: ["input", "keyboard", "key", "press", "mouse", "click", "button", "type", "camera", "look", "controls", "menu"],
+      description:
+        "Play as a real player through the game's own controls and GUI: keys, clicks, camera, typing. Stops at the first failure, including a click the button did not respond to.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          actions: {
+            type: "array",
+            description: "At most 20s in total.",
+            items: {
+              type: "object",
+              properties: {
+                do: { type: "string", enum: ["key", "press", "release", "click", "look", "type", "wait"] },
+                key: { type: "string", description: "W, Space, shift. release with none lets go of all." },
+                hold: { type: "number", description: "Seconds, for key." },
+                target: { type: "string", description: "Name, path or text of a visible GUI element." },
+                at: { type: "array", items: { type: "number" }, description: "[x, y] from ui_inspect, instead of target." },
+                button: { type: "string", enum: ["left", "right"] },
+                dx: { type: "number", description: "Mouse pixels." },
+                dy: { type: "number", description: "Mouse pixels." },
+                text: { type: "string", description: "Into the focused text box." },
+                seconds: { type: "number", description: "wait." },
+              },
+              required: ["do"],
+            },
+          },
+          player: { type: "string", description: "Which client. Default: the first." },
+        },
+        required: ["actions"],
+      },
+      outputSchema: objectResult(),
+    },
+    "client_eval",
+    async (args, ctx) => {
+      const actions = (args ?? {}).actions;
+      if (!Array.isArray(actions) || actions.length === 0 || actions.length > INPUT_MAX_ACTIONS) {
+        return { error: "bad_args", hint: `player_input needs 1-${INPUT_MAX_ACTIONS} actions.` };
+      }
+      // Each action costs a little even with no wait in it, hence the 0.3. A look
+      // takes up to 30 frames whatever its size.
+      const seconds = actions.reduce(
+        (sum: number, act: any) =>
+          sum + (act?.do === "look" ? 1.5 : 0.3) + Math.max(0, Number(act?.hold) || 0) + Math.max(0, Number(act?.seconds) || 0),
+        0,
+      );
+      if (seconds > INPUT_MAX_SECONDS) {
+        return { error: "bad_args", hint: `That is about ${Math.round(seconds)}s of input; split it into calls of ${INPUT_MAX_SECONDS}s or less.` };
+      }
+      const player = (args ?? {}).player;
+      const luau = clientChunk(PLAYER_INPUT_LUAU, { actions });
+      return fromClient(
+        await ctx.bridge.send("client_eval", typeof player === "string" && player !== "" ? { luau, player } : { luau }, 30_000),
+      );
+    },
+  ),
+  commandTool(
+    {
+      name: "ui_inspect",
+      category: "playtest",
+      subcategories: ["live", "gui", "client"],
+      keywords: ["ui", "gui", "button", "menu", "screen", "shop", "text", "visible", "hud", "find"],
+      description:
+        "What is on the player's screen in a playtest: name, text and position of each visible GUI element, clickable ones by default.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          find: { type: "string", description: "Path or text contains this." },
+          all: { type: "boolean", description: "Labels and frames too." },
+          limit: { type: "number", description: "Default 40." },
+          player: { type: "string", description: "Which client." },
+        },
+      },
+      outputSchema: objectResult({ elements: { type: "array" }, total: { type: "number" } }),
+    },
+    "client_eval",
+    async (args, ctx) => {
+      const { player, ...rest } = (args ?? {}) as Record<string, unknown>;
+      const luau = clientChunk(UI_INSPECT_LUAU, rest);
+      return fromClient(
+        await ctx.bridge.send("client_eval", typeof player === "string" && player !== "" ? { luau, player } : { luau }, 30_000),
+      );
     },
   ),
   commandTool(

@@ -77,7 +77,7 @@ function Refs.resolve(token)
 	end
 	local node = game
 	for part in string.gmatch(token, "[^%.]+") do
-		if part ~= "game" and part ~= "DataModel" then
+		if node ~= game or (part ~= "game" and part ~= "DataModel") then
 			local nxt = node:FindFirstChild(part)
 			if not nxt and node == game then
 				-- FindService, not GetService: resolving a path must never create a service.
@@ -148,7 +148,7 @@ function Refs.resolveWithSuggestions(token)
 	local lastFoundPath = "game"
 	local failedSegment = nil
 	for part in string.gmatch(token, "[^%.]+") do
-		if part ~= "game" and part ~= "DataModel" then
+		if node ~= game or (part ~= "game" and part ~= "DataModel") then
 			local nxt = node:FindFirstChild(part)
 			if not nxt and node == game then
 				-- FindService, not GetService: resolving a path must never create a service.

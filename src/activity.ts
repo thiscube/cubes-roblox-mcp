@@ -65,6 +65,8 @@ export const TOOL_ACTIVITY: Record<string, string> = {
   tune: "Tuning",
   client_eval: "Tuning",
   signal_capture: "Measuring",
+  player_input: "Playing",
+  ui_inspect: "Inspecting",
   character_goto: "Pathfinding",
   players_state: "Inspecting",
   character_state: "Inspecting",

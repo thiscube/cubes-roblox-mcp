@@ -384,9 +384,14 @@ edit copy relays. Detect which copy you are by connection direction, not by
   play server. Still `Humanoid:MoveTo` underneath, so it buys intent, not fidelity: the
   game's own control scripts do not run until the relay above exists.
 
-**Done when:** holding a key walks the character through the game's own control scripts,
-a click lands on a button located by name rather than by pixel, and `character_goto`
-crosses a map with obstacles and says whether it arrived.
+**Done (keyboard, mouse, camera, typing).** `player_input` and `ui_inspect` run through
+the `client_eval` bus, so the `PluginConnection` relay above turned out not to be needed.
+Holding W walked the character through the game's own controls, and clicking
+`Menu.Shop.Button` by name opened Climb Stairs' real Shop. A click by name fails with
+`click_missed` when the button did not respond.
+
+Still open: `set_device_simulator`, `set_network_profile`, touch input, the mouse wheel,
+and elements inside `CoreGui`.
 
 #### 11. Multiple Studio windows (**L**)
 

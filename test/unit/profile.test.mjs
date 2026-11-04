@@ -86,3 +86,32 @@ describe("profile persistence", () => {
     assert.deepEqual(p.decisions, []);
   });
 });
+
+describe("profile_update", () => {
+  const ctxFor = (placeId) => ({ getPlaceContext: async () => ({ placeId, placeName: "Test" }) });
+
+  test("parallel updates all land", async () => {
+    const { SESSION_TOOLS } = await import("../../dist/tools/session.js");
+    const tool = SESSION_TOOLS.find((t) => t.name === "profile_update");
+    const placeId = 987001;
+    const runs = Array.from({ length: 10 }, (_, i) => tool.handler({ knownIssue: `issue ${i}` }, ctxFor(placeId)));
+    const results = await Promise.allSettled(runs);
+    assert.deepEqual(results.filter((r) => r.status === "rejected"), []);
+    const saved = await profile.loadProfile(placeId, "Test");
+    assert.equal(saved.knownIssues.length, 10);
+  });
+
+  test("a corrupt profile is set aside, not overwritten", async () => {
+    const { writeFile, readFile } = await import("node:fs/promises");
+    const { dirname, basename } = await import("node:path");
+    const placeId = 987002;
+    const path = profile.profilePath(placeId);
+    await profile.saveProfile({ ...(await profile.loadProfile(placeId, "Test")) });
+    await writeFile(path, '{"decisions":[{"topic":"keep me"', "utf8");
+    await profile.loadProfile(placeId, "Test");
+    const names = await readdir(dirname(path));
+    const kept = names.find((n) => n.startsWith(`${basename(path)}.corrupt-`));
+    assert.ok(kept, "the damaged file should still exist under another name");
+    assert.match(await readFile(join(dirname(path), kept), "utf8"), /keep me/);
+  });
+});

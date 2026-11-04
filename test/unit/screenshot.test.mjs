@@ -185,3 +185,19 @@ describe("screenshot routing", () => {
     assert.ok(b.sent[0].timeoutMs > 0 && b.sent[0].timeoutMs <= 15_000);
   });
 });
+
+describe("the Windows capture script", () => {
+  test("no two PowerShell variables differ only by case", async () => {
+    // PowerShell ignores case, so $W and $w are one variable: the window size got
+    // overwritten by the crop size, and the crop came out too small.
+    const { readFile } = await import("node:fs/promises");
+    const source = await readFile(new URL("../../src/vision.ts", import.meta.url), "utf8");
+    const names = new Set(source.match(/\$[A-Za-z][A-Za-z0-9]*/g));
+    const byFold = new Map();
+    for (const name of names) {
+      const fold = name.toLowerCase();
+      assert.ok(!byFold.has(fold) || byFold.get(fold) === name, `${name} and ${byFold.get(fold)} are the same variable`);
+      byFold.set(fold, name);
+    }
+  });
+});

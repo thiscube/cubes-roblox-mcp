@@ -57,7 +57,7 @@ export interface ProjectProfile {
 
 
 
-function profilePath(placeId: number): string {
+export function profilePath(placeId: number): string {
   // Resolved per call so CUBES_MCP_HOME can relocate it. See src/paths.ts.
   return join(profileDir(), `${placeId}.json`);
 }
@@ -91,10 +91,12 @@ export async function loadProfile(
   } catch (err: unknown) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return emptyProfile(placeId, placeName);
-    // Corrupt file — keep the corrupt file around for inspection but proceed
-    // with a fresh profile so the session doesn't die over bad JSON.
+    // Corrupt file — set it aside for inspection, or the next save would replace
+    // it, and proceed with a fresh profile so the session doesn't die over bad JSON.
+    const aside = `${profilePath(placeId)}.corrupt-${Date.now()}`;
+    await rename(profilePath(placeId), aside).catch(() => {});
     console.error(
-      `[cubes-mcp] profile read failed for placeId=${placeId}: ${(err as Error).message}. Starting fresh.`,
+      `[cubes-mcp] profile read failed for placeId=${placeId}: ${(err as Error).message}. Kept it as ${aside}; starting fresh.`,
     );
     return emptyProfile(placeId, placeName);
   }

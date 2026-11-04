@@ -16,22 +16,22 @@ export const LIGHTING_TOOLS: ToolEntry[] = [
       subcategories: ["sky", "atmosphere", "environment"],
       keywords: ["sky", "skybox", "clouds", "atmosphere", "sun", "moon", "stars", "weather"],
       description:
-        "Configure sky and clouds: skybox faces, sun/moon size, stars, cloud cover/density/color. Creates Sky and Clouds if missing; pass only what changes.",
+        "Configure sky and clouds. Creates them if missing; pass only what changes.",
       inputSchema: {
         type: "object",
         properties: {
-          skyboxUp: { type: "string", description: "Top face texture asset ID." },
-          skyboxDn: { type: "string", description: "Bottom face texture." },
-          skyboxLf: { type: "string", description: "Left face texture." },
-          skyboxRt: { type: "string", description: "Right face texture." },
-          skyboxFt: { type: "string", description: "Front face texture." },
-          skyboxBk: { type: "string", description: "Back face texture." },
-          starCount: { type: "number", description: "Number of stars (default 3000)." },
+          skyboxUp: { type: "string", description: "Asset ID." },
+          skyboxDn: { type: "string", description: "Asset ID." },
+          skyboxLf: { type: "string", description: "Asset ID." },
+          skyboxRt: { type: "string", description: "Asset ID." },
+          skyboxFt: { type: "string", description: "Asset ID." },
+          skyboxBk: { type: "string", description: "Asset ID." },
+          starCount: { type: "number", description: "Default 3000." },
           sunAngularSize: { type: "number", description: "Degrees (default 21)." },
           moonAngularSize: { type: "number", description: "Degrees (default 11)." },
           clouds: {
             type: "object",
-            description: "Cloud settings.",
+            description: "Clouds.",
             properties: {
               cover: { type: "number", description: "0..1 (default 0.55)." },
               density: { type: "number", description: "0..1 (default 0.55)." },

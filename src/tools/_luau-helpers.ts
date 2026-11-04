@@ -12,6 +12,8 @@ import { luaJson } from "../registry.js";
 export const beginUndo = (label: string) => `
 local CHS = game:GetService("ChangeHistoryService")
 local __rec = CHS:TryBeginRecording(${luaJson(label)})
+-- So the plugin can close it if this chunk throws before endUndo.
+_G.__CUBES_MCP_UNDO = __rec
 `;
 
 export const endUndo = `

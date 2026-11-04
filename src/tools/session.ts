@@ -1,7 +1,7 @@
 import { type ToolEntry, evalTool, localTool, luaJson, pipelineTool, readTool } from "../registry.js";
 import { diffSnapshots } from "../snapshot-diff.js";
 import type { SnapshotInstance } from "../memory.js";
-import { applyPatch, loadProfile, saveProfile, type ProfilePatch } from "../profile.js";
+import { applyPatch, updateProfile, type ProfilePatch } from "../profile.js";
 import { objectResult } from "../output-schema.js";
 
 /**
@@ -84,18 +84,18 @@ export const SESSION_TOOLS: ToolEntry[] = [
           genre: {
             type: "string",
             description:
-              "Detected genre: obby, simulator, rpg, racing, tower_defense, casual_sim, social, experimental, unknown.",
+              "obby, simulator, rpg, racing, tower_defense, social, etc.",
           },
           placeName: { type: "string", description: "Set/replace the place name." },
           style: {
             type: "object",
             description:
-              "Shallow-merged into profile.style. Keys: palette[], materials[], naming, notes.",
+              "Shallow-merged. Keys: palette[], materials[], naming, notes.",
           },
           structure: {
             type: "object",
             description:
-              "Shallow-merge into profile.structure. Free-form key/value (e.g. modelRoot='Workspace.Entities').",
+              "Shallow-merged, e.g. modelRoot='Workspace.Entities'.",
           },
           decision: {
             type: "object",
@@ -110,7 +110,7 @@ export const SESSION_TOOLS: ToolEntry[] = [
           sessionSummary: {
             type: "object",
             description:
-              "Append to sessionLog. Breadcrumbs for the next session.",
+              "Append to sessionLog.",
             properties: {
               session: { type: "string" },
               summary: { type: "string" },
@@ -122,7 +122,6 @@ export const SESSION_TOOLS: ToolEntry[] = [
     },
     async (args, ctx) => {
       const ctxData = await ctx.getPlaceContext();
-      const profile = await loadProfile(ctxData.placeId, ctxData.placeName);
       const patch: ProfilePatch = {
         genre: typeof args.genre === "string" ? args.genre : undefined,
         placeName: typeof args.placeName === "string" ? args.placeName : undefined,
@@ -145,8 +144,7 @@ export const SESSION_TOOLS: ToolEntry[] = [
             ? (args.sessionSummary as ProfilePatch["sessionSummary"])
             : undefined,
       };
-      applyPatch(profile, patch);
-      await saveProfile(profile);
+      const profile = await updateProfile(ctxData.placeId, (p) => applyPatch(p, patch), ctxData.placeName);
       return {
         ok: true,
         placeId: profile.placeId,

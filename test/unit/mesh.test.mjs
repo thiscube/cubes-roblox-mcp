@@ -190,3 +190,25 @@ describe("mesh tools are classified by where their effect lands", () => {
     assert.ok(!rpcReadOnlyCommands().includes("mesh_build"));
   });
 });
+
+describe("mesh file limits", () => {
+  const triangle = "v 0 0 0\nv 1 0 0\nv 0 1 0\n";
+
+  test("an OBJ with too many corners stops at the cap", () => {
+    const started = Date.now();
+    assert.throws(() => parseObj(triangle + "f 1 2 3\n".repeat(2_000_000)), /more than/);
+    assert.ok(Date.now() - started < 5000, "it should stop early, not parse everything first");
+  });
+
+  test("one enormous face line is refused before it is split", () => {
+    assert.throws(() => parseObj(triangle + "f " + "1 ".repeat(1_000_000) + "\n"), /line over/);
+  });
+
+  test("too many vertices is refused", () => {
+    assert.throws(() => parseObj("v 0 0 0\n".repeat(1_000_001)), /vertices/);
+  });
+
+  test("Windows line endings still parse", () => {
+    assert.equal(parseObj("v 0 0 0\r\nv 1 0 0\r\nv 0 1 0\r\nf 1 2 3\r\n").indices.length, 3);
+  });
+});

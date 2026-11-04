@@ -17,11 +17,15 @@ local Mutate = {}
 
 -- Extract all signed numeric components from a stringified Roblox value.
 -- Handles tostring() output like "0, 50, 0" (Vector3), "{0, 50}, {0, 100}" (UDim2),
--- or "0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1" (CFrame).
+-- or "0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1" (CFrame). A rotated CFrame holds values
+-- like -4.37113883e-08, so a number has to be taken whole, exponent included.
 local function extractNumbers(str)
 	local nums = {}
-	for n in string.gmatch(str, "-?%d*%.?%d+") do
-		nums[#nums + 1] = tonumber(n)
+	for token in string.gmatch(str, "[%d%.eE%+%-]+") do
+		local n = tonumber(token)
+		if n then
+			nums[#nums + 1] = n
+		end
 	end
 	return nums
 end
@@ -59,10 +63,10 @@ local function parseTypedString(typed, str)
 		return NumberRange.new(n[1])
 	end
 	if typed == "CFrame" then
-		if #n >= 12 then
+		if #n == 12 then
 			return CFrame.new(n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8], n[9], n[10], n[11], n[12])
 		end
-		if #n >= 3 then
+		if #n == 3 then
 			return CFrame.new(n[1], n[2], n[3])
 		end
 	end

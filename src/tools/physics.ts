@@ -16,26 +16,26 @@ export const PHYSICS_TOOLS: ToolEntry[] = [
       subcategories: ["collision", "groups", "rules"],
       keywords: ["collision", "collide", "group", "physicsservice", "pet", "projectile", "ignore"],
       description:
-        "Define collision groups and assign parts (pets that don't push players, projectiles that skip the shooter). `groups` sets collide rules; `assignments` fills them.",
+        "Define collision groups and assign parts. `groups` sets collide rules; `assignments` fills them.",
       inputSchema: {
         type: "object",
         properties: {
           groups: {
             type: "array",
-            description: "Groups to register (idempotent). Each entry can specify which other groups it collides with or not.",
+            description: "Groups to register (idempotent).",
             items: {
               type: "object",
               properties: {
                 name: { type: "string" },
-                collidesWith: { type: "array", items: { type: "string" }, description: "Group names this one DOES collide with." },
-                notCollidesWith: { type: "array", items: { type: "string" }, description: "Group names this one does NOT collide with." },
+                collidesWith: { type: "array", items: { type: "string" }, description: "Group names." },
+                notCollidesWith: { type: "array", items: { type: "string" }, description: "Group names." },
               },
               required: ["name"],
             },
           },
           assignments: {
             type: "array",
-            description: "Assign instances to groups. For Models, all descendant BaseParts are assigned.",
+            description: "A Model assigns all its BaseParts.",
             items: {
               type: "object",
               properties: {
@@ -99,7 +99,7 @@ return { registered = registered, rules = ruleCount, partsAssigned = assigned }
           part0: { type: "string", description: "Ref/path of part0 (Attachment0 host)." },
           part1: { type: "string", description: "Ref/path of part1 (Attachment1 host). Optional for one-sided constraints." },
           offset0: { type: "array", items: { type: "number" }, description: "Local [x,y,z] offset of Attachment0." },
-          offset1: { type: "array", items: { type: "number" }, description: "Local [x,y,z] offset of Attachment1." },
+          offset1: { type: "array", items: { type: "number" }, description: "Local [x,y,z]." },
           props: { type: "object", description: "Extra props to set on the constraint (Stiffness, Damping, Length, Restitution, MaxForce, ...)." },
         },
         required: ["type", "part0"],

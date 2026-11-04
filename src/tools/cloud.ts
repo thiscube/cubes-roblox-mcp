@@ -233,7 +233,7 @@ export const CLOUD_TOOLS: ToolEntry[] = [
       subcategories: ["analytics", "metrics", "live"],
       keywords: ["analytics", "metrics", "dau", "players", "retention", "revenue", "visits", "stats", "opencloud", "dashboard"],
       description:
-        "Live game analytics via Open Cloud: DAU, visits, retention, session length, revenue, conversion. Omit metric to list common names. One line per series. Default universe is Climb Stairs.",
+        "Live game analytics via Open Cloud: DAU, visits, retention, session length, revenue, conversion. Omit metric to list common names. Default universe is Climb Stairs.",
       inputSchema: {
         type: "object",
         properties: {
